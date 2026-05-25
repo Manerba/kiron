@@ -1,0 +1,489 @@
+/* ========================================
+   Ollama Monitor - Requests Tab Styles
+   ======================================== */
+
+/* ========================================
+   Request-Tabelle
+   ======================================== */
+
+.request-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+}
+
+.request-table th {
+    position: sticky;
+    top: calc(var(--header-height) + 44px + var(--filter-bar-height));
+    z-index: 80;
+    background-color: var(--bg-secondary);
+    padding: 8px 12px;
+    text-align: left;
+    font-size: 12px;
+    font-weight: 600;
+    text-transform: uppercase;
+    color: var(--text-secondary);
+    border-bottom: 2px solid var(--border-color);
+    white-space: nowrap;
+}
+
+.request-table td {
+    padding: 6px 12px;
+    border-bottom: 1px solid var(--border-color);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 200px;
+}
+
+.request-table tbody tr[data-request-id] {
+    cursor: pointer;
+    transition: background-color 0.15s;
+}
+
+.request-table tbody tr[data-request-id]:hover {
+    background-color: var(--bg-row-hover);
+}
+
+/* ========================================
+   Zeilen-Status-Klassen
+   ======================================== */
+
+.request-active {
+    background-color: rgba(52, 152, 219, 0.08);
+}
+
+.request-active:hover {
+    background-color: rgba(52, 152, 219, 0.14) !important;
+}
+
+.request-error {
+    background-color: rgba(231, 76, 60, 0.08);
+}
+
+.request-error:hover {
+    background-color: rgba(231, 76, 60, 0.14) !important;
+}
+
+.request-warning {
+    background-color: rgba(255, 193, 7, 0.08);
+}
+
+.request-warning:hover {
+    background-color: rgba(255, 193, 7, 0.14) !important;
+}
+
+/* ========================================
+   Neue Request Animation
+   ======================================== */
+
+.request-new {
+    animation: requestHighlight 2s ease-out;
+}
+
+@keyframes requestHighlight {
+    from {
+        background-color: rgba(52, 152, 219, 0.2);
+    }
+    to {
+        background-color: transparent;
+    }
+}
+
+/* ========================================
+   Status-Badges
+   ======================================== */
+
+.status-badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 10px;
+    font-size: 11px;
+    font-weight: 600;
+    white-space: nowrap;
+}
+
+.status-badge.status-2xx {
+    background-color: #d4edda;
+    color: #155724;
+}
+
+.status-badge.status-4xx {
+    background-color: #fff3cd;
+    color: #856404;
+}
+
+.status-badge.status-5xx {
+    background-color: #f8d7da;
+    color: #721c24;
+}
+
+.status-badge.status-active {
+    background-color: #cce5ff;
+    color: #004085;
+}
+
+.status-badge.status-warning {
+    background-color: #fff3cd;
+    color: #856404;
+}
+
+/* ========================================
+   Detail-Zeile
+   ======================================== */
+
+.request-detail-row td {
+    padding: 0 !important;
+    border-bottom: none;
+}
+
+.request-detail {
+    padding: 12px 20px;
+    background-color: var(--bg-secondary);
+    border-bottom: 2px solid var(--border-color);
+    font-size: 12px;
+}
+
+.request-detail-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 10px;
+}
+
+.request-detail-grid div {
+    color: var(--text-primary);
+    line-height: 1.6;
+}
+
+.request-detail-grid strong {
+    color: var(--text-secondary);
+    font-weight: 500;
+}
+
+.request-detail-error {
+    grid-column: 1 / -1;
+    color: var(--color-bearish) !important;
+    background-color: rgba(231, 76, 60, 0.06);
+    padding: 6px 10px;
+    border-radius: 4px;
+}
+
+.request-detail-warning {
+    grid-column: 1 / -1;
+    color: #856404 !important;
+    background-color: rgba(255, 193, 7, 0.08);
+    padding: 6px 10px;
+    border-radius: 4px;
+}
+
+/* ========================================
+   Pagination
+   ======================================== */
+
+.pagination-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 8px 12px;
+    background-color: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    margin: 8px 0;
+    font-size: 13px;
+    gap: 12px;
+    flex-wrap: wrap;
+}
+
+.pagination-info {
+    color: var(--text-secondary);
+    white-space: nowrap;
+}
+
+.pagination-controls {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+
+.page-btn {
+    min-width: 32px;
+    height: 30px;
+    padding: 0 8px;
+    border: 1px solid var(--border-color);
+    border-radius: 4px;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    cursor: pointer;
+    font-size: 13px;
+    transition: background-color 0.15s, border-color 0.15s;
+}
+
+.page-btn:hover:not(:disabled):not(.active) {
+    background-color: var(--bg-row-hover);
+    border-color: var(--text-secondary);
+}
+
+.page-btn.active {
+    background-color: var(--color-accent, #3498db);
+    color: #fff;
+    border-color: var(--color-accent, #3498db);
+    font-weight: 600;
+}
+
+.page-btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+
+.page-btn.nav-btn {
+    font-size: 11px;
+}
+
+.page-ellipsis {
+    padding: 0 4px;
+    color: var(--text-secondary);
+}
+
+.pagination-size {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    white-space: nowrap;
+}
+
+.pagination-size label {
+    color: var(--text-secondary);
+    font-size: 12px;
+}
+
+.pagination-size select {
+    padding: 4px 8px;
+    border: 1px solid var(--border-color);
+    border-radius: 4px;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    font-size: 13px;
+    cursor: pointer;
+}
+
+/* ========================================
+   Dark Mode Anpassungen
+   ======================================== */
+
+[data-theme="dark"] .status-badge.status-2xx {
+    background-color: rgba(40, 167, 69, 0.2);
+    color: #8fd19e;
+}
+
+[data-theme="dark"] .status-badge.status-4xx {
+    background-color: rgba(255, 193, 7, 0.2);
+    color: #ffc107;
+}
+
+[data-theme="dark"] .status-badge.status-5xx {
+    background-color: rgba(220, 53, 69, 0.2);
+    color: #f1aeb5;
+}
+
+[data-theme="dark"] .status-badge.status-active {
+    background-color: rgba(52, 152, 219, 0.2);
+    color: #7ec8e3;
+}
+
+[data-theme="dark"] .status-badge.status-warning {
+    background-color: rgba(255, 193, 7, 0.2);
+    color: #ffd76a;
+}
+
+[data-theme="dark"] .request-active {
+    background-color: rgba(52, 152, 219, 0.1);
+}
+
+[data-theme="dark"] .request-active:hover {
+    background-color: rgba(52, 152, 219, 0.18) !important;
+}
+
+[data-theme="dark"] .request-error {
+    background-color: rgba(231, 76, 60, 0.1);
+}
+
+[data-theme="dark"] .request-error:hover {
+    background-color: rgba(231, 76, 60, 0.18) !important;
+}
+
+[data-theme="dark"] .request-warning {
+    background-color: rgba(255, 193, 7, 0.1);
+}
+
+[data-theme="dark"] .request-warning:hover {
+    background-color: rgba(255, 193, 7, 0.18) !important;
+}
+
+[data-theme="dark"] .request-detail {
+    background-color: var(--bg-secondary);
+}
+
+[data-theme="dark"] .request-detail-error {
+    background-color: rgba(231, 76, 60, 0.1);
+}
+
+[data-theme="dark"] .request-detail-warning {
+    color: #ffd76a !important;
+    background-color: rgba(255, 193, 7, 0.12);
+}
+
+/* ========================================
+   Request-Body (Prompt/Antwort)
+   ======================================== */
+
+.request-body-section {
+    margin-top: 12px;
+}
+
+.body-block {
+    margin-bottom: 10px;
+    border-radius: 6px;
+    overflow: hidden;
+}
+
+.body-block .body-label {
+    padding: 6px 12px;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    color: var(--text-secondary);
+}
+
+.body-content {
+    margin: 0;
+    padding: 10px 12px;
+    font-size: 12px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 400px;
+    overflow-y: auto;
+    background-color: var(--bg-primary);
+    color: var(--text-primary);
+    border-radius: 0 0 6px 6px;
+}
+
+.body-prompt {
+    border-left: 3px solid #3498db;
+    background-color: rgba(52, 152, 219, 0.04);
+}
+
+.body-prompt .body-label {
+    background-color: rgba(52, 152, 219, 0.08);
+    color: #2980b9;
+}
+
+.body-response {
+    border-left: 3px solid #27ae60;
+    background-color: rgba(39, 174, 96, 0.04);
+}
+
+.body-response .body-label {
+    background-color: rgba(39, 174, 96, 0.08);
+    color: #219a52;
+}
+
+.body-loading {
+    padding: 12px;
+    color: var(--text-secondary);
+    font-size: 12px;
+    font-style: italic;
+}
+
+[data-theme="dark"] .body-prompt {
+    border-left-color: #5dade2;
+    background-color: rgba(52, 152, 219, 0.06);
+}
+
+[data-theme="dark"] .body-prompt .body-label {
+    background-color: rgba(52, 152, 219, 0.12);
+    color: #7ec8e3;
+}
+
+[data-theme="dark"] .body-response {
+    border-left-color: #58d68d;
+    background-color: rgba(39, 174, 96, 0.06);
+}
+
+[data-theme="dark"] .body-response .body-label {
+    background-color: rgba(39, 174, 96, 0.12);
+    color: #82e0aa;
+}
+
+[data-theme="dark"] .body-content {
+    background-color: var(--bg-primary);
+}
+
+/* ========================================
+   JSON Syntax-Highlighting
+   ======================================== */
+
+.json-key {
+    color: #881391;
+}
+
+.json-string {
+    color: #1a7f37;
+}
+
+.json-number {
+    color: #0550ae;
+}
+
+.json-boolean {
+    color: #cf222e;
+    font-weight: 600;
+}
+
+.json-null {
+    color: #6e7781;
+    font-style: italic;
+}
+
+[data-theme="dark"] .json-key {
+    color: #d2a8ff;
+}
+
+[data-theme="dark"] .json-string {
+    color: #7ee787;
+}
+
+[data-theme="dark"] .json-number {
+    color: #79c0ff;
+}
+
+[data-theme="dark"] .json-boolean {
+    color: #ff7b72;
+}
+
+[data-theme="dark"] .json-null {
+    color: #8b949e;
+}
+
+/* ========================================
+   Responsive
+   ======================================== */
+
+@media (max-width: 768px) {
+    .request-table {
+        font-size: 12px;
+    }
+
+    .request-table th,
+    .request-table td {
+        padding: 4px 8px;
+    }
+
+    .request-table td {
+        max-width: 120px;
+    }
+
+    .request-detail-grid {
+        grid-template-columns: 1fr;
+    }
+}

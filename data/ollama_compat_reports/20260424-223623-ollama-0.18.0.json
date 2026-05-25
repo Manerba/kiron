@@ -1,0 +1,91 @@
+{
+  "image": "ollama/ollama:0.18.0",
+  "compose_tag": "ollama/ollama:0.18.0",
+  "image_digest": "ollama/ollama@sha256:e23e6499890325d31f3454cdc83f7a613a2423c8a9e167bbafea0b0e3c27d7c6",
+  "published_version": null,
+  "tested_at": "2026-04-24T20:40:04Z",
+  "validator_version": "v1",
+  "mode": "standard",
+  "fixture_models": [
+    "smollm2:135m"
+  ],
+  "host_ollama_binary_version": "ollama version is 0.18.0",
+  "production_container_image": "ollama/ollama:0.18.0",
+  "production_container_id": "614e63c845092f7102246eed50da8be71d106ef41a0a386201de503d37c5e00f",
+  "capabilities": {
+    "version_endpoint": {
+      "ok": true,
+      "severity": "fail",
+      "message": "version ok",
+      "data": {
+        "version": "0.18.0"
+      }
+    },
+    "tags_shape": {
+      "ok": true,
+      "severity": "fail",
+      "message": "tags shape ok",
+      "data": null
+    },
+    "ps_shape": {
+      "ok": true,
+      "severity": "fail",
+      "message": "ps shape ok",
+      "data": null
+    },
+    "generate_nonstream": {
+      "ok": true,
+      "severity": "fail",
+      "message": "generate ok",
+      "data": null
+    },
+    "chat_nonstream": {
+      "ok": true,
+      "severity": "fail",
+      "message": "chat ok",
+      "data": null
+    },
+    "stream_ndjson": {
+      "ok": true,
+      "severity": "fail",
+      "message": "stream done ok",
+      "data": null
+    },
+    "think_false": {
+      "ok": true,
+      "severity": "fail",
+      "message": "think:false accepted",
+      "data": null
+    },
+    "keep_alive_zero_unload": {
+      "ok": true,
+      "severity": "fail",
+      "message": "unload verified",
+      "data": null
+    },
+    "num_gpu_zero_chat_generate": {
+      "ok": true,
+      "severity": "fail",
+      "message": "num_gpu=0 effective",
+      "data": {
+        "num_gpu_zero_effective": true
+      }
+    },
+    "ps_size_vram": {
+      "ok": true,
+      "severity": "fail",
+      "message": "ps shape ok",
+      "data": null
+    },
+    "error_shape_normalizable": {
+      "ok": true,
+      "severity": "warn",
+      "message": "error shape normalizable",
+      "data": null
+    }
+  },
+  "failures": [],
+  "warnings": [],
+  "report_status": "passed",
+  "upgrade_allowed": true
+}

@@ -1,0 +1,40 @@
+/* ========================================
+   Shared Frontend Core — Design Tokens
+   Produktneutrale :root-Defaults (32 Tokens)
+   Quelle: kiara/web/static/ui_core/css/tokens.css
+   ======================================== */
+
+:root {
+    --header-height: 40px;
+    --filter-bar-height: 48px;
+    --bg-primary: #ffffff;
+    --bg-secondary: #f5f5f5;
+    --bg-header: #2c3e50;
+    --bg-row-hover: #e8f4fc;
+    --bg-accordion-header: #ecf0f1;
+    --text-primary: #333333;
+    --text-secondary: #666666;
+    --text-header: #ffffff;
+    --border-color: #ddd;
+    --shadow: 0 2px 4px rgba(0,0,0,0.1);
+    --drop-shadow: drop-shadow(0 2px 3px rgba(0,0,0,0.1));
+    --accent-primary: #3498db;
+    --accent-hover: #2980b9;
+    --bg-detail: #f0f4f8;
+    --bg-detail-nested: #d6e1ed;
+    --shadow-focus: 0 0 0 2px rgba(52, 152, 219, 0.2);
+    --shadow-sm: 0 2px 4px rgba(0, 0, 0, 0.1);
+    --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.15);
+    --shadow-lg: 0 8px 32px rgba(0, 0, 0, 0.3);
+    --transition-speed: 0.3s;
+    --border-radius: 6px;
+    --bg-tabs: var(--bg-secondary);
+    --bg-subtabs: var(--bg-secondary);
+    --bg-controls: var(--bg-secondary);
+    --bg-content: var(--bg-primary);
+    --text-tabs: var(--text-secondary);
+    --text-tabs-active: var(--accent-primary);
+    --bg-tab-active: var(--bg-tabs);
+    --bg-subtab-active: var(--bg-subtabs);
+    --text-subtab-active: var(--text-tabs-active);
+}

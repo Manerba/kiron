@@ -1,0 +1,3 @@
+httpx>=0.28
+uvicorn>=0.34
+starlette>=0.45,<1.0

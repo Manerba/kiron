@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Kiron</title>
+    <link rel="stylesheet" href="/static/ui_core/css/tokens.css">
+    <link rel="stylesheet" href="/static/ui_core/css/theme.css">
+    <link rel="stylesheet" href="/static/ui_core/css/layout.css">
+    <link rel="stylesheet" href="/static/css/style.css">
+    <link rel="stylesheet" href="/static/css/expandable_table.css">
+    <link rel="stylesheet" href="/static/css/kpi_grid.css">
+    <link rel="stylesheet" href="/static/css/requests.css">
+    <link rel="stylesheet" href="/static/css/charts.css">
+    <link rel="stylesheet" href="/static/css/models.css">
+    <link rel="stylesheet" href="/static/css/apikeys.css">
+    <link rel="stylesheet" href="/static/ui_core/css/table.css">
+</head>
+<body>
+    <!-- Header -->
+    <header class="header">
+        <h1>
+            <img src="/static/img/brain.svg" class="logo-brain" alt="Kiron Logo">
+            <span><span class="logo-ki">KI</span><span class="logo-ron">ron</span></span>
+        </h1>
+        <div class="header-controls">
+            <div class="settings-dropdown-wrapper">
+                <button class="settings-btn" id="settingsBtn" title="Einstellungen">&#x2699;&#xFE0F;</button>
+                <nav class="settings-dropdown" id="settingsDropdown" style="display: none;">
+                    <div class="settings-menu">
+                        <div class="settings-item settings-theme-selector">
+                            <span class="settings-icon">&#x1F3A8;</span>
+                            <span class="settings-label">Theme</span>
+                            <div class="theme-options">
+                                <button class="theme-option" data-theme="light">Light</button>
+                                <button class="theme-option" data-theme="dark">Dark</button>
+                                <button class="theme-option" data-theme="kontrast">Kontrast</button>
+                            </div>
+                        </div>
+                        <div class="settings-divider"></div>
+                        <div class="settings-item" id="densityToggle">
+                            <span class="settings-icon">&#x2630;</span>
+                            <span class="settings-label">Kompakte Ansicht</span>
+                            <span class="settings-value" id="densityStatus">Aus</span>
+                        </div>
+                        <div class="settings-divider"></div>
+                        <div class="settings-item settings-danger" id="restartBtn">
+                            <span class="settings-icon">&#x21bb;</span>
+                            <span class="settings-label">Neu laden</span>
+                        </div>
+                    </div>
+                </nav>
+            </div>
+        </div>
+    </header>
+
+    <!-- Tabs -->
+    <nav class="tabs main-tabs">
+        <a class="tab" href="/dashboard" data-tab="dashboard">Dashboard</a>
+        <a class="tab" href="/requests" data-tab="requests">Requests</a>
+        <a class="tab" href="/system" data-tab="system">System</a>
+        <a class="tab" href="/history" data-tab="history">Verlauf</a>
+        <a class="tab" href="/models" data-tab="models">Modelle</a>
+        <a class="tab" href="/apikeys" data-tab="apikeys">API Keys</a>
+        <a class="tab" href="/selftest" data-tab="selftest">Selbsttest</a>
+    </nav>
+
+    <!-- Sub-Tabs (dynamisch je Haupt-Tab befuellt) -->
+    <nav class="tabs sub-tabs is-hidden" id="subTabs"></nav>
+
+    <!-- Filter Bar -->
+    <div class="filter-bar" id="filterBar" style="display: none;"></div>
+
+    <!-- Content -->
+    <main class="container" id="contentContainer">
+        <div class="table-loading"><div class="spinner"></div></div>
+    </main>
+
+    <!-- Scripts: Reihenfolge wichtig! -->
+    <script src="/static/ui_core/js/core.js"></script>
+    <script src="/static/ui_core/js/theme.js"></script>
+    <script src="/static/js/expandable_table.js"></script>
+    <script src="/static/js/kpi_grid.js"></script>
+    <script src="/static/vendor/chart.min.js"></script>
+    <script src="/static/vendor/chartjs-adapter-date-fns.min.js"></script>
+    <script src="/static/js/chart_component.js"></script>
+    <script src="/static/js/tab_dashboard.js"></script>
+    <script src="/static/js/tab_requests.js"></script>
+    <script src="/static/js/tab_system.js"></script>
+    <script src="/static/js/tab_history.js"></script>
+    <script src="/static/js/tab_models.js"></script>
+    <script src="/static/js/tab_apikeys.js"></script>
+    <script src="/static/js/tab_selftest.js"></script>
+    <script src="/static/js/app_core.js"></script>
+</body>
+</html>

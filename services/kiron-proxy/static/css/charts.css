@@ -1,0 +1,109 @@
+/* ========================================
+   Charts & Verlauf-Tab Styling
+   ======================================== */
+
+/* Zeitraum-Selektor */
+.time-range-selector {
+    display: flex;
+    gap: 6px;
+    padding: 12px 0;
+    flex-wrap: wrap;
+    align-items: center;
+}
+
+.time-range-selector .range-label {
+    font-size: 13px;
+    color: var(--text-secondary);
+    margin-right: 8px;
+    font-weight: 500;
+}
+
+.time-range-btn {
+    padding: 6px 14px;
+    border: 1px solid var(--border-color);
+    border-radius: 4px;
+    background-color: var(--bg-primary);
+    color: var(--text-secondary);
+    font-size: 12px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all var(--transition-speed);
+}
+
+.time-range-btn:hover {
+    background-color: var(--bg-row-hover);
+    color: var(--text-primary);
+}
+
+.time-range-btn.active {
+    background-color: var(--accent-primary);
+    color: white;
+    border-color: var(--accent-primary);
+}
+
+/* DB-Stats Zeile */
+.history-stats {
+    display: flex;
+    gap: 20px;
+    padding: 8px 0;
+    font-size: 12px;
+    color: var(--text-secondary);
+    flex-wrap: wrap;
+}
+
+.history-stats .stat-item {
+    display: flex;
+    gap: 4px;
+}
+
+.history-stats .stat-value {
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+/* Chart Grid */
+.charts-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+    margin-top: 12px;
+}
+
+/* Chart Container */
+.chart-container {
+    background-color: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    padding: 16px;
+    position: relative;
+    min-height: 280px;
+}
+
+.chart-container .chart-title {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-primary);
+    margin-bottom: 12px;
+}
+
+.chart-container canvas {
+    width: 100% !important;
+    max-height: 240px;
+}
+
+/* Leerer Zustand */
+.chart-no-data {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    height: 200px;
+    color: var(--text-secondary);
+    font-size: 13px;
+}
+
+/* Responsive: 1 Spalte auf Mobile */
+@media (max-width: 900px) {
+    .charts-grid {
+        grid-template-columns: 1fr;
+    }
+}

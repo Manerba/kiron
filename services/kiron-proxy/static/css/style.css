@@ -1,0 +1,606 @@
+/* ========================================
+   Kiron - Produkt-CSS
+   Core-Tokens / Theme-Overrides / Tabs / Filter-Bar / Container
+   liegen in /static/ui_core/css/ (tokens.css, theme.css, layout.css).
+   Hier nur Kiron-Spezifika + Shell (Header, Dropdown, Theme-Pills).
+   ======================================== */
+
+/* Kiron-spezifische Status-Farben */
+:root {
+    --color-bullish: #28a745;
+    --color-bearish: #dc3545;
+    --color-neutral: #6c757d;
+    --color-unclear: #fd7e14;
+}
+
+[data-theme="dark"] {
+    --color-bullish: #5cb85c;
+    --color-bearish: #d9534f;
+    --color-neutral: #868e96;
+    --color-unclear: #f0ad4e;
+}
+
+/* Reset & Base */
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: 'Segoe UI', Arial, sans-serif;
+    font-size: 13px;
+    background-color: var(--bg-content);
+    color: var(--text-primary);
+    transition: background-color var(--transition-speed), color var(--transition-speed);
+    line-height: 1.4;
+}
+
+/* ========================================
+   Header (Gehirn-Logo + "Kiron")
+   ======================================== */
+
+.header {
+    background-color: var(--bg-header);
+    color: var(--text-header);
+    padding: 6px 16px;
+    min-height: var(--header-height);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    box-shadow: var(--shadow);
+    position: sticky;
+    top: 0;
+    z-index: 100;
+}
+
+.header h1 {
+    font-size: 18px;
+    font-weight: 500;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.header h1 .logo-brain {
+    flex-shrink: 0;
+    height: 16px;
+    width: auto;
+    position: relative;
+    top: -1px;
+}
+
+.header h1 .logo-ki {
+    font-weight: 700;
+    background: linear-gradient(135deg, #3b82f6, #8b5cf6);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+}
+
+.header h1 .logo-ron {
+    font-weight: 400;
+    color: var(--text-header);
+}
+
+.header-controls {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+/* ========================================
+   Settings Dropdown
+   ======================================== */
+
+.settings-dropdown-wrapper {
+    position: relative;
+}
+
+.settings-btn {
+    background: none;
+    border: none;
+    color: var(--text-header);
+    width: 26px;
+    height: 26px;
+    border-radius: 50%;
+    cursor: pointer;
+    font-size: 16px;
+    padding: 0;
+    transition: all var(--transition-speed);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.settings-btn:hover {
+    background-color: rgba(255,255,255,0.15);
+    transform: rotate(30deg);
+}
+
+.settings-dropdown {
+    position: absolute;
+    top: 100%;
+    right: 0;
+    margin-top: 8px;
+    background-color: var(--bg-primary);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.2);
+    z-index: 300;
+    min-width: 220px;
+    animation: slideDown 0.15s ease-out;
+}
+
+@keyframes slideDown {
+    from { opacity: 0; transform: translateY(-10px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+
+.settings-menu { padding: 8px 0; }
+
+.settings-item {
+    padding: 10px 16px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 14px;
+    color: var(--text-primary);
+    transition: background-color var(--transition-speed);
+}
+
+.settings-item:hover {
+    background-color: var(--bg-row-hover);
+}
+
+.settings-icon { width: 20px; text-align: center; }
+.settings-label { flex: 1; }
+
+.settings-value {
+    font-size: 12px;
+    color: var(--text-secondary);
+    background-color: var(--bg-secondary);
+    padding: 2px 8px;
+    border-radius: 10px;
+}
+
+.settings-divider {
+    height: 1px;
+    background-color: var(--border-color);
+    margin: 8px 0;
+}
+
+.settings-danger:hover {
+    background-color: rgba(231, 76, 60, 0.1);
+    color: #e74c3c;
+}
+
+/* Theme-Pills (Light/Dark/Kontrast) */
+.settings-theme-selector { flex-wrap: wrap; cursor: default; }
+.settings-theme-selector:hover { background-color: transparent; }
+.theme-options {
+    display: flex;
+    gap: 4px;
+    margin-left: auto;
+}
+.theme-option {
+    padding: 3px 10px;
+    border: 1px solid var(--border-color);
+    border-radius: 12px;
+    background: var(--bg-secondary);
+    color: var(--text-secondary);
+    font-size: 11px;
+    cursor: pointer;
+    transition: all 0.15s;
+    font-family: inherit;
+}
+.theme-option:hover {
+    background: var(--bg-row-hover);
+    color: var(--text-primary);
+}
+.theme-option.active {
+    background: var(--accent-primary);
+    color: #fff;
+    border-color: var(--accent-primary);
+}
+
+/* ========================================
+   Filter-Bar-Zusaetze (Basis in ui_core/layout.css)
+   ======================================== */
+
+.filter-group {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.filter-label {
+    font-size: 12px;
+    color: var(--text-secondary);
+    white-space: nowrap;
+}
+
+.filter-select {
+    padding: 6px 10px;
+    border: 1px solid var(--border-color);
+    border-radius: 4px;
+    font-size: 12px;
+    background-color: var(--bg-primary);
+    color: var(--text-primary);
+    cursor: pointer;
+    max-width: 160px;
+}
+
+.filter-input {
+    padding: 6px 10px;
+    border: 1px solid var(--border-color);
+    border-radius: 4px;
+    font-size: 12px;
+    width: 120px;
+    background-color: var(--bg-primary);
+    color: var(--text-primary);
+}
+
+/* ========================================
+   Loading & States
+   ======================================== */
+
+.loading,
+.table-loading {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    padding: 50px;
+}
+
+.spinner {
+    width: 40px;
+    height: 40px;
+    border: 4px solid var(--border-color);
+    border-top-color: var(--accent-primary);
+    border-radius: 50%;
+    animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+    to { transform: rotate(360deg); }
+}
+
+.no-data {
+    text-align: center;
+    padding: 50px;
+    color: var(--text-secondary);
+    font-size: 14px;
+}
+
+/* ========================================
+   Notifications
+   ======================================== */
+
+.notification {
+    position: fixed;
+    top: 20px;
+    right: 20px;
+    padding: 12px 20px;
+    border-radius: 6px;
+    font-size: 14px;
+    z-index: 1000;
+    animation: slideIn 0.3s ease-out;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+}
+
+.notification-info {
+    background-color: var(--accent-primary);
+    color: white;
+}
+
+.notification-success {
+    background-color: var(--color-bullish);
+    color: white;
+}
+
+.notification-error {
+    background-color: var(--color-bearish);
+    color: white;
+}
+
+.notification.fade-out {
+    opacity: 0;
+    transition: opacity 0.3s;
+}
+
+@keyframes slideIn {
+    from { opacity: 0; transform: translateX(50px); }
+    to   { opacity: 1; transform: translateX(0); }
+}
+
+/* ========================================
+   Buttons
+   ======================================== */
+
+.action-btn {
+    padding: 6px 14px;
+    border: 1px solid var(--border-color);
+    border-radius: 4px;
+    font-size: 12px;
+    cursor: pointer;
+    background-color: var(--bg-primary);
+    color: var(--text-primary);
+    transition: all var(--transition-speed);
+}
+
+.action-btn:hover {
+    background-color: var(--bg-row-hover);
+}
+
+.action-btn.primary {
+    background-color: var(--accent-primary);
+    color: white;
+    border-color: var(--accent-primary);
+}
+
+.action-btn.primary:hover {
+    background-color: var(--accent-hover);
+}
+
+.action-btn.danger {
+    color: var(--color-bearish);
+    border-color: var(--color-bearish);
+}
+
+.action-btn.danger:hover {
+    background-color: var(--color-bearish);
+    color: white;
+}
+
+/* ========================================
+   Scrollbar
+   ======================================== */
+
+::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+}
+
+::-webkit-scrollbar-track {
+    background: var(--bg-secondary);
+}
+
+::-webkit-scrollbar-thumb {
+    background: var(--border-color);
+    border-radius: 5px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+    background: var(--text-secondary);
+}
+
+/* ========================================
+   Utility Classes
+   ======================================== */
+
+.text-right { text-align: right; }
+.text-center { text-align: center; }
+.font-bold { font-weight: 600; }
+.text-muted { color: var(--text-secondary); }
+
+.highlight {
+    background-color: #ffeb3b;
+    padding: 1px 3px;
+    border-radius: 2px;
+}
+
+[data-theme="dark"] .highlight {
+    background-color: #665c00;
+}
+
+/* ========================================
+   Dashboard Info Page
+   ======================================== */
+
+.dashboard-info {
+    max-width: 900px;
+    margin: 0 auto;
+    padding: 10px 0;
+}
+
+.info-header {
+    display: flex;
+    align-items: baseline;
+    gap: 15px;
+    margin-bottom: 8px;
+}
+
+.info-header h2 {
+    font-size: 24px;
+    color: var(--text-primary);
+}
+
+.info-version {
+    font-size: 14px;
+    color: var(--text-secondary);
+    background-color: var(--bg-secondary);
+    padding: 3px 10px;
+    border-radius: 12px;
+    border: 1px solid var(--border-color);
+}
+
+.info-lead {
+    font-size: 15px;
+    color: var(--text-secondary);
+    margin-bottom: 30px;
+    line-height: 1.5;
+}
+
+.info-section {
+    margin-bottom: 35px;
+}
+
+.info-section h2 {
+    font-size: 18px;
+    color: var(--text-primary);
+    margin-bottom: 16px;
+    padding-bottom: 8px;
+    border-bottom: 2px solid var(--accent-primary);
+}
+
+.info-section h3 {
+    font-size: 14px;
+    color: var(--text-primary);
+    margin: 12px 0 8px 0;
+}
+
+.info-components-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 16px;
+}
+
+.info-component {
+    background-color: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    padding: 16px;
+    transition: box-shadow var(--transition-speed);
+}
+
+.info-component:hover {
+    box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+}
+
+.info-component h3 {
+    font-size: 15px;
+    color: var(--accent-primary);
+    margin-bottom: 6px;
+    border: none;
+    padding: 0;
+}
+
+.info-description {
+    font-size: 13px;
+    color: var(--text-secondary);
+    margin-bottom: 10px;
+    line-height: 1.4;
+}
+
+.info-features {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+}
+
+.info-features li {
+    font-size: 12px;
+    color: var(--text-primary);
+    padding: 3px 0 3px 16px;
+    position: relative;
+}
+
+.info-features li::before {
+    content: '\2713';
+    position: absolute;
+    left: 0;
+    color: var(--color-bullish);
+    font-weight: bold;
+}
+
+.info-steps {
+    padding-left: 20px;
+    margin: 0;
+}
+
+.info-steps li {
+    font-size: 13px;
+    color: var(--text-primary);
+    padding: 4px 0;
+    line-height: 1.5;
+}
+
+.info-hint {
+    font-size: 12px;
+    color: var(--text-secondary);
+    margin-top: 10px;
+    font-style: italic;
+}
+
+.info-section code {
+    background-color: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    padding: 2px 6px;
+    border-radius: 3px;
+    font-size: 12px;
+    font-family: 'Consolas', 'Monaco', monospace;
+}
+
+.info-section ul {
+    padding-left: 20px;
+    margin: 4px 0;
+}
+
+.info-section ul li {
+    font-size: 13px;
+    padding: 3px 0;
+    line-height: 1.4;
+}
+
+/* ========================================
+   Config-Form / Config-Section (Selbsttest u.a.)
+   Uebernommen aus kiara/web/static/css/style.css fuer
+   optisch identisches Selbsttest-Panel.
+   ======================================== */
+
+.config-form {
+    padding: 16px;
+    max-width: 800px;
+}
+
+.config-form h3 {
+    margin: 0 0 16px 0;
+    font-size: 16px;
+    color: var(--text-primary);
+}
+
+.config-section {
+    background: var(--bg-primary);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    padding: 20px;
+    margin-bottom: 20px;
+}
+
+.config-section h3 {
+    margin: 0 0 16px 0;
+    font-size: 16px;
+    color: var(--text-primary);
+}
+
+.config-section h4 {
+    margin: 0 0 12px 0;
+    font-size: 14px;
+    color: var(--text-primary);
+}
+
+.widget-error {
+    margin-top: 12px;
+    padding: 10px;
+    background: rgba(239,68,68,0.1);
+    border-radius: 4px;
+    font-size: 12px;
+    color: var(--color-bearish);
+}
+
+/* ========================================
+   Responsive
+   ======================================== */
+
+@media (max-width: 768px) {
+    .info-components-grid {
+        grid-template-columns: 1fr;
+    }
+
+    .info-header {
+        flex-direction: column;
+        gap: 8px;
+    }
+}

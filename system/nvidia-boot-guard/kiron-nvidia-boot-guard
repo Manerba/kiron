@@ -1,0 +1,63 @@
+#!/bin/bash
+#
+# kiron-nvidia-boot-guard  (Track 3.1)
+#
+# Zwingt den GRUB-Default auf den NEUESTEN installierten Kernel, der ein
+# nvidia.ko-Modul hat. Schuetzt vor treiberlosem Boot, wenn Kernel und
+# precompiled nvidia-Modul desyncen (neuester Kernel ohne passendes Modul).
+#
+# Aufruf:
+#   - /etc/kernel/postinst.d/zzz-kiron-nvidia-boot-guard  (nach Kernel-/Modul-Install)
+#   - systemd-Unit kiron-nvidia-boot-guard.service        (bei jedem Boot)
+# Setzt GRUB saved_entry; setzt GRUB_DEFAULT=saved voraus.
+# Idempotent. Failt nie hart (darf kernel-postinst nicht abbrechen).
+
+GRUB_CFG=/boot/grub/grub.cfg
+
+log() { logger -t kiron-nvidia-guard -- "$*" 2>/dev/null || true; echo "kiron-nvidia-guard: $*"; }
+
+has_nvidia_ko() { find "/lib/modules/$1" -name 'nvidia.ko*' 2>/dev/null | grep -q .; }
+
+# Installierte Kernel (haben /boot/vmlinuz-*), neuester zuerst
+mapfile -t kernels < <(for img in /boot/vmlinuz-*; do
+    [ -e "$img" ] && echo "${img#/boot/vmlinuz-}"
+done | sort -V -r)
+
+if [ "${#kernels[@]}" -eq 0 ]; then
+    log "KRITISCH: keine installierten Kernel gefunden"
+    exit 0
+fi
+
+newest="${kernels[0]}"
+best=""
+for k in "${kernels[@]}"; do
+    if has_nvidia_ko "$k"; then best="$k"; break; fi
+done
+
+if [ -z "$best" ]; then
+    log "KRITISCH: KEIN installierter Kernel hat ein nvidia.ko-Modul - treiberloser Boot unvermeidbar (manueller Eingriff noetig)"
+    exit 0
+fi
+
+if [ "$best" != "$newest" ]; then
+    log "WARNUNG: neuester Kernel $newest hat KEIN nvidia.ko - setze GRUB-Default auf $best (Kernel/Modul desynchron)"
+fi
+
+entry_id=$(grep -oE "gnulinux-${best}-advanced-[0-9a-fA-F-]+" "$GRUB_CFG" 2>/dev/null | head -1)
+if [ -z "$entry_id" ]; then
+    log "WARNUNG: kein GRUB-Eintrag fuer $best in $GRUB_CFG gefunden - GRUB-Default unveraendert"
+    exit 0
+fi
+
+current=$(grub-editenv list 2>/dev/null | sed -n 's/^saved_entry=//p')
+if [ "$current" = "$entry_id" ]; then
+    log "OK: GRUB-Default bereits $best"
+else
+    if grub-set-default "$entry_id" 2>/dev/null; then
+        log "GRUB-Default -> $best"
+    else
+        log "WARNUNG: grub-set-default fehlgeschlagen"
+    fi
+fi
+
+exit 0

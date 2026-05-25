@@ -1,0 +1,11 @@
+[Unit]
+Description=Kiron NVIDIA Boot-Guard (GRUB-Default auf Kernel mit nvidia.ko)
+After=local-fs.target
+ConditionPathExists=/usr/local/sbin/kiron-nvidia-boot-guard
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/kiron-nvidia-boot-guard
+
+[Install]
+WantedBy=multi-user.target

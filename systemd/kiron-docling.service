@@ -1,0 +1,19 @@
+[Unit]
+Description=Kiron Docling Proxy (on-demand container management)
+After=network.target docker.service
+Requires=docker.service
+PartOf=docker.service
+StartLimitBurst=5
+StartLimitIntervalSec=300
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/usr/lib/kiron/services/kiron-docling
+ExecStart=/usr/lib/kiron/services/kiron-docling/venv/bin/python proxy.py
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

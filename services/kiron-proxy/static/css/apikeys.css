@@ -1,0 +1,306 @@
+/* ========================================
+   API Keys Tab - Styling
+   ======================================== */
+
+.apikeys-page {
+    max-width: 1200px;
+    margin: 0 auto;
+}
+
+/* Header */
+.apikeys-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 16px;
+}
+
+.apikeys-header h2 {
+    margin: 0;
+    font-size: 18px;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.apikeys-create-btn {
+    padding: 8px 16px;
+    background-color: var(--accent-primary);
+    color: #fff;
+    border: none;
+    border-radius: 6px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background-color var(--transition-speed);
+}
+
+.apikeys-create-btn:hover {
+    background-color: var(--accent-hover);
+}
+
+/* Table */
+.apikeys-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+}
+
+.apikeys-table th {
+    text-align: left;
+    padding: 10px 12px;
+    background-color: var(--bg-secondary);
+    border-bottom: 2px solid var(--border-color);
+    color: var(--text-secondary);
+    font-weight: 600;
+    font-size: 12px;
+    white-space: nowrap;
+}
+
+.apikeys-table td {
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--border-color);
+    vertical-align: middle;
+}
+
+.apikeys-table tr:hover {
+    background-color: var(--bg-row-hover);
+}
+
+.apikeys-empty {
+    text-align: center;
+    padding: 32px 12px;
+    color: var(--text-secondary);
+    font-size: 14px;
+}
+
+/* Status Badges */
+.apikeys-badge-active {
+    display: inline-block;
+    padding: 3px 10px;
+    border-radius: 12px;
+    font-size: 11px;
+    font-weight: 600;
+    white-space: nowrap;
+    background-color: rgba(40, 167, 69, 0.15);
+    color: var(--color-bullish);
+    border: 1px solid var(--color-bullish);
+}
+
+.apikeys-badge-inactive {
+    display: inline-block;
+    padding: 3px 10px;
+    border-radius: 12px;
+    font-size: 11px;
+    font-weight: 600;
+    white-space: nowrap;
+    background-color: rgba(108, 117, 125, 0.1);
+    color: var(--color-neutral);
+    border: 1px solid var(--color-neutral);
+}
+
+/* Actions */
+.apikeys-actions {
+    white-space: nowrap;
+    display: flex;
+    gap: 6px;
+}
+
+.apikeys-actions button {
+    padding: 4px 10px;
+    border: 1px solid var(--border-color);
+    border-radius: 4px;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    font-size: 12px;
+    cursor: pointer;
+    transition: all var(--transition-speed);
+}
+
+.apikeys-actions button:hover {
+    background-color: var(--bg-row-hover);
+    border-color: var(--text-secondary);
+}
+
+.apikeys-actions .btn-danger {
+    color: var(--color-bearish);
+    border-color: var(--color-bearish);
+}
+
+.apikeys-actions .btn-danger:hover {
+    background-color: rgba(231, 76, 60, 0.1);
+}
+
+/* Modal Overlay */
+.apikeys-modal {
+    position: fixed;
+    inset: 0;
+    z-index: 1000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background-color: rgba(0, 0, 0, 0.5);
+}
+
+.apikeys-modal-content {
+    background-color: var(--bg-primary);
+    border: 1px solid var(--border-color);
+    border-radius: 10px;
+    padding: 24px;
+    min-width: 400px;
+    max-width: 560px;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.2);
+}
+
+.apikeys-modal-content h3 {
+    margin: 0 0 16px;
+    font-size: 16px;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.apikeys-modal-content label {
+    display: block;
+    margin-bottom: 6px;
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--text-secondary);
+}
+
+.apikeys-modal-content input[type="text"] {
+    width: 100%;
+    padding: 8px 12px;
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    background: var(--bg-secondary);
+    color: var(--text-primary);
+    font-size: 14px;
+    box-sizing: border-box;
+}
+
+.apikeys-modal-content input[type="text"]:focus {
+    outline: none;
+    border-color: var(--accent-primary);
+}
+
+.apikeys-modal-buttons {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    margin-top: 16px;
+}
+
+.apikeys-modal-buttons button {
+    padding: 8px 16px;
+    border-radius: 6px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all var(--transition-speed);
+}
+
+.apikeys-modal-buttons .btn-cancel {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    color: var(--text-primary);
+}
+
+.apikeys-modal-buttons .btn-cancel:hover {
+    background: var(--bg-row-hover);
+}
+
+.apikeys-modal-buttons .btn-create {
+    background-color: var(--accent-primary);
+    color: #fff;
+    border: none;
+}
+
+.apikeys-modal-buttons .btn-create:hover {
+    background-color: var(--accent-hover);
+}
+
+/* Key Display (after creation) */
+.apikeys-key-display {
+    margin-top: 12px;
+    padding: 12px;
+    background-color: var(--bg-secondary);
+    border: 1px solid var(--accent-primary);
+    border-radius: 6px;
+}
+
+.apikeys-key-display .key-warning {
+    font-size: 12px;
+    color: var(--color-bearish);
+    font-weight: 600;
+    margin-bottom: 8px;
+}
+
+.apikeys-key-display code {
+    display: block;
+    padding: 10px 12px;
+    background-color: var(--bg-primary);
+    border: 1px solid var(--border-color);
+    border-radius: 4px;
+    font-size: 13px;
+    font-family: 'Courier New', monospace;
+    word-break: break-all;
+    color: var(--text-primary);
+    margin-bottom: 8px;
+}
+
+.apikeys-key-display .btn-copy {
+    padding: 6px 14px;
+    background-color: var(--accent-primary);
+    color: #fff;
+    border: none;
+    border-radius: 4px;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background-color var(--transition-speed);
+}
+
+.apikeys-key-display .btn-copy:hover {
+    background-color: var(--accent-hover);
+}
+
+/* Info text */
+.apikeys-info {
+    margin-top: 16px;
+    padding: 12px;
+    background-color: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    font-size: 12px;
+    color: var(--text-secondary);
+    line-height: 1.6;
+}
+
+.apikeys-info code {
+    background-color: var(--bg-primary);
+    padding: 1px 5px;
+    border-radius: 3px;
+    font-size: 11px;
+}
+
+/* Responsive */
+@media (max-width: 768px) {
+    .apikeys-header {
+        flex-direction: column;
+        align-items: stretch;
+        gap: 8px;
+    }
+
+    .apikeys-table {
+        font-size: 12px;
+    }
+
+    .apikeys-table th,
+    .apikeys-table td {
+        padding: 8px 6px;
+    }
+
+    .apikeys-modal-content {
+        min-width: 0;
+        margin: 16px;
+    }
+}

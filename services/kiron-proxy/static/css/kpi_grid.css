@@ -1,0 +1,553 @@
+/* ========================================
+   Dashboard Template - Widget & KPI Styling
+   ======================================== */
+
+/* ========================================
+   Widget-Dashboard Layout
+   ======================================== */
+
+.widget-dashboard {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 20px;
+    padding: 20px;
+    align-items: start;
+}
+
+/* Masonry-Variante (Dashboard-Tab): Spalten packen unabhaengig voneinander,
+   damit kurze Widgets keine Luecke unter sich lassen (kein starres Zeilenraster
+   aus dem hoechsten Widget der Zeile). CSS-Multicol statt Grid; volle-Breite-
+   Widgets via column-span. Reihenfolge wird dadurch spalten- statt zeilenweise. */
+.widget-dashboard--masonry {
+    display: block;
+    column-count: 3;
+    column-gap: 20px;
+}
+
+.widget-dashboard--masonry .widget {
+    break-inside: avoid;
+    margin-bottom: 20px;
+}
+
+.widget--full {
+    grid-column: 1 / -1;
+}
+
+.widget-dashboard--masonry .widget--full {
+    column-span: all;
+}
+
+/* ========================================
+   Einzelnes Widget
+   ======================================== */
+
+.widget {
+    background-color: var(--bg-primary);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    box-shadow: var(--shadow);
+    overflow: hidden;
+}
+
+.widget-header {
+    background-color: var(--bg-secondary);
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border-color);
+}
+
+.widget-title {
+    font-size: 0.95rem;
+    font-weight: 600;
+    color: var(--text-primary);
+    margin: 0;
+}
+
+.widget-subtitle {
+    font-size: 0.8rem;
+    color: var(--text-secondary);
+    margin-top: 2px;
+    font-style: italic;
+}
+
+.widget-info {
+    padding: 8px 14px;
+    font-size: 0.85rem;
+    color: var(--text-secondary);
+    border-bottom: 1px solid var(--border-color);
+    background-color: var(--bg-primary);
+}
+
+.widget-body {
+    padding: 0;
+}
+
+/* ========================================
+   Widget-Tabelle
+   ======================================== */
+
+.widget-table {
+    width: 100%;
+    border-collapse: collapse;
+}
+
+.widget-table th {
+    padding: 8px 14px;
+    text-align: left;
+    font-weight: 600;
+    font-size: 0.8rem;
+    text-transform: uppercase;
+    color: var(--text-secondary);
+    border-bottom: 1px solid var(--border-color);
+    background-color: var(--bg-secondary);
+}
+
+.widget-table td {
+    padding: 8px 14px;
+    border-bottom: 1px solid var(--border-color);
+    font-size: 0.9rem;
+}
+
+.widget-table tr:last-child td {
+    border-bottom: none;
+}
+
+.widget-table tr:hover {
+    background-color: var(--bg-row-hover);
+}
+
+/* Farbige Werte in Widget-Tabellen */
+.widget-table td.kpi-green {
+    color: var(--color-bullish);
+    font-weight: 600;
+}
+
+.widget-table td.kpi-red {
+    color: var(--color-bearish);
+    font-weight: 600;
+}
+
+/* ========================================
+   KPI Cards Grid (für KPI-Widgets)
+   ======================================== */
+
+.kpi-cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+    gap: 12px;
+    padding: 16px;
+}
+
+@media (min-width: 1200px) {
+    .kpi-cards {
+        grid-template-columns: repeat(6, 1fr);
+    }
+}
+
+@media (min-width: 900px) and (max-width: 1199px) {
+    .kpi-cards {
+        grid-template-columns: repeat(4, 1fr);
+    }
+}
+
+@media (max-width: 600px) {
+    .kpi-cards {
+        grid-template-columns: repeat(2, 1fr);
+    }
+}
+
+/* ========================================
+   KPI Card
+   ======================================== */
+
+.kpi-card {
+    background-color: var(--bg-primary);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    padding: 14px 12px;
+    text-align: center;
+    transition: all var(--transition-speed);
+    box-shadow: var(--shadow);
+}
+
+.kpi-card:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+}
+
+.kpi-icon {
+    font-size: 1.4rem;
+    margin-bottom: 6px;
+    line-height: 1;
+}
+
+.kpi-value {
+    font-size: 1.5rem;
+    font-weight: 700;
+    margin-bottom: 4px;
+    line-height: 1.2;
+    color: var(--text-primary);
+}
+
+.kpi-title {
+    font-size: 0.8rem;
+    color: var(--text-secondary);
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+}
+
+/* ========================================
+   KPI Card Farben
+   ======================================== */
+
+.kpi-card.kpi-green .kpi-value {
+    color: var(--color-bullish);
+}
+
+.kpi-card.kpi-red .kpi-value {
+    color: var(--color-bearish);
+}
+
+.kpi-card.kpi-orange .kpi-value {
+    color: var(--color-unclear);
+}
+
+.kpi-card.kpi-green {
+    border-left: 3px solid var(--color-bullish);
+}
+
+.kpi-card.kpi-red {
+    border-left: 3px solid var(--color-bearish);
+}
+
+/* ========================================
+   Loading & Error States
+   ======================================== */
+
+.kpi-loading {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 50px 20px;
+    color: var(--text-secondary);
+    gap: 15px;
+}
+
+.kpi-loading .spinner {
+    width: 40px;
+    height: 40px;
+}
+
+.kpi-error {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 40px 20px;
+    color: var(--color-bearish);
+    gap: 10px;
+    background-color: var(--bg-secondary);
+    border-radius: 8px;
+    margin: 20px;
+}
+
+.kpi-error-icon {
+    font-size: 1.5rem;
+}
+
+.kpi-error-text {
+    font-size: 0.95rem;
+}
+
+.kpi-empty {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 30px 20px;
+    color: var(--text-secondary);
+    gap: 10px;
+}
+
+.kpi-empty-icon {
+    font-size: 2rem;
+}
+
+.kpi-empty-text {
+    font-size: 0.95rem;
+}
+
+/* ========================================
+   GPU Memory Manager
+   ======================================== */
+
+.widget[data-widget="sys-gpu-mgr"] {
+    grid-column: 1 / -1;
+}
+
+/* Stacked VRAM Bar */
+.gpu-mgr-bar {
+    display: flex;
+    height: 28px;
+    border-radius: 4px;
+    overflow: hidden;
+    margin: 16px;
+    background-color: var(--border-color);
+}
+
+.gpu-mgr-segment {
+    transition: width 0.3s ease;
+    min-width: 0;
+}
+
+.gpu-mgr-segment-ollama {
+    background: var(--color-bullish);
+}
+
+.gpu-mgr-segment-docling {
+    background: #9b59b6;
+}
+
+.gpu-mgr-segment-embed {
+    background: var(--color-unclear);
+}
+
+.gpu-mgr-segment-deberta {
+    background: #e67e22;
+}
+
+.gpu-mgr-segment-other {
+    background: #95a5a6;
+}
+
+.gpu-mgr-segment-free {
+    background: var(--border-color);
+}
+
+/* Legend */
+.gpu-mgr-legend {
+    display: flex;
+    gap: 16px;
+    padding: 0 16px 12px;
+    flex-wrap: wrap;
+    font-size: 0.85rem;
+    color: var(--text-secondary);
+}
+
+.gpu-mgr-legend-item {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+}
+
+.gpu-mgr-legend-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    display: inline-block;
+    flex-shrink: 0;
+}
+
+/* Service Table */
+.gpu-mgr-table th {
+    font-size: 0.8rem;
+    text-transform: uppercase;
+    color: var(--text-secondary);
+}
+
+/* Device Toggle */
+.gpu-mgr-device-toggle {
+    display: inline-flex;
+    gap: 2px;
+    margin-left: 6px;
+}
+
+.gpu-mgr-device-btn {
+    padding: 2px 8px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 11px;
+    font-weight: 600;
+    border: 1px solid var(--border-color);
+    background: transparent;
+    color: var(--text-secondary);
+    transition: all var(--transition-speed);
+}
+
+.gpu-mgr-device-btn:hover {
+    background-color: var(--bg-row-hover);
+    color: var(--text-primary);
+}
+
+.gpu-mgr-device-btn.active {
+    background: var(--color-bullish);
+    color: white;
+    border-color: var(--color-bullish);
+}
+
+/* Model Name in Service Table */
+.gpu-mgr-model-name {
+    font-size: 0.8rem;
+    color: var(--text-secondary);
+    font-style: italic;
+    margin-left: 4px;
+}
+
+/* ========================================
+   Wartungsmodus
+   ======================================== */
+
+.widget[data-widget="sys-maintenance"] {
+    grid-column: 1 / -1;
+}
+
+.maintenance-container {
+    padding: 16px;
+}
+
+.maintenance-toggle-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 16px;
+}
+
+.maintenance-info {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.maintenance-status {
+    font-size: 1.1rem;
+    font-weight: 700;
+    color: var(--color-bullish);
+}
+
+.maintenance-status.maintenance-active {
+    color: var(--color-bearish);
+}
+
+.maintenance-desc {
+    font-size: 0.85rem;
+    color: var(--text-secondary);
+}
+
+/* Toggle Switch */
+.maintenance-switch {
+    position: relative;
+    display: inline-block;
+    width: 52px;
+    height: 28px;
+    flex-shrink: 0;
+}
+
+.maintenance-switch input {
+    opacity: 0;
+    width: 0;
+    height: 0;
+}
+
+.maintenance-slider {
+    position: absolute;
+    cursor: pointer;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background-color: var(--border-color);
+    transition: 0.3s;
+    border-radius: 28px;
+}
+
+.maintenance-slider:before {
+    position: absolute;
+    content: "";
+    height: 22px;
+    width: 22px;
+    left: 3px;
+    bottom: 3px;
+    background-color: white;
+    transition: 0.3s;
+    border-radius: 50%;
+}
+
+.maintenance-switch input:checked + .maintenance-slider {
+    background-color: var(--color-bearish);
+}
+
+.maintenance-switch input:checked + .maintenance-slider:before {
+    transform: translateX(24px);
+}
+
+.maintenance-switch input:disabled + .maintenance-slider {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.maintenance-ports-table {
+    margin-top: 0;
+}
+
+/* ========================================
+   Dark Mode Anpassungen
+   ======================================== */
+
+[data-theme="dark"] .widget {
+    background-color: var(--bg-secondary);
+}
+
+[data-theme="dark"] .widget-header {
+    background-color: rgba(0, 0, 0, 0.2);
+}
+
+[data-theme="dark"] .widget-table th {
+    background-color: rgba(0, 0, 0, 0.2);
+}
+
+[data-theme="dark"] .kpi-card {
+    background-color: var(--bg-secondary);
+}
+
+/* ========================================
+   Responsive
+   ======================================== */
+
+@media (max-width: 1200px) {
+    .widget-dashboard {
+        grid-template-columns: repeat(2, 1fr);
+    }
+
+    .widget-dashboard--masonry {
+        column-count: 2;
+    }
+}
+
+@media (max-width: 768px) {
+    .widget-dashboard {
+        grid-template-columns: 1fr;
+        padding: 10px;
+        gap: 12px;
+    }
+
+    .widget-dashboard--masonry {
+        column-count: 1;
+        column-gap: 12px;
+    }
+
+    .widget-dashboard--masonry .widget {
+        margin-bottom: 12px;
+    }
+
+    .kpi-card {
+        padding: 12px 8px;
+    }
+
+    .kpi-value {
+        font-size: 1.3rem;
+    }
+
+    .kpi-icon {
+        font-size: 1.2rem;
+    }
+}

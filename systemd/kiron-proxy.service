@@ -1,0 +1,18 @@
+[Unit]
+Description=Kiron Proxy (Dashboard + Reverse Proxy + OpenAI API)
+After=network.target docker.service mariadb.service
+Wants=docker.service mariadb.service
+StartLimitBurst=5
+StartLimitIntervalSec=300
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/usr/lib/kiron/services/kiron-proxy
+ExecStart=/usr/lib/kiron/services/kiron-proxy/venv/bin/python main.py
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

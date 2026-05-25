@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environments
+venv/
+.venv/
+
+# Lokale Konfiguration mit Credentials (aus db_config.json.example erzeugen)
+data/db_config.json
+
+# Runtime-Daten
+data/metrics.db
+data/metrics.db-wal
+data/metrics.db-shm
+data/maintenance_mode.json
+
+# Runtime-Caches
+services/kiron-proxy/benchmarks_cache.json
+services/kiron-proxy/registry_cache.json
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store

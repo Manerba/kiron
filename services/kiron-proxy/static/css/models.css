@@ -1,0 +1,355 @@
+/* ========================================
+   Models Tab - Styling
+   ======================================== */
+
+.models-page {
+    max-width: 1500px;
+    margin: 0 auto;
+}
+
+/* Pull Section */
+
+/* Manual Pull Input */
+.models-pull-manual {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 12px;
+}
+
+.models-pull-input {
+    width: 280px;
+}
+
+.models-search-link {
+    font-size: 13px;
+    color: var(--accent-primary);
+    text-decoration: none;
+    white-space: nowrap;
+    transition: color var(--transition-speed);
+}
+
+.models-search-link:hover {
+    color: var(--accent-hover);
+    text-decoration: underline;
+}
+
+/* Pull Progress */
+.models-pull-progress {
+    margin-top: 12px;
+    margin-bottom: 12px;
+}
+
+.models-progress-bar-container {
+    width: 100%;
+    height: 20px;
+    background-color: var(--bg-primary);
+    border: 1px solid var(--border-color);
+    border-radius: 10px;
+    overflow: hidden;
+}
+
+.models-progress-bar {
+    height: 100%;
+    background: linear-gradient(90deg, var(--accent-primary), var(--color-bullish));
+    border-radius: 10px;
+    transition: width 0.3s ease;
+    width: 0%;
+}
+
+.models-progress-text {
+    font-size: 12px;
+    color: var(--text-secondary);
+    margin-top: 4px;
+}
+
+/* Registry Section */
+.models-registry-section {
+    margin-top: 8px;
+}
+
+/* Models Table */
+.models-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+}
+
+.models-table th {
+    text-align: left;
+    padding: 10px 12px;
+    background-color: var(--bg-secondary);
+    border-bottom: 2px solid var(--border-color);
+    color: var(--text-secondary);
+    font-weight: 600;
+    font-size: 12px;
+    white-space: nowrap;
+}
+
+.models-table td {
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--border-color);
+    vertical-align: middle;
+}
+
+.models-table tr:hover {
+    background-color: var(--bg-row-hover);
+}
+
+/* Registry Table specifics */
+.models-registry-table th {
+    background-color: transparent;
+}
+
+/* Expand Button */
+.models-expand-cell {
+    width: 30px;
+    text-align: center;
+}
+
+.models-expand-btn {
+    background: none;
+    border: 1px solid var(--border-color);
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 10px;
+    color: var(--text-secondary);
+    width: 24px;
+    height: 24px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    transition: all var(--transition-speed);
+}
+
+.models-expand-btn:hover {
+    background-color: var(--bg-row-hover);
+    color: var(--text-primary);
+}
+
+.models-expand-btn.expanded {
+    color: var(--accent-primary);
+    border-color: var(--accent-primary);
+}
+
+/* Tags Row (expanded) */
+.models-tags-row {
+    background-color: var(--bg-primary) !important;
+}
+
+.models-tags-row:hover {
+    background-color: var(--bg-primary) !important;
+}
+
+.models-tags-container {
+    padding: 4px 0 8px 30px;
+}
+
+/* Tags Sub-Table */
+.models-tags-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+}
+
+.models-tags-table th {
+    text-align: left;
+    padding: 6px 10px;
+    color: var(--text-secondary);
+    font-weight: 600;
+    font-size: 11px;
+    border-bottom: 1px solid var(--border-color);
+    background-color: transparent;
+}
+
+.models-tags-table td {
+    padding: 6px 10px;
+    border-bottom: 1px solid var(--border-color);
+}
+
+.models-tags-table tr:last-child td {
+    border-bottom: none;
+}
+
+.models-tags-table tr:hover {
+    background-color: var(--bg-row-hover);
+}
+
+/* Status Badges */
+.models-badge {
+    display: inline-block;
+    padding: 3px 10px;
+    border-radius: 12px;
+    font-size: 11px;
+    font-weight: 600;
+    white-space: nowrap;
+}
+
+.models-badge-vram {
+    background-color: rgba(40, 167, 69, 0.15);
+    color: var(--color-bullish);
+    border: 1px solid var(--color-bullish);
+}
+
+.models-badge-ram {
+    background-color: rgba(52, 152, 219, 0.15);
+    color: var(--accent-primary);
+    border: 1px solid var(--accent-primary);
+}
+
+.models-badge-mixed {
+    background-color: rgba(253, 126, 20, 0.15);
+    color: var(--color-unclear);
+    border: 1px solid var(--color-unclear);
+}
+
+.models-badge-unloaded {
+    background-color: rgba(108, 117, 125, 0.1);
+    color: var(--color-neutral);
+    border: 1px solid var(--color-neutral);
+}
+
+.models-badge-ollama {
+    background-color: rgba(52, 152, 219, 0.15);
+    color: var(--accent-primary);
+    border: 1px solid var(--accent-primary);
+}
+
+.models-badge-other {
+    background-color: rgba(108, 117, 125, 0.1);
+    color: var(--color-neutral);
+    border: 1px solid var(--color-neutral);
+}
+
+/* Embedding-Service aktiv (blau) */
+.models-badge-embed-active {
+    background-color: rgba(52, 152, 219, 0.15);
+    color: var(--accent-primary);
+    border: 1px solid var(--accent-primary);
+}
+
+/* Modelltyp-Badges */
+.models-badge-type-llm {
+    background-color: rgba(52, 152, 219, 0.12);
+    color: #5b9bd5;
+    border: 1px solid rgba(52, 152, 219, 0.4);
+}
+
+.models-badge-type-vlm {
+    background-color: rgba(155, 89, 182, 0.12);
+    color: #b07cc6;
+    border: 1px solid rgba(155, 89, 182, 0.4);
+}
+
+.models-badge-type-embed {
+    background-color: rgba(0, 188, 180, 0.12);
+    color: #2ec4b6;
+    border: 1px solid rgba(0, 188, 180, 0.4);
+}
+
+/* Embedding-Service Button */
+.models-btn-embed {
+    background-color: rgba(0, 188, 180, 0.1);
+    color: #2ec4b6;
+    border-color: rgba(0, 188, 180, 0.4);
+}
+
+.models-btn-embed:hover {
+    background-color: rgba(0, 188, 180, 0.25);
+}
+
+/* Context & Expires Info */
+.models-ctx,
+.models-expires {
+    font-size: 11px;
+    color: var(--text-secondary);
+    margin-top: 3px;
+}
+
+/* Memory Bar */
+.models-mem-bar-wrapper {
+    min-width: 120px;
+}
+
+.models-mem-bar {
+    display: flex;
+    height: 14px;
+    border-radius: 7px;
+    overflow: hidden;
+    background-color: var(--bg-primary);
+    border: 1px solid var(--border-color);
+}
+
+.models-mem-vram {
+    background-color: var(--color-bullish);
+    height: 100%;
+    transition: width 0.3s;
+}
+
+.models-mem-ram {
+    background-color: var(--accent-primary);
+    height: 100%;
+    transition: width 0.3s;
+}
+
+.models-mem-labels {
+    display: flex;
+    gap: 8px;
+    margin-top: 2px;
+    font-size: 10px;
+}
+
+.models-mem-label-vram {
+    color: var(--color-bullish);
+}
+
+.models-mem-label-ram {
+    color: var(--accent-primary);
+}
+
+/* Benchmark Columns */
+.models-bench-col {
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+    min-width: 55px;
+}
+
+/* Load Split-Button Group */
+.models-load-group {
+    display: flex;
+    gap: 4px;
+}
+
+/* Actions */
+.models-actions {
+    white-space: nowrap;
+    display: flex;
+    gap: 6px;
+    justify-content: flex-end;
+}
+
+/* Responsive */
+@media (max-width: 900px) {
+    .models-pull-manual {
+        flex-direction: column;
+        align-items: stretch;
+    }
+
+    .models-pull-input {
+        width: 100%;
+    }
+
+    .models-table {
+        font-size: 12px;
+    }
+
+    .models-table th,
+    .models-table td {
+        padding: 8px 6px;
+    }
+
+    .models-tags-container {
+        padding-left: 8px;
+    }
+}

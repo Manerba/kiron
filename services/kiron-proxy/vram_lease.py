@@ -1,0 +1,916 @@
+"""VRAM-Lease Helper-Modul fuer kiron-proxy (#285).
+
+Gemeinsames Modul fuer proxy.py, openai_api.py, app.py. Stellt:
+- `LeaseOutcome`-Enum (PASS/FORCE_CPU/BLOCK).
+- `snapshot()` — async TTL-Cache + Fetch + Fallback mit Thundering-
+  Herd-Lock.
+- `apply_bytes(body, path, model)` — bytes-Intercept fuer proxy.py.
+- `apply_options_dict(options)` — Dict-Intercept fuer openai_api.py.
+- `lifespan_client()` — async-Context-Manager fuer den shared httpx-
+  Client, vom main.py Startup/Shutdown aufgerufen.
+- `VRAM_LEASE_POLICY` — Policy-Env mit Validierung beim Modul-Import.
+"""
+
+import asyncio
+from dataclasses import dataclass
+import enum
+import fcntl
+import json
+import logging
+import os
+import stat
+import sys
+import time
+import uuid
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Any
+
+import httpx
+
+_COMMON_SRC = Path(__file__).resolve().parents[1] / "kiron-common"
+if _COMMON_SRC.exists() and str(_COMMON_SRC) not in sys.path:
+    sys.path.insert(0, str(_COMMON_SRC))
+
+try:
+    from kiron_common.ollama_compat import ensure_num_gpu_zero, is_real_int
+except ImportError:  # pragma: no cover - defensive fallback for half-upgraded venvs
+    def is_real_int(value: Any) -> bool:
+        return isinstance(value, int) and not isinstance(value, bool)
+
+    def ensure_num_gpu_zero(options: dict[str, Any] | None) -> dict[str, Any]:
+        if not isinstance(options, dict):
+            options = {}
+        if "num_gpu" not in options:
+            options["num_gpu"] = 0
+        return options
+
+__all__ = [
+    "LeaseOutcome",
+    "VRAM_LEASE_POLICY",
+    "DOCLING_LIFECYCLE_URL",
+    "STREAMING_INTERCEPT_PATHS",
+    "snapshot",
+    "effective_snapshot",
+    "apply_bytes",
+    "apply_ollama_embed_fallback",
+    "apply_options_dict",
+    "num_gpu_zero_effective",
+    "runtime_capability_status",
+    "invalidate_runtime_capability_cache",
+    "GPU_SERVICE_LOADING_TTL_S",
+    "GPU_SERVICE_START_DEADLINE_S",
+    "GPU_SERVICE_HEALTH_POLL_S",
+    "GPU_SERVICE_LOADING_DRAIN_TIMEOUT_S",
+    "GPU_SERVICE_LOADING_DRAIN_POLL_S",
+    "GPU_SERVICE_MARKER_SHORT_TTL_S",
+    "GPU_SERVICE_LOADING_MARKER_PATH",
+    "MarkerOwnershipError",
+    "GPUGateDecision",
+    "GPUServiceOperation",
+    "gpu_gate_decision",
+    "overlay_marker_active",
+    "write_overlay_marker",
+    "refresh_overlay_marker",
+    "clear_overlay_marker",
+    "gpu_service_operation",
+    "begin_gpu_service_operation",
+    "finish_gpu_service_operation",
+    "gpu_service_ops_lock",
+    "lifespan_client",
+]
+
+logger = logging.getLogger(__name__)
+
+
+# --- Konstanten / Konfiguration ---
+
+DOCLING_LIFECYCLE_URL = "http://127.0.0.1:5001/_internal/lifecycle"
+
+# Pfade auf denen Chat/Generate-Intercept greift. Wird von proxy.py als
+# Referenz fuer die STREAMING_PATHS-Menge reused.
+STREAMING_INTERCEPT_PATHS = frozenset({"/api/chat", "/api/generate"})
+
+# Modelle fuer die Ollama selbst das Embedding bedient (7B+) — Teilintercept
+# auf /api/embed fuer diese Modelle (siehe Plan Pfad 2 / F1).
+_OLLAMA_EMBED_MODELS = frozenset({
+    "e5-mistral-7b-instruct", "gte-qwen2-7b-instruct",
+})
+
+# V1: Der fruehere Env-Bypass darf `/api/embed` nicht mehr lockern.
+_EMBED_BLOCK_FALLBACK = True
+if os.environ.get("KIRON_VRAM_LEASE_EMBED_BLOCK") == "0":
+    logger.warning(
+        "KIRON_VRAM_LEASE_EMBED_BLOCK=0 wird in V1 ignoriert; "
+        "/api/embed bleibt bei aktivem Gate konservativ geblockt."
+    )
+
+_LEASE_CACHE_TTL_S = 2.0
+_LEASE_FETCH_TIMEOUT_S = 0.5
+_LEASE_UNREACHABLE_LOG_INTERVAL_S = 60.0
+_PASS_WARNING_LOG_INTERVAL_S = 60.0
+
+RUNTIME_CAPABILITY_PATH = os.environ.get(
+    "KIRON_OLLAMA_COMPAT_RUNTIME",
+    "/usr/lib/kiron/data/ollama_compat_runtime.json",
+)
+_RUNTIME_CAPABILITY_CACHE_TTL_S = 1.0
+_runtime_capability_cache: dict[str, Any] = {
+    "ts": 0.0,
+    "stat_key": None,
+    "status": None,
+}
+
+RUNTIME_MARKER_DIR = Path(os.environ.get("KIRON_RUNTIME_DIR", "/run/kiron"))
+STARTUP_MARKER_PATH = RUNTIME_MARKER_DIR / "docling-vram-startup.json"
+SHUTDOWN_MARKER_PATH = RUNTIME_MARKER_DIR / "docling-vram-shutdown.json"
+GPU_SERVICE_LOADING_MARKER_PATH = RUNTIME_MARKER_DIR / "gpu-service-loading.json"
+_MARKER_MAX_TTL_S = 15 * 60.0
+
+GPU_SERVICE_LOADING_TTL_S = 300.0
+GPU_SERVICE_START_DEADLINE_S = 240.0
+GPU_SERVICE_HEALTH_POLL_S = 0.5
+GPU_SERVICE_LOADING_DRAIN_TIMEOUT_S = 300.0
+GPU_SERVICE_LOADING_DRAIN_POLL_S = 0.5
+GPU_SERVICE_MARKER_SHORT_TTL_S = 5.0
+
+
+# --- Policy-Resolver ---
+
+_POLICY_CHOICES = ("block", "force_cpu", "pass")
+
+
+def _resolve_policy() -> str:
+    raw = os.environ.get("KIRON_VRAM_LEASE_POLICY", "force_cpu")
+    if raw not in _POLICY_CHOICES:
+        logger.warning(
+            "KIRON_VRAM_LEASE_POLICY=%r ist ungueltig (erwartet: %s) — "
+            "fallback auf 'force_cpu'.",
+            raw, "|".join(_POLICY_CHOICES),
+        )
+        return "force_cpu"
+    return raw
+
+
+VRAM_LEASE_POLICY = _resolve_policy()
+
+
+# --- Outcome-Enum ---
+
+class LeaseOutcome(enum.Enum):
+    PASS = "pass"
+    FORCE_CPU = "force_cpu"
+    BLOCK = "block"
+
+
+class MarkerOwnershipError(RuntimeError):
+    """Raised when an active marker is owned by another process/token."""
+
+
+@dataclass(frozen=True)
+class GPUGateDecision:
+    allowed: bool
+    reason: str
+    status_code: int = 200
+    marker_kind: str | None = None
+    lease_state: str = "inactive"
+    service_name: str = "GPU-Service"
+
+
+@dataclass
+class GPUServiceOperation:
+    allowed: bool
+    decision: GPUGateDecision
+    token: str | None = None
+    clear_marker: bool = False
+    lock_acquired: bool = False
+
+
+# --- Module-State ---
+
+_lease_cache: dict[str, float | bool] = {"active": False, "ts": 0.0}
+_lease_fetch_lock = asyncio.Lock()
+gpu_service_ops_lock = asyncio.Lock()
+_shared_client: httpx.AsyncClient | None = None
+
+_last_unreachable_log_ts: float = 0.0
+_last_pass_warning_log_ts: float = 0.0
+
+
+def _log_unreachable_throttled(err: Exception | None = None) -> None:
+    """Max 1 Warning pro 60s, damit Docling-Down nicht das Log flutet."""
+    global _last_unreachable_log_ts
+    now = time.monotonic()
+    if now - _last_unreachable_log_ts < _LEASE_UNREACHABLE_LOG_INTERVAL_S:
+        return
+    _last_unreachable_log_ts = now
+    logger.warning(
+        "VRAM-Lease: Docling-Lifecycle (%s) unreachable: %s — "
+        "fallback lease_active=False",
+        DOCLING_LIFECYCLE_URL, err,
+    )
+
+
+def _log_pass_passthrough_throttled() -> None:
+    """Max 1 Warning pro 60s bei Policy=pass + aktivem Lease."""
+    global _last_pass_warning_log_ts
+    now = time.monotonic()
+    if now - _last_pass_warning_log_ts < _PASS_WARNING_LOG_INTERVAL_S:
+        return
+    _last_pass_warning_log_ts = now
+    logger.warning(
+        "VRAM-Lease aktiv, aber Policy=pass — Request passthrough "
+        "(#285 Debug-Modus)."
+    )
+
+
+def _warn_runtime_capability(message: str) -> dict[str, Any]:
+    return {"safe": False, "reason": message}
+
+
+def _path_is_safe_regular_file(path: Path) -> tuple[bool, str, os.stat_result | None]:
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return False, "missing", None
+    except OSError as exc:
+        return False, f"stat_failed:{exc}", None
+    if stat.S_ISLNK(st.st_mode):
+        return False, "symlink", st
+    if not stat.S_ISREG(st.st_mode):
+        return False, "not_regular", st
+    if st.st_uid != 0:
+        return False, "file_not_root_owned", st
+    if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        return False, "file_group_or_world_writable", st
+    parent = path.parent
+    try:
+        pst = os.stat(parent)
+    except OSError as exc:
+        return False, f"parent_stat_failed:{exc}", st
+    if pst.st_uid != 0:
+        return False, "parent_not_root_owned", st
+    if pst.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        return False, "parent_group_or_world_writable", st
+    return True, "ok", st
+
+
+def invalidate_runtime_capability_cache() -> None:
+    _runtime_capability_cache["ts"] = 0.0
+    _runtime_capability_cache["stat_key"] = None
+    _runtime_capability_cache["status"] = None
+
+
+def runtime_capability_status() -> dict[str, Any]:
+    """Return safety status for runtime `num_gpu=0` handoff.
+
+    Missing, malformed or unsafe files fail closed. The short cache is
+    stat-key aware so replacing/removing the file invalidates a previous
+    safe result quickly and usually on the next call.
+    """
+    path = Path(RUNTIME_CAPABILITY_PATH)
+    ok, reason, st = _path_is_safe_regular_file(path)
+    stat_key = None
+    if st is not None:
+        stat_key = (st.st_dev, st.st_ino, st.st_mtime_ns, st.st_size, st.st_mode, st.st_uid)
+    now = time.monotonic()
+    cached = _runtime_capability_cache.get("status")
+    if (
+        cached is not None
+        and _runtime_capability_cache.get("stat_key") == stat_key
+        and now - float(_runtime_capability_cache.get("ts", 0.0)) < _RUNTIME_CAPABILITY_CACHE_TTL_S
+    ):
+        return dict(cached)
+
+    if not ok:
+        status = _warn_runtime_capability(reason)
+    else:
+        try:
+            with path.open("r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, json.JSONDecodeError) as exc:
+            status = _warn_runtime_capability(f"read_or_json_failed:{exc}")
+        else:
+            if not isinstance(data, dict):
+                status = _warn_runtime_capability("root_not_object")
+            elif not isinstance(data.get("image_digest"), str) or not data.get("image_digest"):
+                status = _warn_runtime_capability("missing_image_digest")
+            elif not isinstance(data.get("report_path"), str) or not data.get("report_path"):
+                status = _warn_runtime_capability("missing_report_path")
+            elif not isinstance(data.get("num_gpu_zero_effective"), bool):
+                status = _warn_runtime_capability("num_gpu_zero_effective_not_bool")
+            elif data.get("num_gpu_zero_effective") is not True:
+                status = _warn_runtime_capability("num_gpu_zero_effective_false")
+            else:
+                status = {
+                    "safe": True,
+                    "reason": "ok",
+                    "image_digest": data.get("image_digest"),
+                    "report_path": data.get("report_path"),
+                }
+
+    _runtime_capability_cache["ts"] = now
+    _runtime_capability_cache["stat_key"] = stat_key
+    _runtime_capability_cache["status"] = dict(status)
+    return status
+
+
+def num_gpu_zero_effective() -> bool:
+    return bool(runtime_capability_status().get("safe"))
+
+
+def _marker_payload(path: Path) -> tuple[dict[str, Any] | None, bool]:
+    """Return marker payload and active flag.
+
+    Missing or expired markers are inactive. Unsafe, unreadable or malformed
+    markers are active fail-closed and have no trusted payload.
+    """
+    ok, reason, _ = _path_is_safe_regular_file(path)
+    if not ok:
+        if reason == "missing":
+            return None, False
+        logger.warning("VRAM-Lease Marker %s unsafe: %s", path, reason)
+        return None, True
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("VRAM-Lease Marker %s nicht lesbar: %s", path, exc)
+        return None, True
+    if not isinstance(data, dict):
+        return None, True
+    deadline = data.get("deadline_monotonic")
+    created_wall = data.get("created_wall")
+    ttl = data.get("ttl_s")
+    if isinstance(deadline, (int, float)) and not isinstance(deadline, bool):
+        return data, time.monotonic() < float(deadline)
+    if (
+        isinstance(created_wall, (int, float))
+        and not isinstance(created_wall, bool)
+        and isinstance(ttl, (int, float))
+        and not isinstance(ttl, bool)
+    ):
+        ttl_s = max(0.0, min(float(ttl), _MARKER_MAX_TTL_S))
+        return data, time.time() < float(created_wall) + ttl_s
+    return None, True
+
+
+def _marker_active(path: Path) -> bool:
+    _, active = _marker_payload(path)
+    return active
+
+
+def _overlay_active() -> bool:
+    return (
+        _marker_active(STARTUP_MARKER_PATH)
+        or _marker_active(SHUTDOWN_MARKER_PATH)
+        or _marker_active(GPU_SERVICE_LOADING_MARKER_PATH)
+    )
+
+
+def _marker_path(kind: str) -> Path:
+    if kind == "startup":
+        return STARTUP_MARKER_PATH
+    if kind == "shutdown":
+        return SHUTDOWN_MARKER_PATH
+    if kind == "gpu_service_loading":
+        return GPU_SERVICE_LOADING_MARKER_PATH
+    raise ValueError(f"unknown overlay marker kind: {kind!r}")
+
+
+def overlay_marker_active(kind: str) -> bool:
+    return _marker_active(_marker_path(kind))
+
+
+def _hard_overlay_marker_kind() -> str | None:
+    for kind in ("gpu_service_loading", "startup", "shutdown"):
+        if overlay_marker_active(kind):
+            return kind
+    return None
+
+
+def _marker_lock_path(path: Path) -> Path:
+    return path.with_name(f".{path.name}.lock")
+
+
+def _write_marker_payload(path: Path, payload: dict[str, Any]) -> None:
+    tmp = path.with_name(f".{path.name}.{payload['token']}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, separators=(",", ":"))
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def write_overlay_marker(
+    kind: str = "startup", *, ttl_s: float = 300.0, token: str | None = None,
+) -> str:
+    """Atomically write an owned effective-gate overlay marker.
+
+    Active foreign, tokenless, malformed or unsafe markers fail closed and are
+    never overwritten. Passing `token` refreshes only that owned marker.
+    """
+    token = token or uuid.uuid4().hex
+    path = _marker_path(kind)
+    path.parent.mkdir(parents=True, mode=0o755, exist_ok=True)
+    lock_path = _marker_lock_path(path)
+    payload = {
+        "token": token,
+        "kind": kind,
+        "pid": os.getpid(),
+        "created_wall": time.time(),
+        "deadline_monotonic": time.monotonic() + max(1.0, min(ttl_s, _MARKER_MAX_TTL_S)),
+        "ttl_s": max(1.0, min(ttl_s, _MARKER_MAX_TTL_S)),
+    }
+    lock_fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        current, active = _marker_payload(path)
+        if active:
+            current_token = current.get("token") if isinstance(current, dict) else None
+            if not isinstance(current_token, str) or current_token != token:
+                raise MarkerOwnershipError(f"active {kind} marker is owned by another token")
+        _write_marker_payload(path, payload)
+    finally:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(lock_fd)
+    invalidate_runtime_capability_cache()
+    return token
+
+
+def refresh_overlay_marker(kind: str, token: str, *, ttl_s: float = 300.0) -> bool:
+    try:
+        write_overlay_marker(kind, ttl_s=ttl_s, token=token)
+        return True
+    except MarkerOwnershipError:
+        return False
+
+
+def clear_overlay_marker(kind: str = "startup", token: str | None = None) -> None:
+    """Remove overlay marker only if ownership token matches."""
+    path = _marker_path(kind)
+    if token is None:
+        return
+    path.parent.mkdir(parents=True, mode=0o755, exist_ok=True)
+    lock_path = _marker_lock_path(path)
+    lock_fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        data, active = _marker_payload(path)
+        if data is None:
+            return
+        if data.get("token") != token:
+            return
+        try:
+            path.unlink()
+        except OSError:
+            pass
+    finally:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(lock_fd)
+
+
+# --- lifespan / shared client ---
+
+@asynccontextmanager
+async def lifespan_client():
+    """Verwaltet den langlebigen httpx-Client zu Docling-Lifecycle.
+
+    Aufruf aus main.py Startup. Setzt `_shared_client` waehrend des
+    Kontextes und leert ihn beim Exit.
+    """
+    global _shared_client
+    client = httpx.AsyncClient(
+        timeout=httpx.Timeout(
+            connect=_LEASE_FETCH_TIMEOUT_S,
+            read=_LEASE_FETCH_TIMEOUT_S,
+            write=_LEASE_FETCH_TIMEOUT_S,
+            pool=_LEASE_FETCH_TIMEOUT_S,
+        ),
+        limits=httpx.Limits(
+            max_connections=5,
+            max_keepalive_connections=2,
+        ),
+    )
+    _shared_client = client
+    try:
+        yield client
+    finally:
+        _shared_client = None
+        try:
+            await client.aclose()
+        except Exception:
+            logger.exception("VRAM-Lease client.aclose() fehlgeschlagen")
+
+
+# --- snapshot (TTL-Cache + Thundering-Herd-Lock) ---
+
+async def snapshot() -> bool:
+    """Liefert den gecachten Lease-Zustand (True = Docling haelt GPU).
+
+    Robust gegen `_shared_client is None` (vor lifespan_client-Startup
+    oder nach Shutdown): liefert `False`, keine Exception, kein Log.
+
+    TTL 2s; parallele Cache-Misses werden unter `_lease_fetch_lock`
+    serialisiert — der Lifecycle-Endpoint bekommt genau EINEN Fetch
+    statt N.
+    """
+    if _shared_client is None:
+        return False
+    now = time.monotonic()
+    if now - float(_lease_cache["ts"]) < _LEASE_CACHE_TTL_S:
+        return bool(_lease_cache["active"])
+
+    async with _lease_fetch_lock:
+        # Zweiter Check: paralleler Fetch hat moeglicherweise schon
+        # waehrend wir auf das Lock warteten den Cache refreshed.
+        now = time.monotonic()
+        if now - float(_lease_cache["ts"]) < _LEASE_CACHE_TTL_S:
+            return bool(_lease_cache["active"])
+        try:
+            resp = await _shared_client.get(DOCLING_LIFECYCLE_URL)
+            if resp.status_code == 200:
+                data = resp.json()
+                _lease_cache["active"] = bool(data.get("vram_lease_active"))
+                _lease_cache["ts"] = time.monotonic()
+                return bool(_lease_cache["active"])
+            _log_unreachable_throttled(
+                RuntimeError(f"HTTP {resp.status_code}")
+            )
+        except Exception as e:
+            _log_unreachable_throttled(e)
+        _lease_cache["active"] = False
+        _lease_cache["ts"] = time.monotonic()
+        return False
+
+
+async def effective_snapshot() -> bool:
+    """Lifecycle snapshot plus crash/startup/shutdown overlays.
+
+    `snapshot()` remains lifecycle-only and keeps its historical
+    fail-open fallback for callers like the release watcher. Runtime GPU
+    gates call this function.
+    """
+    if _overlay_active():
+        return True
+    return await snapshot()
+
+
+async def gpu_gate_decision(
+    force: bool = False,
+    service_name: str = "GPU-Service",
+) -> GPUGateDecision:
+    """Shared hard-GPU gate decision without framework response objects."""
+    hard_kind = _hard_overlay_marker_kind()
+    if hard_kind is not None:
+        return GPUGateDecision(
+            allowed=False,
+            reason="gpu_overlay_active",
+            status_code=409,
+            marker_kind=hard_kind,
+            lease_state="overlay",
+            service_name=service_name,
+        )
+    lease_active = await snapshot()
+    if lease_active and not force and VRAM_LEASE_POLICY != "pass":
+        return GPUGateDecision(
+            allowed=False,
+            reason="docling_lifecycle_lease_active",
+            status_code=409,
+            lease_state="lifecycle",
+            service_name=service_name,
+        )
+    if lease_active and VRAM_LEASE_POLICY == "pass":
+        _log_pass_passthrough_throttled()
+    return GPUGateDecision(
+        allowed=True,
+        reason="allowed",
+        status_code=200,
+        lease_state="lifecycle" if lease_active else "inactive",
+        service_name=service_name,
+    )
+
+
+def _marker_write_decision(
+    service_name: str,
+    exc: BaseException,
+) -> GPUGateDecision:
+    return GPUGateDecision(
+        allowed=False,
+        reason=f"gpu_service_marker_write_failed:{type(exc).__name__}",
+        status_code=409,
+        lease_state="marker_write_failed",
+        service_name=service_name,
+    )
+
+
+@asynccontextmanager
+async def gpu_service_operation(
+    *,
+    force: bool = False,
+    service_name: str = "GPU-Service",
+    marker_ttl_s: float = GPU_SERVICE_LOADING_TTL_S,
+):
+    """Serialize a marker-led GPU service operation in the proxy process.
+
+    The marker is fail-closed by default. Callers set `op.clear_marker = True`
+    only after an endpoint-specific, unambiguous success or no-start result.
+    """
+    op = await begin_gpu_service_operation(
+        force=force,
+        service_name=service_name,
+        marker_ttl_s=marker_ttl_s,
+    )
+    try:
+        yield op
+    finally:
+        await finish_gpu_service_operation(op)
+
+
+async def begin_gpu_service_operation(
+    *,
+    force: bool = False,
+    service_name: str = "GPU-Service",
+    marker_ttl_s: float = GPU_SERVICE_LOADING_TTL_S,
+) -> GPUServiceOperation:
+    await gpu_service_ops_lock.acquire()
+    decision = await gpu_gate_decision(force=force, service_name=service_name)
+    if not decision.allowed:
+        gpu_service_ops_lock.release()
+        return GPUServiceOperation(False, decision)
+    try:
+        token = write_overlay_marker(
+            "gpu_service_loading",
+            ttl_s=marker_ttl_s,
+        )
+    except Exception as exc:
+        logger.warning("GPU-Service marker write failed for %s: %s", service_name, exc)
+        gpu_service_ops_lock.release()
+        return GPUServiceOperation(False, _marker_write_decision(service_name, exc))
+    op = GPUServiceOperation(True, decision, token=token, lock_acquired=True)
+    post_kind = None
+    for kind in ("startup", "shutdown"):
+        if overlay_marker_active(kind):
+            post_kind = kind
+            break
+    if post_kind is not None:
+        op.allowed = False
+        op.decision = GPUGateDecision(
+            allowed=False,
+            reason="gpu_overlay_active",
+            status_code=409,
+            marker_kind=post_kind,
+            lease_state="overlay",
+            service_name=service_name,
+        )
+        op.clear_marker = True
+        await finish_gpu_service_operation(op)
+    return op
+
+
+async def finish_gpu_service_operation(op: GPUServiceOperation) -> None:
+    try:
+        if op.clear_marker and op.token is not None:
+            clear_overlay_marker("gpu_service_loading", op.token)
+    finally:
+        if op.lock_acquired:
+            op.lock_acquired = False
+            gpu_service_ops_lock.release()
+
+
+# --- Interne Helfer ---
+
+def _num_gpu_explicit(options: dict) -> bool:
+    """True wenn der Client num_gpu explizit gesetzt hat.
+
+    Wichtig: 0 gilt als explizit (Client will bewusst CPU), 99 auch.
+    """
+    return "num_gpu" in options
+
+
+def _explicit_num_gpu_zero(options: dict) -> bool:
+    return is_real_int(options.get("num_gpu")) and options.get("num_gpu") == 0
+
+
+def _evaluate_chat_generate_options(options: dict, *, explicit: bool) -> LeaseOutcome:
+    if explicit:
+        if _explicit_num_gpu_zero(options) and num_gpu_zero_effective():
+            return LeaseOutcome.FORCE_CPU
+        return LeaseOutcome.BLOCK
+    if not num_gpu_zero_effective():
+        return LeaseOutcome.BLOCK
+    ensure_num_gpu_zero(options)
+    return LeaseOutcome.FORCE_CPU
+
+
+def _explicit_verified_cpu_offload_from_body(body: bytes) -> bool:
+    try:
+        data = json.loads(body) if body else {}
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    options = data.get("options")
+    if not isinstance(options, dict):
+        return False
+    return _explicit_num_gpu_zero(options) and num_gpu_zero_effective()
+
+
+def _embed_outcome(model: str, lease_active: bool, policy: str) -> LeaseOutcome:
+    """Sub-Logik fuer /api/embed-Pfad (Pfad 2)."""
+    if not lease_active:
+        return LeaseOutcome.PASS
+    if policy == "pass":
+        _log_pass_passthrough_throttled()
+        return LeaseOutcome.PASS
+    if model not in _OLLAMA_EMBED_MODELS:
+        # EMBED_SERVICE_MODELS + unbekannte: nicht Teil des Intercepts
+        return LeaseOutcome.PASS
+    if policy == "block":
+        return LeaseOutcome.BLOCK
+    # force_cpu: Ollama honoriert num_gpu auf /api/embed nicht zuverlaessig
+    # (F1). Konservativ auf Block zurueckfallen, ausser explizit deaktiviert.
+    if _EMBED_BLOCK_FALLBACK:
+        return LeaseOutcome.BLOCK
+    return LeaseOutcome.FORCE_CPU
+
+
+# --- Public Intercept-Helfer ---
+
+async def apply_bytes(
+    body: bytes, path: str, model: str,
+) -> tuple[bytes, LeaseOutcome]:
+    """Lease-Intercept fuer bytes-basierte Bodies (proxy.py-Pfad).
+
+    Liefert (possibly-modified-body, outcome):
+    - PASS      → Body unveraendert weiter, kein Header.
+    - FORCE_CPU → Body mit `options.num_gpu=0` ergaenzt, Header
+                  `X-Kiron-VRAM-Lease: force-cpu`.
+    - BLOCK     → Caller liefert 503-JSON-Body, Header
+                  `X-Kiron-VRAM-Lease: blocked`.
+
+    Angewandte Matrix:
+    - path nicht in STREAMING_INTERCEPT_PATHS ∪ {/api/embed} → PASS.
+    - JSON-unparseable → PASS.
+    - Client-`options.num_gpu` bereits gesetzt → PASS.
+    - /api/embed mit OLLAMA_EMBED_MODELS: siehe `_embed_outcome`.
+    """
+    normalized_path = path
+    is_embed = normalized_path == "/api/embed"
+    if normalized_path not in STREAMING_INTERCEPT_PATHS and not is_embed:
+        return body, LeaseOutcome.PASS
+
+    hard_kind = _hard_overlay_marker_kind()
+    if hard_kind is not None:
+        if (
+            normalized_path in STREAMING_INTERCEPT_PATHS
+            and _explicit_verified_cpu_offload_from_body(body)
+        ):
+            return body, LeaseOutcome.PASS
+        return body, LeaseOutcome.BLOCK
+
+    lease_active = await snapshot()
+    policy = VRAM_LEASE_POLICY
+
+    if is_embed:
+        outcome = _embed_outcome(_normalize_model_name(model),
+                                 lease_active, policy)
+        if outcome == LeaseOutcome.PASS:
+            return body, LeaseOutcome.PASS
+        if outcome == LeaseOutcome.BLOCK:
+            return body, LeaseOutcome.BLOCK
+        return body, LeaseOutcome.BLOCK
+
+    # chat/generate
+    if not lease_active:
+        return body, LeaseOutcome.PASS
+    if policy == "pass":
+        _log_pass_passthrough_throttled()
+        return body, LeaseOutcome.PASS
+    if policy == "block":
+        return body, LeaseOutcome.BLOCK
+    # force_cpu
+    try:
+        data = json.loads(body) if body else {}
+        if not isinstance(data, dict):
+            return body, LeaseOutcome.PASS
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return body, LeaseOutcome.PASS
+
+    options = data.get("options")
+    if not isinstance(options, dict):
+        options = {}
+    explicit_num_gpu = _num_gpu_explicit(options)
+    outcome = _evaluate_chat_generate_options(options, explicit=explicit_num_gpu)
+    if outcome == LeaseOutcome.BLOCK:
+        return body, LeaseOutcome.BLOCK
+    data["options"] = options
+    new_body = json.dumps(data, ensure_ascii=False,
+                          separators=(",", ":")).encode("utf-8")
+    return new_body, outcome
+
+
+async def apply_ollama_embed_fallback(
+    body: bytes, path: str, model: str,
+) -> tuple[bytes, LeaseOutcome]:
+    """Gate final Ollama `/api/embed` fallback posts.
+
+    This is intentionally stricter than `apply_bytes(..., "/api/embed",
+    EMBED_SERVICE_MODEL)`: service-routed models normally pass to
+    kiron-embeddings, but the ConnectError fallback becomes a real Ollama
+    GPU path and must be blocked while Docling owns the effective gate.
+    """
+    if path != "/api/embed":
+        return body, LeaseOutcome.PASS
+    hard_kind = _hard_overlay_marker_kind()
+    if hard_kind is not None:
+        return body, LeaseOutcome.BLOCK
+    if not await snapshot():
+        return body, LeaseOutcome.PASS
+    if VRAM_LEASE_POLICY == "pass":
+        _log_pass_passthrough_throttled()
+        return body, LeaseOutcome.PASS
+    return body, LeaseOutcome.BLOCK
+
+
+async def apply_options_dict(options: dict) -> LeaseOutcome:
+    """Lease-Intercept fuer Dict-basierte Bodies (openai_api.py-Pfad).
+
+    Ruft intern `snapshot()` — symmetrisch zu `apply_bytes`. Mutiert
+    das uebergebene Dict in place: setzt `options["num_gpu"] = 0` bei
+    FORCE_CPU, wenn der Client num_gpu nicht bereits explizit gesetzt
+    hat. Gibt Outcome zurueck:
+
+    - PASS      → Dict unveraendert, kein Header.
+    - FORCE_CPU → Dict mutiert, Caller setzt Header
+                  `X-Kiron-VRAM-Lease: force-cpu`.
+    - BLOCK     → Dict unveraendert, Caller liefert 503.
+    """
+    hard_kind = _hard_overlay_marker_kind()
+    if hard_kind is not None:
+        if _explicit_num_gpu_zero(options) and num_gpu_zero_effective():
+            return LeaseOutcome.PASS
+        return LeaseOutcome.BLOCK
+
+    lease_active = await snapshot()
+    policy = VRAM_LEASE_POLICY
+    if not lease_active:
+        return LeaseOutcome.PASS
+    if policy == "pass":
+        _log_pass_passthrough_throttled()
+        return LeaseOutcome.PASS
+    if policy == "block":
+        return LeaseOutcome.BLOCK
+    # force_cpu
+    return _evaluate_chat_generate_options(
+        options,
+        explicit=_num_gpu_explicit(options),
+    )
+
+
+# --- Body-Modifikation ---
+
+def _inject_num_gpu_zero(body: bytes) -> bytes:
+    """Setzt options.num_gpu=0 in JSON-Body. Unparseable → Original."""
+    try:
+        data = json.loads(body) if body else {}
+        if not isinstance(data, dict):
+            return body
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return body
+    options = data.get("options")
+    if not isinstance(options, dict):
+        options = {}
+    if "num_gpu" not in options:
+        options["num_gpu"] = 0
+    data["options"] = options
+    return json.dumps(data, ensure_ascii=False,
+                      separators=(",", ":")).encode("utf-8")
+
+
+def _normalize_model_name(name: str) -> str:
+    """Gleiche Normalisierung wie proxy.normalize_embed_model, damit
+    /api/embed-Modellvergleich konsistent ist."""
+    if not isinstance(name, str) or not name:
+        return ""
+    if "/" in name:
+        name = name.rsplit("/", 1)[1]
+    if ":" in name:
+        name = name.split(":")[0]
+    return name.lower()

@@ -1,0 +1,5 @@
+#!/bin/sh
+# Kernel-postinst-Hook (Track 3.1): nach Kernel-/Modul-Installation den
+# GRUB-Default auf einen Kernel mit nvidia.ko zwingen. zzz-Prefix => laeuft
+# NACH zz-update-grub, damit grub.cfg den neuen Kernel bereits enthaelt.
+exec /usr/local/sbin/kiron-nvidia-boot-guard

@@ -1,0 +1,18 @@
+[Unit]
+Description=Kiron Embeddings (Sentence-Transformers)
+After=network.target
+StartLimitBurst=5
+StartLimitIntervalSec=300
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/usr/lib/kiron/services/kiron-embeddings
+ExecStart=/usr/lib/kiron/services/kiron-embeddings/venv/bin/python main.py
+Restart=always
+RestartSec=30
+Environment=PYTHONUNBUFFERED=1
+Environment=CUDA_VISIBLE_DEVICES=0
+
+[Install]
+WantedBy=multi-user.target

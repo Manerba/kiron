@@ -1,0 +1,118 @@
+/* ========================================
+   Tabellen-Optik: Karten-Zeilen-Stil (analog kiara .data-table)
+   Angewandt auf Kirons bestehende Tabellen-Klassen. Muss NACH den
+   Feature-CSS (models/kpi_grid/requests) eingebunden werden, um deren
+   Basis-Look zu ueberschreiben. Kompakt-Ansicht via [data-density="compact"].
+   ======================================== */
+
+.data-table,
+.widget-table,
+.request-table,
+.models-table,
+.models-tags-table {
+    width: 100%;
+    border-collapse: separate;
+    border-spacing: 0 4px;
+}
+
+.data-table thead th,
+.widget-table thead th,
+.request-table thead th,
+.models-table thead th,
+.models-tags-table thead th {
+    background-color: var(--bg-header);
+    color: var(--text-header);
+    font-weight: 500;
+    font-size: 12px;
+    text-transform: none;
+    padding: 10px 12px;
+    white-space: nowrap;
+    text-align: left;
+    border: none;
+}
+
+.data-table thead th:first-child,
+.widget-table thead th:first-child,
+.request-table thead th:first-child,
+.models-table thead th:first-child,
+.models-tags-table thead th:first-child {
+    border-radius: 6px 0 0 6px;
+}
+
+.data-table thead th:last-child,
+.widget-table thead th:last-child,
+.request-table thead th:last-child,
+.models-table thead th:last-child,
+.models-tags-table thead th:last-child {
+    border-radius: 0 6px 6px 0;
+}
+
+.data-table tbody tr,
+.widget-table tbody tr,
+.request-table tbody tr,
+.models-table tbody tr,
+.models-tags-table tbody tr {
+    background-color: var(--bg-accordion-header);
+    box-shadow: var(--shadow);
+    transition: box-shadow var(--transition-speed), background-color var(--transition-speed);
+}
+
+.data-table tbody tr:hover,
+.widget-table tbody tr:hover,
+.request-table tbody tr:hover,
+.models-table tbody tr:hover,
+.models-tags-table tbody tr:hover {
+    box-shadow: 0 4px 8px rgba(0, 0, 0, 0.15);
+    background-color: var(--bg-row-hover);
+}
+
+.data-table tbody td,
+.widget-table tbody td,
+.request-table tbody td,
+.models-table tbody td,
+.models-tags-table tbody td {
+    padding: 10px 12px;
+    border-top: 1px solid var(--border-color);
+    border-bottom: 1px solid var(--border-color);
+}
+
+.data-table tbody td:first-child,
+.widget-table tbody td:first-child,
+.request-table tbody td:first-child,
+.models-table tbody td:first-child,
+.models-tags-table tbody td:first-child {
+    border-left: 1px solid var(--border-color);
+    border-radius: 6px 0 0 6px;
+}
+
+.data-table tbody td:last-child,
+.widget-table tbody td:last-child,
+.request-table tbody td:last-child,
+.models-table tbody td:last-child,
+.models-tags-table tbody td:last-child {
+    border-right: 1px solid var(--border-color);
+    border-radius: 0 6px 6px 0;
+}
+
+/* ── Kompakt-Ansicht (Density) ───────────────────────────────────── */
+
+[data-density="compact"] .data-table,
+[data-density="compact"] .widget-table,
+[data-density="compact"] .request-table,
+[data-density="compact"] .models-table,
+[data-density="compact"] .models-tags-table {
+    border-spacing: 0 2px;
+}
+
+[data-density="compact"] .data-table thead th,
+[data-density="compact"] .widget-table thead th,
+[data-density="compact"] .request-table thead th,
+[data-density="compact"] .models-table thead th,
+[data-density="compact"] .models-tags-table thead th,
+[data-density="compact"] .data-table tbody td,
+[data-density="compact"] .widget-table tbody td,
+[data-density="compact"] .request-table tbody td,
+[data-density="compact"] .models-table tbody td,
+[data-density="compact"] .models-tags-table tbody td {
+    padding: 3px 12px;
+}

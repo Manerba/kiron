@@ -1,0 +1,36 @@
+services:
+  ollama:
+    image: ollama/ollama:0.18.0
+    # #544 (wontfix): Fester container_name ist by-design fuer Ops-Konsistenz
+    # (`docker logs kiron-ollama`, `docker exec kiron-ollama ...`, Deploy-Gate-
+    # Verifikation im Ollama-Upgrade-Runbook / finalem Compat-Adapter-Plan).
+    # Konflikt-Vermeidung mit
+    # dem Compat-Validator-Container laeuft ueber dynamischen Test-Container-
+    # Namen `kiron-ollama-compat-<timestamp>` (D10) und separates Test-Volume
+    # `kiron_ollama_compat_models` (D11), nicht ueber Auto-Naming hier.
+    container_name: kiron-ollama
+    ports:
+      - "11435:11435"
+    volumes:
+      - ollama_data:/root/.ollama
+    # #506: Moderne Compose-Syntax statt legacy `runtime: nvidia` (nvidia-docker2-Paket).
+    # Funktioniert mit nvidia-container-toolkit, das hier installiert ist.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    environment:
+      - OLLAMA_HOST=0.0.0.0:11435
+      - OLLAMA_KEEP_ALIVE=24h
+      - OLLAMA_FLASH_ATTENTION=1
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    restart: unless-stopped
+
+volumes:
+  ollama_data:
+    external: true
+    name: botmin_ollama

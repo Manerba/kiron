@@ -1,10 +1,17 @@
 import asyncio
 import json
 import unittest
+from unittest import mock
 
 from pydantic import ValidationError
 
 import main
+import loaders
+from kiron_common.model_catalog import ModelEndpoint
+
+
+def _request_model(endpoint: ModelEndpoint = ModelEndpoint.RERANK) -> str:
+    return main.DEBERTA_CATALOG_VIEW.request_default(endpoint).model_name
 
 
 class _FakeModelManager:
@@ -17,7 +24,10 @@ class _FakeModelManager:
     async def get_model(self, resolved):
         if self.load_error is not None:
             raise self.load_error
-        return _FakeModel(self.predict_error), {"labels": None}
+        return (
+            _FakeModel(self.predict_error),
+            main.DEBERTA_CATALOG_VIEW.require_runtime_model(resolved),
+        )
 
     def force_reset_locked(self):
         self.resets += 1
@@ -44,7 +54,7 @@ class CudaRuntimeErrorTests(unittest.IsolatedAsyncioTestCase):
         fake = _FakeModelManager(load_error=RuntimeError("CUDA out of memory"))
         main.model_manager = fake
 
-        resp = await main.load_model_endpoint({"model": main.DEFAULT_MODEL})
+        resp = await main.load_model_endpoint({"model": _request_model()})
 
         self.assertEqual(resp.status_code, 503)
         self.assertEqual(fake.resets, 1)
@@ -100,7 +110,7 @@ class RerankTopKTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-        self.assertEqual(resp, {"model": main.DEFAULT_MODEL, "results": []})
+        self.assertEqual(resp, {"model": _request_model(), "results": []})
 
     async def test_positive_top_k_limits_results(self):
         main.model_manager = _FakeModelManager()
@@ -118,6 +128,61 @@ class RerankTopKTests(unittest.IsolatedAsyncioTestCase):
     def test_negative_top_k_is_rejected(self):
         with self.assertRaises(ValidationError):
             main.RerankRequest(query="q", documents=["a"], top_k=-1)
+
+
+class LocalOnlyModelLoadTests(unittest.TestCase):
+    def test_cross_encoder_load_uses_local_files_only(self):
+        manager = main.ModelManager()
+        fake_model = object()
+
+        with (
+            mock.patch.object(main.torch.cuda, "is_available", return_value=True),
+            mock.patch.object(main.torch.cuda, "empty_cache"),
+            mock.patch.object(
+                loaders,
+                "CrossEncoder",
+                return_value=fake_model,
+            ) as cross_encoder,
+        ):
+            loaded, config = manager._load_model(_request_model())
+
+        self.assertIs(loaded, fake_model)
+        self.assertIs(
+            config,
+            main.DEBERTA_CATALOG_VIEW.require_runtime_model(_request_model()),
+        )
+        self.assertIs(manager.model, fake_model)
+        _, kwargs = cross_encoder.call_args
+        self.assertEqual(kwargs["device"], "cuda")
+        self.assertTrue(kwargs["local_files_only"])
+        self.assertEqual(kwargs["model_kwargs"], {"torch_dtype": main.torch.float16})
+        self.assertEqual(kwargs["revision"], config.artifact.revision)
+
+    def test_missing_local_model_is_hard_load_error(self):
+        manager = main.ModelManager()
+        old_model = object()
+        manager.model = old_model
+        manager.current_model_name = _request_model()
+        manager.config = main.DEBERTA_CATALOG_VIEW.require_runtime_model(
+            _request_model()
+        )
+
+        with (
+            mock.patch.object(main.torch.cuda, "is_available", return_value=True),
+            mock.patch.object(main.torch.cuda, "empty_cache"),
+            mock.patch.object(
+                loaders,
+                "CrossEncoder",
+                side_effect=OSError("cache miss"),
+            ) as cross_encoder,
+        ):
+            with self.assertRaises(OSError):
+                manager._load_model("nli-deberta-v3-base")
+
+        self.assertIs(manager.model, old_model)
+        self.assertEqual(manager.current_model_name, _request_model())
+        _, kwargs = cross_encoder.call_args
+        self.assertTrue(kwargs["local_files_only"])
 
 
 if __name__ == "__main__":

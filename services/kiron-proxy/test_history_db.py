@@ -180,6 +180,38 @@ class RetentionTest(unittest.TestCase):
         self.assertEqual(result["timestamps"], [round(ts, 3)])
         self.assertEqual(result["series"]["cpu_usage"], [3.0])
 
+    def test_init_db_migrates_gpu_probe_state_text_column(self):
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            conn = history_db.sqlite3.connect(path)
+            try:
+                conn.execute("""
+                    CREATE TABLE metrics_history (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        timestamp REAL NOT NULL
+                    )
+                """)
+                conn.commit()
+            finally:
+                conn.close()
+
+            db = history_db.MetricsDB(path)
+            try:
+                db.init_db()
+                conn = db._get_conn()
+                rows = conn.execute("PRAGMA table_info(metrics_history)").fetchall()
+                cols = {row[1]: row[2] for row in rows}
+                self.assertEqual(cols["gpu_probe_state"].upper(), "TEXT")
+            finally:
+                db.close()
+        finally:
+            for suffix in ("", "-wal", "-shm"):
+                try:
+                    os.unlink(path + suffix)
+                except OSError:
+                    pass
+
     def test_close_handles_worker_thread_connection(self):
         metrics = {
             "timestamp": time.time(),

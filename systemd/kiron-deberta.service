@@ -6,13 +6,32 @@ StartLimitIntervalSec=300
 
 [Service]
 Type=simple
-User=root
+User=kiron-deberta
+Group=kiron-deberta
+SupplementaryGroups=kiron-models kiron-common video render
 WorkingDirectory=/usr/lib/kiron/services/kiron-deberta
 ExecStart=/usr/lib/kiron/services/kiron-deberta/venv/bin/python main.py
 Restart=always
 RestartSec=30
 Environment=PYTHONUNBUFFERED=1
 Environment=CUDA_VISIBLE_DEVICES=0
+Environment=HF_HOME=/var/cache/kiron/huggingface
+Environment=HF_HUB_CACHE=/var/cache/kiron/huggingface/hub
+Environment=SENTENCE_TRANSFORMERS_HOME=/var/cache/kiron/huggingface/sentence-transformers
+Environment=XDG_CACHE_HOME=/var/cache/kiron
+Environment=HF_HUB_OFFLINE=1
+Environment=TRANSFORMERS_OFFLINE=1
+UMask=0027
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/cache/kiron/huggingface
+RestrictSUIDSGID=true
+LockPersonality=true
+NoNewPrivileges=true
+PrivateDevices=false
+CapabilityBoundingSet=
+AmbientCapabilities=
 
 [Install]
 WantedBy=multi-user.target

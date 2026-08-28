@@ -26,6 +26,9 @@ class MetricsDB:
         "gpu_util", "vram_usage", "vram_used_mb", "gpu_temp", "gpu_power_w",
         "disk_read_mb_s", "disk_write_mb_s",
     ]
+    TEXT_COLS = {
+        "gpu_probe_state": "TEXT",
+    }
 
     def __init__(self, db_path):
         self.db_path = db_path
@@ -135,7 +138,8 @@ class MetricsDB:
                 gpu_temp REAL,
                 gpu_power_w REAL,
                 disk_read_mb_s REAL,
-                disk_write_mb_s REAL
+                disk_write_mb_s REAL,
+                gpu_probe_state TEXT
             )
         """)
         conn.execute(
@@ -147,6 +151,11 @@ class MetricsDB:
         for col in self.METRIC_COLS:
             if col not in existing_cols:
                 conn.execute(f"ALTER TABLE metrics_history ADD COLUMN {col} REAL")
+        for col, col_type in self.TEXT_COLS.items():
+            if col not in existing_cols:
+                conn.execute(
+                    f"ALTER TABLE metrics_history ADD COLUMN {col} {col_type}"
+                )
 
         conn.commit()
 
@@ -159,6 +168,9 @@ class MetricsDB:
 
         # GPU-Fehler -> NULL
         has_gpu = "error" not in gpu
+        gpu_probe_state = None
+        if not has_gpu and isinstance(gpu.get("code"), str):
+            gpu_probe_state = gpu.get("code")
 
         row = {
             "timestamp": metrics_dict.get("timestamp", time.time()),
@@ -173,6 +185,7 @@ class MetricsDB:
             "gpu_power_w": gpu.get("power_draw_w") if has_gpu else None,
             "disk_read_mb_s": disk.get("read_mb_s"),
             "disk_write_mb_s": disk.get("write_mb_s"),
+            "gpu_probe_state": gpu_probe_state,
         }
 
         cols = list(row.keys())

@@ -1,0 +1,84 @@
+{
+  "schema_version": 1,
+  "canonical_model_id": "mdeberta-v3-xnli",
+  "aliases": [
+    "MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7"
+  ],
+  "deployments": [
+    {
+      "id": "kiron-deberta-mdeberta-v3-xnli-v1.deployment",
+      "backend": {
+        "type": "kiron_deberta",
+        "parameters": {
+          "implementation": "sentence-transformers-cross-encoder",
+          "implementation_revision": "5.6.0",
+          "model_name": "mdeberta-v3-xnli"
+        }
+      },
+      "artifact": {
+        "type": "huggingface",
+        "repository": "MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7",
+        "revision": "b5113eb38ab63efdd7f280f8c144ea8b13f978ce",
+        "manifest_digest": null,
+        "trust_remote_code": false,
+        "weights": [
+          {
+            "path": "model.safetensors",
+            "sha256": "7c8e29f1115986d032e92b0fbaa0bdef1062a46f658b08705f237c05014a8541"
+          }
+        ],
+        "auxiliary": [],
+        "metadata": {}
+      },
+      "routes": [
+        {
+          "task": "rerank",
+          "endpoint": "/api/rerank"
+        },
+        {
+          "task": "nli",
+          "endpoint": "/api/score"
+        }
+      ],
+      "loader": {
+        "type": "cross_encoder",
+        "parameters": {
+          "max_length": 512,
+          "torch_dtype": "float16"
+        }
+      },
+      "metadata": {
+        "service": {
+          "display_order": 4,
+          "labels": [
+            "entailment",
+            "neutral",
+            "contradiction"
+          ],
+          "rerank_label": "entailment",
+          "size": 557652046
+        }
+      }
+    }
+  ],
+  "profiles": [
+    {
+      "id": "kiron-mdeberta-v3-xnli-rerank-v1",
+      "deployment_id": "kiron-deberta-mdeberta-v3-xnli-v1.deployment",
+      "task": "rerank",
+      "endpoint": "/api/rerank",
+      "default_for_endpoint": true,
+      "metadata": {}
+    },
+    {
+      "id": "kiron-mdeberta-v3-xnli-score-v1",
+      "deployment_id": "kiron-deberta-mdeberta-v3-xnli-v1.deployment",
+      "task": "nli",
+      "endpoint": "/api/score",
+      "default_for_endpoint": true,
+      "metadata": {}
+    }
+  ],
+  "request_defaults": [],
+  "metadata": {}
+}

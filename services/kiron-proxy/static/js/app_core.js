@@ -8,7 +8,6 @@
 // ========================================
 
 let currentTab = 'dashboard';
-let currentSubTab = null;
 const domCache = {};
 
 const tabMap = {
@@ -18,15 +17,8 @@ const tabMap = {
     'history': 'history',
     'models': 'models',
     'apikeys': 'apikeys',
+    'config': 'config',
     'selftest': 'selftest',
-};
-
-// Sub-Tabs pro Haupt-Tab (analog kiara): label + globaler init-Funktionsname.
-const SUBTABS = {
-    'models': {
-        'installed': { label: 'Installiert', init: 'initModelsInstalled' },
-        'available': { label: 'Verfuegbar', init: 'initModelsAvailable' },
-    },
 };
 
 // ========================================
@@ -126,25 +118,19 @@ async function restartDashboard() {
 
 function parseRoute() {
     const path = window.location.pathname.replace(/^\/+|\/+$/g, '');
-    const parts = path.split('/');
-    const tab = tabMap[parts[0]] ? parts[0] : 'dashboard';
-    const subtab = parts[1] || null;
-    return { tab, subtab };
+    const tab = tabMap[path] ? path : 'dashboard';
+    return { tab };
 }
 
-function buildPath(tab, subtab) {
-    let path = '/' + (tab || 'dashboard');
-    if (subtab && SUBTABS[tab] && SUBTABS[tab][subtab]) {
-        path += '/' + subtab;
-    }
-    return path;
+function buildPath(tab) {
+    return '/' + (tab || 'dashboard');
 }
 
-function navigateTo(tab, subtab) {
+function navigateTo(tab) {
     if (!tabMap[tab]) tab = 'dashboard';
-    const path = buildPath(tab, subtab);
-    history.pushState({ tab, subtab: subtab || null }, '', path);
-    switchTab(tab, subtab);
+    const path = buildPath(tab);
+    history.pushState({ tab }, '', path);
+    switchTab(tab);
 }
 
 // ========================================
@@ -175,7 +161,7 @@ function invalidateTabCache(tab) {
     }
 }
 
-function switchTab(tab, subtab) {
+function switchTab(tab) {
     if (!tabMap[tab]) tab = 'dashboard';
 
     // History-Charts aufraeumen wenn weg navigiert wird
@@ -193,8 +179,7 @@ function switchTab(tab, subtab) {
     currentTab = tab;
     const filterBar = document.getElementById('filterBar');
 
-    // Haupt-Tab-Links aktiv markieren (nur .main-tabs, nicht die Sub-Tabs,
-    // die seit dem kiara-Sub-Tab-System ebenfalls .tab nutzen)
+    // Haupt-Tab-Link aktiv markieren.
     document.querySelectorAll('.main-tabs .tab').forEach(el => {
         el.classList.toggle('active', el.getAttribute('data-tab') === tab);
     });
@@ -203,14 +188,6 @@ function switchTab(tab, subtab) {
     const container = document.getElementById('contentContainer');
     if (container) {
         container.innerHTML = '<div class="table-loading"><div class="spinner"></div></div>';
-    }
-
-    // Hat der Tab Sub-Tabs? Dann Leiste rendern und an den aktiven Sub-Tab delegieren.
-    const activeSub = renderSubTabsBar(tab, subtab);
-    if (activeSub) {
-        if (filterBar) filterBar.style.display = 'none';
-        switchSubTab(activeSub);
-        return;
     }
 
     // Tab initialisieren
@@ -234,76 +211,26 @@ function switchTab(tab, subtab) {
         if (typeof initHistoryTab === 'function') {
             initHistoryTab();
         }
+    } else if (tab === 'models') {
+        if (filterBar) filterBar.style.display = 'none';
+        if (typeof initModelsTab === 'function') {
+            initModelsTab();
+        }
     } else if (tab === 'apikeys') {
         if (filterBar) filterBar.style.display = 'none';
         if (typeof initApiKeysTab === 'function') {
             initApiKeysTab();
+        }
+    } else if (tab === 'config') {
+        if (filterBar) filterBar.style.display = 'none';
+        if (typeof initConfigTab === 'function') {
+            initConfigTab();
         }
     } else if (tab === 'selftest') {
         if (filterBar) filterBar.style.display = 'none';
         if (typeof initSelftestTab === 'function') {
             initSelftestTab();
         }
-    }
-}
-
-// ========================================
-// Sub-Tabs (analog kiara)
-// ========================================
-
-function renderSubTabsBar(tab, activeSubtab) {
-    const subTabsNav = document.getElementById('subTabs');
-    if (!subTabsNav) return null;
-
-    const mainTabs = document.querySelector('.main-tabs');
-    const cfg = SUBTABS[tab];
-    if (!cfg) {
-        subTabsNav.classList.add('is-hidden');
-        subTabsNav.innerHTML = '';
-        currentSubTab = null;
-        if (mainTabs) mainTabs.classList.remove('has-subtabs');
-        return null;
-    }
-
-    const keys = Object.keys(cfg);
-    const active = (activeSubtab && cfg[activeSubtab]) ? activeSubtab : keys[0];
-
-    subTabsNav.innerHTML = keys.map(key =>
-        `<a class="tab${key === active ? ' active' : ''}" href="${buildPath(tab, key)}" data-subtab="${key}">${cfg[key].label}</a>`
-    ).join('');
-    subTabsNav.classList.remove('is-hidden');
-    if (mainTabs) mainTabs.classList.add('has-subtabs');
-
-    subTabsNav.querySelectorAll('.tab').forEach(st => {
-        st.addEventListener('click', (e) => {
-            e.preventDefault();
-            switchSubTab(st.dataset.subtab);
-        });
-    });
-
-    return active;
-}
-
-function switchSubTab(subtab) {
-    const cfg = SUBTABS[currentTab];
-    if (!cfg || !cfg[subtab]) return;
-
-    currentSubTab = subtab;
-
-    document.querySelectorAll('#subTabs .tab').forEach(t => {
-        t.classList.toggle('active', t.dataset.subtab === subtab);
-    });
-
-    history.replaceState({ tab: currentTab, subtab }, '', buildPath(currentTab, subtab));
-
-    const container = document.getElementById('contentContainer');
-    if (container) {
-        container.innerHTML = '<div class="table-loading"><div class="spinner"></div></div>';
-    }
-
-    const initFn = window[cfg[subtab].init];
-    if (typeof initFn === 'function') {
-        initFn();
     }
 }
 
@@ -427,12 +354,8 @@ function formatPercent(value) {
 
 function initTabs() {
     const route = parseRoute();
-    switchTab(route.tab, route.subtab);
-    history.replaceState(
-        { tab: route.tab, subtab: route.subtab || null },
-        '',
-        buildPath(route.tab, route.subtab)
-    );
+    switchTab(route.tab);
+    history.replaceState({ tab: route.tab }, '', buildPath(route.tab));
 
     // WebSocket starten
     initWebSocket();
@@ -486,8 +409,7 @@ document.addEventListener('DOMContentLoaded', () => {
     window.addEventListener('popstate', (e) => {
         const route = parseRoute();
         const tab = e.state?.tab || route.tab;
-        const subtab = (e.state && 'subtab' in e.state) ? e.state.subtab : route.subtab;
-        switchTab(tab, subtab);
+        switchTab(tab);
     });
 
     // Tabs initialisieren

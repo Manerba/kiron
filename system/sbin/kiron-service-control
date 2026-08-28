@@ -1,0 +1,28 @@
+#!/bin/bash
+set -euo pipefail
+
+fail() {
+    echo "FEHLER: $*" >&2
+    exit 64
+}
+
+[ "$#" -eq 2 ] || fail "Usage: kiron-service-control <verb> <unit>"
+
+verb="$1"
+unit="$2"
+
+case "$verb $unit" in
+    "restart kiron-proxy.service" | \
+    "start kiron-embeddings.service" | \
+    "stop kiron-embeddings.service" | \
+    "restart kiron-embeddings.service" | \
+    "start kiron-deberta.service" | \
+    "stop kiron-deberta.service" | \
+    "restart kiron-deberta.service")
+        ;;
+    *)
+        fail "Operation nicht erlaubt: $verb $unit"
+        ;;
+esac
+
+exec /usr/bin/systemctl "$verb" "$unit"

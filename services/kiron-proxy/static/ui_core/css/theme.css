@@ -19,21 +19,17 @@
     --bg-detail: #1e2a45;
     --bg-detail-nested: #2a3a5e;
     --bg-tabs: var(--bg-secondary);
-    --bg-subtabs: var(--bg-secondary);
     --bg-controls: var(--bg-secondary);
     --bg-content: var(--bg-primary);
     --text-tabs: var(--text-secondary);
     --text-tabs-active: var(--accent-primary);
     --bg-tab-active: var(--bg-tabs);
-    --bg-subtab-active: var(--bg-subtabs);
-    --text-subtab-active: var(--text-tabs-active);
 }
 
 [data-theme="kontrast"] {
     --bg-header: #1a1a2e;
     --text-header: #ffffff;
     --bg-tabs: #2d3748;
-    --bg-subtabs: #4a5568;
     --bg-controls: #e2e8f0;
     --bg-content: #ffffff;
     --bg-primary: #ffffff;
@@ -44,9 +40,7 @@
     --text-secondary: #4a5568;
     --text-tabs: #ffffff;
     --text-tabs-active: #63b3ed;
-    --bg-tab-active: var(--bg-subtabs);
-    --bg-subtab-active: var(--bg-content);
-    --text-subtab-active: var(--accent-primary);
+    --bg-tab-active: #4a5568;
     --border-color: #cbd5e0;
     --shadow: 0 2px 4px rgba(0,0,0,0.15);
     --drop-shadow: drop-shadow(0 2px 3px rgba(0,0,0,0.15));

@@ -22,19 +22,233 @@ DST="/usr/lib/kiron"
 REPORT_DIR="$SRC/data/ollama_compat_reports"
 RUNTIME_HANDOFF="$DST/data/ollama_compat_runtime.json"
 SKIP_GATE="${KIRON_SKIP_OLLAMA_COMPAT_GATE:-0}"
+KIRON_SERVICES=(kiron-proxy kiron-docling kiron-embeddings kiron-deberta kitt-worker)
+COMMON_CONSUMERS=(kiron-proxy kiron-docling kiron-embeddings kiron-deberta)
+PROXY_DATA_DIR="$DST/data/kiron-proxy"
+SHARED_DATA_DIR="$DST/data/shared"
+MODEL_REGISTRY_FILE="$SHARED_DATA_DIR/local-model-registry.json"
+MODEL_REGISTRY_LOCK_FILE="$MODEL_REGISTRY_FILE.lock"
 
 echo "Deploye Kiron nach ${DST}..."
 
+service_group() {
+    case "$1" in
+        kiron-proxy) echo "kiron-proxy" ;;
+        kiron-docling) echo "kiron-docling" ;;
+        kiron-embeddings) echo "kiron-embeddings" ;;
+        kiron-deberta) echo "kiron-deberta" ;;
+        kitt-worker) echo "kitt-worker" ;;
+        *) echo "FEHLER: unbekannter Service $1" >&2; return 1 ;;
+    esac
+}
+
+apply_readonly_tree_permissions() {
+    local path="$1"
+    local group="$2"
+
+    if [ ! -d "$path" ]; then
+        echo "FEHLER: Rechte-Ziel fehlt oder ist kein Verzeichnis: $path" >&2
+        return 1
+    fi
+    chown -hR root:"$group" "$path"
+    find "$path" -type d -exec chmod 0750 {} +
+    find "$path" -type f -perm /111 -exec chmod 0750 {} +
+    find "$path" -type f ! -perm /111 -exec chmod 0640 {} +
+}
+
+apply_code_permissions() {
+    local svc group
+
+    apply_readonly_tree_permissions "$DST/services/kiron-common" kiron-common
+    for svc in "${KIRON_SERVICES[@]}"; do
+        group="$(service_group "$svc")"
+        apply_readonly_tree_permissions "$DST/services/$svc" "$group"
+    done
+}
+
+check_local_model_registry_paths() {
+    local file
+
+    for file in "$MODEL_REGISTRY_FILE" "$MODEL_REGISTRY_LOCK_FILE"; do
+        if [ -L "$file" ]; then
+            echo "FEHLER: $file darf kein Symlink sein." >&2
+            return 1
+        fi
+        if [ ! -e "$file" ]; then
+            continue
+        fi
+        if [ ! -f "$file" ]; then
+            echo "FEHLER: $file muss eine regulaere Datei sein." >&2
+            return 1
+        fi
+        if [ "$(stat -c '%h' "$file")" != "1" ]; then
+            echo "FEHLER: $file darf kein Hardlink sein." >&2
+            return 1
+        fi
+    done
+}
+
+apply_local_model_registry_permissions() {
+    local file
+
+    check_local_model_registry_paths || return 1
+    for file in "$MODEL_REGISTRY_FILE" "$MODEL_REGISTRY_LOCK_FILE"; do
+        if [ ! -e "$file" ]; then
+            continue
+        fi
+        chown kiron-proxy:kiron-config "$file"
+        chmod 0640 "$file"
+        if [ "$(stat -c '%U:%G %a' "$file")" != "kiron-proxy:kiron-config 640" ]; then
+            echo "FEHLER: $file muss kiron-proxy:kiron-config 0640 sein." >&2
+            return 1
+        fi
+    done
+}
+
+apply_data_permissions() {
+    mkdir -p "$DST/data" "$PROXY_DATA_DIR" "$SHARED_DATA_DIR"
+
+    chown root:root "$DST/data"
+    chmod 0755 "$DST/data"
+
+    chown kiron-proxy:kiron-proxy "$PROXY_DATA_DIR"
+    chmod 0750 "$PROXY_DATA_DIR"
+
+    chown kiron-proxy:kiron-config "$SHARED_DATA_DIR"
+    chmod 2750 "$SHARED_DATA_DIR"
+    apply_local_model_registry_permissions
+
+    if [ -f "$DST/data/db_config.json" ]; then
+        chown root:kiron-proxy "$DST/data/db_config.json"
+        chmod 0640 "$DST/data/db_config.json"
+    fi
+    if [ -f "$DST/data/ollama_compat_runtime.json" ]; then
+        chown root:root "$DST/data/ollama_compat_runtime.json"
+        chmod 0644 "$DST/data/ollama_compat_runtime.json"
+    fi
+    if [ -f "$SHARED_DATA_DIR/runtime_config.json" ]; then
+        chown kiron-proxy:kiron-config "$SHARED_DATA_DIR/runtime_config.json"
+        chmod 0640 "$SHARED_DATA_DIR/runtime_config.json"
+    fi
+    for file in \
+        "$PROXY_DATA_DIR"/metrics.db \
+        "$PROXY_DATA_DIR"/metrics.db-wal \
+        "$PROXY_DATA_DIR"/metrics.db-shm \
+        "$PROXY_DATA_DIR"/maintenance_mode.json \
+        "$PROXY_DATA_DIR"/selftest_results.json \
+        "$PROXY_DATA_DIR"/registry_cache.json \
+        "$PROXY_DATA_DIR"/benchmarks_cache.json; do
+        if [ -e "$file" ]; then
+            chown kiron-proxy:kiron-proxy "$file"
+            chmod 0640 "$file"
+        fi
+    done
+
+    if [ -d "$DST/data/kitt-worker" ]; then
+        chown kitt-worker:kitt-worker "$DST/data/kitt-worker"
+        chmod 0750 "$DST/data/kitt-worker"
+    fi
+    for path in "$DST/data/kitt-worker/staging" "$DST/data/kitt-worker/work"; do
+        if [ -d "$path" ]; then
+            chown kitt-worker:kitt-worker "$path"
+            chmod 0750 "$path"
+        fi
+    done
+}
+
+check_catalog_consistency_after_restart() {
+    local proxy_python="$DST/services/kiron-proxy/venv/bin/python"
+    local checker="$DST/services/kiron-proxy/catalog_health.py"
+
+    if [ ! -x "$proxy_python" ] || [ ! -f "$checker" ]; then
+        echo "FEHLER: Catalog-Konsistenz-Checker oder Proxy-Python fehlt." >&2
+        return 1
+    fi
+    echo "Pruefe Catalog-Digests der laufenden verwalteten Services..."
+    runuser -u kiron-proxy -- env PYTHONNOUSERSITE=1 \
+        "$proxy_python" "$checker" --wait-seconds 30
+}
+
+required_identity_groups() {
+    case "$1" in
+        kiron-proxy) echo "docker kiron-runtime kiron-common" ;;
+        kiron-docling) echo "docker kiron-runtime kiron-common" ;;
+        kiron-embeddings) echo "kiron-models kiron-config kiron-common video render" ;;
+        kiron-deberta) echo "kiron-models kiron-common video render" ;;
+        kitt-worker) echo "" ;;
+        *) echo "FEHLER: unbekannter Service $1" >&2; return 1 ;;
+    esac
+}
+
+check_exact_identity_groups() {
+    local svc actual expected supplementary
+
+    for svc in "${KIRON_SERVICES[@]}"; do
+        supplementary="$(required_identity_groups "$svc")" || return 1
+        actual="$(id -nG "$svc" | tr ' ' '\n' | LC_ALL=C sort | xargs)" \
+            || return 1
+        # shellcheck disable=SC2086 # fixed, space-separated group contract
+        expected="$(printf '%s\n' "$svc" $supplementary | LC_ALL=C sort | xargs)"
+        if [ "$actual" != "$expected" ]; then
+            echo "FEHLER: $svc Gruppen falsch: ist '$actual', soll '$expected'." >&2
+            echo "       bash scripts/install-system-configs.sh zuerst ausfuehren." >&2
+            return 1
+        fi
+    done
+}
+
+validate_model_catalog_source() {
+    echo "Validiere eingebauten Model-Catalog (offline)..."
+    env PYTHONDONTWRITEBYTECODE=1 PYTHONNOUSERSITE=1 \
+        python3 "$SRC/scripts/validate-model-catalog.py" || {
+            echo "FEHLER: Model-Catalog-/Projektionsvalidierung fehlgeschlagen; Deploy bleibt unveraendert." >&2
+            return 1
+        }
+}
+
+check_issue_859_deploy_prereqs() {
+    local svc group
+
+    for group in \
+        kiron-proxy kiron-docling kiron-embeddings kiron-deberta \
+        kiron-models kiron-runtime kiron-config kiron-common \
+        docker video render kitt-worker; do
+        if ! getent group "$group" >/dev/null 2>&1; then
+            echo "FEHLER: Gruppe $group fehlt; install-system-configs.sh zuerst ausfuehren." >&2
+            return 1
+        fi
+    done
+
+    for svc in "${KIRON_SERVICES[@]}"; do
+        if ! id -u "$svc" >/dev/null 2>&1; then
+            echo "FEHLER: User $svc fehlt; install-system-configs.sh zuerst ausfuehren." >&2
+            return 1
+        fi
+    done
+
+    check_exact_identity_groups || return 1
+    check_kiron_dashboard_env_contract || return 1
+    check_local_model_registry_paths || return 1
+}
+
 # Preflight: Quellen pruefen, bevor irgendetwas veraendert wird.
 # Vermeidet die haeufigste Ursache fuer einen mittendrin abgebrochenen Deploy.
-for svc in kiron-proxy kiron-docling kiron-embeddings kiron-deberta; do
+for svc in "${KIRON_SERVICES[@]}"; do
     if [ ! -d "$SRC/services/$svc" ]; then
         echo "FEHLER: Quelle $SRC/services/$svc fehlt. Deploy abgebrochen." >&2
+        exit 1
+    fi
+    if [ ! -f "$SRC/services/$svc/requirements.txt" ]; then
+        echo "FEHLER: Quelle $SRC/services/$svc/requirements.txt fehlt. Deploy abgebrochen." >&2
         exit 1
     fi
 done
 if [ ! -f "$SRC/services/kiron-common/pyproject.toml" ] || [ ! -d "$SRC/services/kiron-common/kiron_common" ]; then
     echo "FEHLER: Quelle $SRC/services/kiron-common fehlt. Deploy abgebrochen." >&2
+    exit 1
+fi
+if [ ! -f "$SRC/scripts/validate-model-catalog.py" ]; then
+    echo "FEHLER: Model-Catalog-Validator fehlt: $SRC/scripts/validate-model-catalog.py" >&2
     exit 1
 fi
 for f in version.txt docker/docker-compose.yml data/db_config.json; do
@@ -47,6 +261,10 @@ if ! ls "$SRC/systemd/"*.service >/dev/null 2>&1; then
     echo "FEHLER: keine systemd-Unit in $SRC/systemd/ gefunden. Deploy abgebrochen." >&2
     exit 1
 fi
+
+# Architektur-Gate vor docker pull, Verzeichnis-/Rechteaenderungen, rsync,
+# Compose-/Handoff-/Unit-Aenderungen, Restarts und version.txt.
+validate_model_catalog_source
 
 compose_ollama_image() {
     python3 - "$1" <<'PY'
@@ -122,10 +340,10 @@ check_common_venvs() {
     # Frueher --restart-Preflight. Importprobe ist hier sinnlos: kiron-common
     # ist editable aus $DST installiert, und rsync von kiron-common passiert
     # erst spaeter — die Pruefung wuerde den alten Code testen (#782).
-    # Alle vier Services pruefen, da der spaetere systemctl-restart-Loop alle
-    # vier abdeckt — fehlt ein venv, soll der Abbruch vor mutierenden Schritten
+    # Alle Services pruefen, da der spaetere systemctl-restart-Loop alle
+    # abdeckt — fehlt ein venv, soll der Abbruch vor mutierenden Schritten
     # passieren statt erst nach rsync und Docker-Handoff.
-    for svc in kiron-proxy kiron-docling kiron-embeddings kiron-deberta; do
+    for svc in "${KIRON_SERVICES[@]}"; do
         py="$DST/services/$svc/venv/bin/python"
         if [ ! -x "$py" ]; then
             echo "FEHLER: $py fehlt; --restart benoetigt vorhandene venvs aller Services." >&2
@@ -140,25 +358,262 @@ check_common_venvs() {
 
 smoke_common_imports() {
     # MUSS nach rsync von kiron-common laufen, damit der aktuelle Code geprueft wird.
-    # Iteriert alle vier Services analog zu check_common_venvs und Restart-Loop;
-    # Services ohne kiron-common im venv (aktuell kiron-embeddings/-deberta, vgl.
-    # setup-venvs.sh:140) werden uebersprungen. Sobald ein weiterer Service
-    # kiron_common adoptiert, deckt der Smoke-Test ihn automatisch ab — ohne
-    # dass die Service-Liste an zwei Stellen synchron gehalten werden muss.
-    for svc in kiron-proxy kiron-docling kiron-embeddings kiron-deberta; do
+    # Fuer deklarierte Common-Consumer ist ein fehlender Import ein harter
+    # Venv-Vertragsfehler; nur noch nicht migrierte Services stehen nicht in
+    # COMMON_CONSUMERS.
+    for svc in "${COMMON_CONSUMERS[@]}"; do
         py="$DST/services/$svc/venv/bin/python"
         if ! "$py" -c 'import kiron_common' 2>/dev/null; then
-            continue
+            echo "FEHLER: kiron_common fehlt im $svc venv." >&2
+            echo "Fuehre die sichere Sequenz aus:" >&2
+            echo "  bash /opt/kiron/scripts/deploy-local.sh" >&2
+            echo "  bash /opt/kiron/scripts/setup-venvs.sh" >&2
+            echo "  bash /opt/kiron/scripts/deploy-local.sh --restart" >&2
+            return 1
         fi
-        "$py" -c 'import kiron_common.ollama_compat' || {
-            echo "FEHLER: kiron_common.ollama_compat Import in $svc venv fehlgeschlagen." >&2
+        "$py" -c 'import kiron_common.catalog_consistency, kiron_common.model_state, kiron_common.ollama_compat' || {
+            echo "FEHLER: aktuelle kiron_common Module im $svc venv nicht importierbar." >&2
             echo "Fuehre die sichere Sequenz aus:" >&2
             echo "  bash /opt/kiron/scripts/deploy-local.sh" >&2
             echo "  bash /opt/kiron/scripts/setup-venvs.sh" >&2
             echo "  bash /opt/kiron/scripts/deploy-local.sh --restart" >&2
             return 1
         }
+        if [ "$svc" = "kiron-proxy" ] || \
+           [ "$svc" = "kiron-embeddings" ] || \
+           [ "$svc" = "kiron-deberta" ]; then
+            "$py" -c 'from importlib import resources; from kiron_common.embedding_registry import MODEL_CATALOG; root = resources.files("kiron_common.model_catalog.manifests"); assert any(item.name.endswith(".model.json") for item in root.iterdir()); assert MODEL_CATALOG.groups' || {
+                echo "FEHLER: Model-Catalog-Package-Daten im $svc venv fehlen." >&2
+                return 1
+            }
+        fi
     done
+}
+
+check_kitt_worker_restart_prereqs() {
+    if ! getent group kitt-worker >/dev/null 2>&1; then
+        echo "FEHLER: Gruppe kitt-worker fehlt; install-system-configs.sh zuerst ausfuehren." >&2
+        return 1
+    fi
+    if ! id -u kitt-worker >/dev/null 2>&1; then
+        echo "FEHLER: User kitt-worker fehlt; install-system-configs.sh zuerst ausfuehren." >&2
+        return 1
+    fi
+    for path in "$DST/data/kitt-worker" "/run/kiron/kitt-worker"; do
+        if [ ! -d "$path" ]; then
+            echo "FEHLER: Runtime-Pfad $path fehlt; install-system-configs.sh zuerst ausfuehren." >&2
+            return 1
+        fi
+        if [ "$(stat -c '%U:%G %a' "$path")" != "kitt-worker:kitt-worker 750" ]; then
+            echo "FEHLER: Runtime-Pfad $path muss kitt-worker:kitt-worker 0750 sein." >&2
+            return 1
+        fi
+    done
+}
+
+kitt_worker_effective_env_value() {
+    local key="$1"
+    local env_line part
+    env_line="$(systemctl show kitt-worker.service -p Environment --value 2>/dev/null || true)"
+    for part in $env_line; do
+        case "$part" in
+            "$key="*)
+                printf '%s\n' "${part#*=}"
+                return 0
+                ;;
+        esac
+    done
+    return 1
+}
+
+check_not_symlink() {
+    local path="$1"
+    if [ -L "$path" ]; then
+        echo "FEHLER: $path darf kein Symlink sein." >&2
+        return 1
+    fi
+}
+
+check_kiron_dashboard_env_contract() {
+    local dashboard_env="/etc/kiron/dashboard.env"
+
+    check_not_symlink /etc/kiron || return 1
+    check_not_symlink "$dashboard_env" || return 1
+    if [ ! -e "$dashboard_env" ]; then
+        return 0
+    fi
+    [ -d /etc/kiron ] \
+        || { echo "FEHLER: /etc/kiron fehlt." >&2; return 1; }
+    [ "$(stat -c '%U:%G %a' /etc/kiron)" = "root:root 755" ] \
+        || { echo "FEHLER: /etc/kiron muss root:root 0755 sein." >&2; return 1; }
+    [ -f "$dashboard_env" ] \
+        || { echo "FEHLER: /etc/kiron/dashboard.env muss eine regulaere Datei sein." >&2; return 1; }
+    [ "$(stat -c '%U:%G %a' "$dashboard_env")" = "root:root 600" ] \
+        || { echo "FEHLER: /etc/kiron/dashboard.env muss root:root 0600 sein." >&2; return 1; }
+}
+
+validate_kitt_worker_credentials_path() {
+    local credentials_file="$1"
+    if ! python3 - "$credentials_file" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+credential_dir = Path("/etc/kiron/kitt-worker")
+if not path.is_absolute():
+    raise SystemExit(1)
+if path.parent != credential_dir:
+    raise SystemExit(1)
+
+resolved = path.resolve(strict=False)
+root = credential_dir.resolve(strict=False)
+if resolved != root and not resolved.is_relative_to(root):
+    raise SystemExit(1)
+PY
+    then
+        echo "FEHLER: KITT_WORKER_CREDENTIALS_FILE muss direkt unter /etc/kiron/kitt-worker liegen." >&2
+        return 1
+    fi
+}
+
+check_kitt_worker_credentials_file() {
+    local credentials_file="$1"
+    validate_kitt_worker_credentials_path "$credentials_file" || return 1
+    check_not_symlink /etc/kiron || return 1
+    check_not_symlink /etc/kiron/kitt-worker || return 1
+    check_not_symlink "$credentials_file" || return 1
+    [ -d /etc/kiron ] || { echo "FEHLER: /etc/kiron fehlt." >&2; return 1; }
+    [ -d /etc/kiron/kitt-worker ] || { echo "FEHLER: /etc/kiron/kitt-worker fehlt." >&2; return 1; }
+    [ -f "$credentials_file" ] || { echo "FEHLER: Credential-Datei fehlt." >&2; return 1; }
+    [ "$(stat -c '%U:%G %a' /etc/kiron)" = "root:root 755" ] \
+        || { echo "FEHLER: /etc/kiron muss root:root 0755 sein." >&2; return 1; }
+    [ "$(stat -c '%U:%G %a' /etc/kiron/kitt-worker)" = "root:kitt-worker 750" ] \
+        || { echo "FEHLER: /etc/kiron/kitt-worker muss root:kitt-worker 0750 sein." >&2; return 1; }
+    [ "$(stat -c '%U:%G %a' "$credentials_file")" = "root:kitt-worker 640" ] \
+        || { echo "FEHLER: Credential-Datei muss root:kitt-worker 0640 sein." >&2; return 1; }
+}
+
+check_kitt_worker_credentials_store_loadable() {
+    local credentials_file="$1"
+    local py="$DST/services/kitt-worker/venv/bin/python"
+    if ! command -v runuser >/dev/null 2>&1; then
+        echo "FEHLER: runuser fehlt; CredentialStore-Preflight muss als kitt-worker laufen." >&2
+        return 1
+    fi
+    if [ ! -x "$py" ]; then
+        echo "FEHLER: $py fehlt; CredentialStore-Preflight benoetigt vorhandene kitt-worker venv." >&2
+        return 1
+    fi
+    if ! (cd "$DST/services/kitt-worker" && runuser -u kitt-worker -- "$py" - "$credentials_file" <<'PY'
+from pathlib import Path
+import sys
+
+import auth
+
+auth.load_credentials_file(Path(sys.argv[1]))
+PY
+    ); then
+        echo "FEHLER: kitt-worker CredentialStore ist im Auth-required-Normalbetrieb nicht ladbar." >&2
+        return 1
+    fi
+}
+
+check_kitt_worker_no_dispatch_activation() {
+    local scan_paths
+    scan_paths=("$@")
+    if [ "${#scan_paths[@]}" -eq 0 ]; then
+        scan_paths=(
+            "$DST/services/kitt-worker"
+            "/etc/systemd/system/kitt-worker.service"
+            "/etc/systemd/system/kitt-worker.service.d"
+        )
+    fi
+    if ! python3 - "${scan_paths[@]}" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+pattern = re.compile(
+    r"""(?ix)
+    (?<![A-Za-z0-9_])
+    ["']?(?:[A-Za-z0-9_]*_)?allow_dispatch["']?
+    \s*(?:=|:)\s*
+    ["']?(?:true|1|yes|on)["']?
+    (?![A-Za-z0-9_])
+    """
+)
+suffixes = {".py", ".json", ".yaml", ".yml", ".service", ".sh", ".conf"}
+
+
+def should_scan(path: Path) -> bool:
+    return path.name == ".env" or path.suffix in suffixes
+
+
+def iter_files(path: Path):
+    if path.is_dir():
+        for child in path.rglob("*"):
+            if child.is_file() and should_scan(child):
+                yield child
+    elif path.is_file():
+        yield path
+
+
+for raw in sys.argv[1:]:
+    for path in iter_files(Path(raw)):
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            print(f"FEHLER: Dispatch-Gate konnte {path} nicht lesen.", file=sys.stderr)
+            sys.exit(1)
+        if pattern.search(text):
+            print(f"FEHLER: kitt-worker darf allow_dispatch nicht truthy setzen: {path}", file=sys.stderr)
+            sys.exit(1)
+PY
+    then
+        return 1
+    fi
+}
+
+check_kitt_worker_auth_restart_preflight() {
+    local enable_v1 auth_mode credentials_file
+    check_kitt_worker_no_dispatch_activation || return 1
+    enable_v1="$(kitt_worker_effective_env_value KITT_WORKER_ENABLE_V1 || true)"
+    if [ -z "$enable_v1" ]; then
+        enable_v1="true"
+    fi
+    case "$enable_v1" in
+        true|1|yes|on) ;;
+        false|0|no|off)
+            echo "  kitt-worker /v1 disabled: Rollback-Modus, CredentialStore wird nicht verlangt"
+            return 0
+            ;;
+        *)
+            echo "FEHLER: KITT_WORKER_ENABLE_V1 ist ungueltig: $enable_v1" >&2
+            return 1
+            ;;
+    esac
+    auth_mode="$(kitt_worker_effective_env_value KITT_WORKER_AUTH_MODE || true)"
+    if [ -z "$auth_mode" ]; then
+        auth_mode="required"
+    fi
+    case "$auth_mode" in
+        required)
+            credentials_file="$(kitt_worker_effective_env_value KITT_WORKER_CREDENTIALS_FILE || true)"
+            if [ -z "$credentials_file" ]; then
+                echo "FEHLER: KITT_WORKER_CREDENTIALS_FILE fehlt in der effektiven systemd-Umgebung." >&2
+                return 1
+            fi
+            check_kitt_worker_credentials_file "$credentials_file" || return 1
+            check_kitt_worker_credentials_store_loadable "$credentials_file"
+            ;;
+        disabled)
+            echo "  kitt-worker Auth disabled: /v1 Rollback-Modus, CredentialStore wird nicht verlangt"
+            ;;
+        *)
+            echo "FEHLER: KITT_WORKER_AUTH_MODE ist ungueltig: $auth_mode" >&2
+            return 1
+            ;;
+    esac
 }
 
 validate_ollama_runtime_contract() {
@@ -192,8 +647,12 @@ else
     OLLAMA_SERVICE_CHANGED=1
 fi
 
+check_kitt_worker_no_dispatch_activation "$SRC/services/kitt-worker" "$SRC/scripts" "$SRC/systemd"
+check_issue_859_deploy_prereqs
+
 if [ "${1:-}" = "--restart" ]; then
     check_common_venvs
+    check_kitt_worker_restart_prereqs
 fi
 
 if [ "$OLLAMA_IMAGE_CHANGED" = "1" ]; then
@@ -290,7 +749,10 @@ abort_partial() {
 }
 
 # Verzeichnisstruktur sicherstellen
-mkdir -p "$DST"/{services/kiron-proxy,services/kiron-docling,services/kiron-embeddings,services/kiron-deberta,services/kiron-common,data,docker}
+mkdir -p "$DST/services/kiron-common" "$DST/data" "$DST/docker"
+for svc in "${KIRON_SERVICES[@]}"; do
+    mkdir -p "$DST/services/$svc"
+done
 
 # Service-rsync gekapselt, damit alle Services identisch behandelt werden.
 sync_service() {
@@ -304,15 +766,17 @@ sync_service() {
         "$SRC/services/$name/" "$DST/services/$name/"
 }
 
-sync_service kiron-proxy      --exclude='requirements-lock.txt'
-sync_service kiron-docling    --exclude='requirements-lock.txt'
-sync_service kiron-embeddings --exclude='requirements-lock.txt'
-sync_service kiron-deberta    --exclude='requirements-lock.txt'
+for svc in "${KIRON_SERVICES[@]}"; do
+    sync_service "$svc" --exclude='requirements-lock.txt'
+done
 rsync -a --delete \
     --exclude='venv/' \
     --exclude='__pycache__/' \
     --exclude='*.pyc' \
     "$SRC/services/kiron-common/" "$DST/services/kiron-common/"
+apply_code_permissions
+
+check_kitt_worker_no_dispatch_activation "$DST/services/kitt-worker"
 
 # Importprobe gegen den jetzt aktuellen Common-Code, bevor Docker-Compose,
 # Runtime-Handoff und systemd-Aenderungen Side-Effects haben (#782).
@@ -370,14 +834,22 @@ if [ ! -f "$DST/data/db_config.json" ]; then
 else
     echo "  db_config.json: existiert bereits, uebersprungen"
 fi
+apply_data_permissions
 
 # systemd-Units installieren
 cp "$SRC/systemd/"*.service /etc/systemd/system/
+check_kitt_worker_no_dispatch_activation \
+    "$DST/services/kitt-worker" \
+    "/etc/systemd/system/kitt-worker.service" \
+    "/etc/systemd/system/kitt-worker.service.d"
 systemctl daemon-reload
 echo "  systemd-Units aktualisiert"
+if [ "$1" = "--restart" ]; then
+    check_kitt_worker_auth_restart_preflight
+fi
 
 # Optional: Services neustarten
-# Sequentiell, damit die 4 Services nicht gleichzeitig um GPU/VRAM konkurrieren (#545).
+# Sequentiell, damit Services nicht gleichzeitig um GPU/VRAM konkurrieren (#545).
 # Proxy zuerst, damit das Dashboard/OpenAI-API so frueh wie moeglich wieder antwortet.
 if [ "$1" = "--restart" ]; then
     echo "Starte Services neu..."
@@ -385,7 +857,7 @@ if [ "$1" = "--restart" ]; then
     # Services mit altem in-memory-Code stehen, waehrend on-disk schon der neue
     # Code liegt — Halb-Deploy-Zustand (#936).
     failed_services=()
-    for svc in kiron-proxy kiron-docling kiron-embeddings kiron-deberta; do
+    for svc in "${KIRON_SERVICES[@]}"; do
         if ! systemctl restart "$svc"; then
             failed_services+=("$svc")
             echo "  FEHLER: systemctl restart $svc fehlgeschlagen, fahre mit naechstem Service fort." >&2
@@ -394,6 +866,10 @@ if [ "$1" = "--restart" ]; then
     if [ ${#failed_services[@]} -gt 0 ]; then
         echo "FEHLER: Restart fehlgeschlagen fuer: ${failed_services[*]}" >&2
         echo "       Logs pruefen via: journalctl -u <service> -n 50" >&2
+        abort_partial
+    fi
+    if ! check_catalog_consistency_after_restart; then
+        echo "FEHLER: Catalog-Digests nach Restart inkonsistent; Deploy-Complete-Marker bleibt unveraendert." >&2
         abort_partial
     fi
     echo "Services neugestartet."

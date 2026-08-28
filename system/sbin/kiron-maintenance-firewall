@@ -1,0 +1,75 @@
+#!/bin/bash
+set -euo pipefail
+
+ABSENT_EXIT=10
+COMMENT="ollama-monitor-maintenance"
+IPTABLES="/usr/sbin/iptables"
+
+fail() {
+    echo "FEHLER: $*" >&2
+    exit 64
+}
+
+[ "$#" -eq 3 ] || fail "Usage: kiron-maintenance-firewall <check|insert|delete> <INPUT|DOCKER-USER> <port>"
+
+action="$1"
+chain="$2"
+port="$3"
+
+case "$action" in
+    check|insert|delete) ;;
+    *) fail "Action nicht erlaubt: $action" ;;
+esac
+
+case "$chain" in
+    INPUT|DOCKER-USER) ;;
+    *) fail "Chain nicht erlaubt: $chain" ;;
+esac
+
+case "$port" in
+    5001|11434|11435|11440) ;;
+    *) fail "Port nicht erlaubt: $port" ;;
+esac
+
+[ -x "$IPTABLES" ] || fail "iptables nicht ausfuehrbar: $IPTABLES"
+
+rule=(-p tcp --dport "$port")
+if [ "$chain" = "INPUT" ]; then
+    rule+=(! -i lo)
+fi
+rule+=(-j DROP -m comment --comment "$COMMENT")
+
+iptables_action=""
+case "$action" in
+    check) iptables_action="-C" ;;
+    insert) iptables_action="-I" ;;
+    delete) iptables_action="-D" ;;
+esac
+
+stderr_file="$(mktemp)"
+trap 'rm -f "$stderr_file"' EXIT
+
+if "$IPTABLES" "$iptables_action" "$chain" "${rule[@]}" 2>"$stderr_file"; then
+    [ "$action" = "check" ] && echo "present"
+    exit 0
+fi
+
+stderr="$(cat "$stderr_file")"
+
+if [ "$chain" = "DOCKER-USER" ] && [[ "$stderr" == *"No chain"* ]]; then
+    if [ "$action" = "check" ]; then
+        echo "absent"
+        exit "$ABSENT_EXIT"
+    fi
+    exit 0
+fi
+
+if [ "$action" = "check" ] && {
+    [[ "$stderr" == *"Bad rule"* ]] || [[ "$stderr" == *"matching rule exist"* ]];
+}; then
+    echo "absent"
+    exit "$ABSENT_EXIT"
+fi
+
+printf '%s\n' "$stderr" >&2
+exit 1

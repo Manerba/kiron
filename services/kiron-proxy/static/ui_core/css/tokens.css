@@ -1,6 +1,6 @@
 /* ========================================
    Shared Frontend Core — Design Tokens
-   Produktneutrale :root-Defaults (32 Tokens)
+   Produktneutrale :root-Defaults
    Quelle: kiara/web/static/ui_core/css/tokens.css
    ======================================== */
 
@@ -29,12 +29,9 @@
     --transition-speed: 0.3s;
     --border-radius: 6px;
     --bg-tabs: var(--bg-secondary);
-    --bg-subtabs: var(--bg-secondary);
     --bg-controls: var(--bg-secondary);
     --bg-content: var(--bg-primary);
     --text-tabs: var(--text-secondary);
     --text-tabs-active: var(--accent-primary);
     --bg-tab-active: var(--bg-tabs);
-    --bg-subtab-active: var(--bg-subtabs);
-    --text-subtab-active: var(--text-tabs-active);
 }

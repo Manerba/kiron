@@ -7,24 +7,18 @@ import logging
 import os
 import re
 import subprocess
-import sys
 import threading
 import time
 import xml.etree.ElementTree as ET
-from pathlib import Path
 from typing import Optional
 
 import httpx
 import psutil
 
-_COMMON_SRC = Path(__file__).resolve().parents[1] / "kiron-common"
-if _COMMON_SRC.exists() and str(_COMMON_SRC) not in sys.path:
-    sys.path.insert(0, str(_COMMON_SRC))
-try:
-    from kiron_common.ollama_compat import is_real_int
-except ImportError:  # pragma: no cover
-    def is_real_int(value):
-        return isinstance(value, int) and not isinstance(value, bool)
+from kiron_common.catalog_consistency import check_catalog_digests
+from kiron_common.ollama_compat import is_real_int
+
+from routing_catalog import PROXY_ROUTING_VIEW
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +88,35 @@ _metrics_executor_lock = threading.Lock()
 #                              startet sofort wieder Backoff.
 _probe_health: dict[str, dict] = {}
 _probe_health_lock = threading.Lock()
+
+_CATALOG_SERVICES = ("kiron-embeddings", "kiron-deberta")
+
+
+def catalog_consistency_diagnostic(
+    embedding_status: object,
+    deberta_status: object,
+) -> dict:
+    """Compare digests already collected by the periodic health probes."""
+
+    reported = {
+        "kiron-embeddings": (
+            embedding_status.get("catalog_digest")
+            if isinstance(embedding_status, dict)
+            else None
+        ),
+        "kiron-deberta": (
+            deberta_status.get("catalog_digest")
+            if isinstance(deberta_status, dict)
+            else None
+        ),
+    }
+    report = check_catalog_digests(
+        PROXY_ROUTING_VIEW.catalog_digest,
+        reported,
+        required_services=_CATALOG_SERVICES,
+    ).to_dict()
+    report["proxy_digest"] = PROXY_ROUTING_VIEW.catalog_digest
+    return report
 
 
 def get_cpu_metrics() -> dict:
@@ -728,8 +751,13 @@ async def get_embedding_status() -> dict:
                     "running": True,
                     "status": status or ("ok" if resp.status_code == 200 else "unknown"),
                     "model": data.get("current_model") or data.get("model"),
+                    "loaded_models": data.get("loaded_models"),
+                    "model_slots": data.get("model_slots"),
                     "loading_model": data.get("loading_model"),
                     "available_models": data.get("available_models"),
+                    "available_colbert_models": data.get("available_colbert_models"),
+                    "catalog_digest": data.get("catalog_digest"),
+                    "model_states": data.get("model_states"),
                 }
     except httpx.TimeoutException:
         # #776-Pattern: code/probe-Felder, damit der zentrale Done-Pfad das
@@ -737,14 +765,29 @@ async def get_embedding_status() -> dict:
         # die embedding-Probe im 2s-Tick endlos in den 2s-Timeout).
         return {
             "running": False, "status": "down", "model": None,
+            "loaded_models": None, "model_slots": None,
             "loading_model": None, "available_models": None,
+            "available_colbert_models": None,
+            "catalog_digest": None,
+            "model_states": None,
             "error": "embedding health request timed out after 2 seconds.",
             "code": "probe_timeout",
             "probe": "embedding",
         }
     except Exception:
         pass
-    return {"running": False, "status": "down", "model": None, "loading_model": None, "available_models": None}
+    return {
+        "running": False,
+        "status": "down",
+        "model": None,
+        "loaded_models": None,
+        "model_slots": None,
+        "loading_model": None,
+        "available_models": None,
+        "available_colbert_models": None,
+        "catalog_digest": None,
+        "model_states": None,
+    }
 
 
 def _docling_inspect_sync() -> dict:
@@ -833,22 +876,36 @@ async def get_deberta_status() -> dict:
                     "running": True,
                     "status": status or ("ok" if resp.status_code == 200 else "unknown"),
                     "model": data.get("current_model") or data.get("model"),
+                    "loaded_models": data.get("loaded_models"),
                     "loading_model": data.get("loading_model"),
                     "available_models": data.get("available_models"),
+                    "catalog_digest": data.get("catalog_digest"),
+                    "model_states": data.get("model_states"),
                 }
     except httpx.TimeoutException:
         # #776-Pattern: code/probe-Felder, damit der zentrale Done-Pfad das probe-interne
         # Timeout vom "down"-Payload unterscheiden und Strikes/Backoff korrekt zaehlen kann
         # (sonst laeuft die DeBERTa-Probe im 2s-Tick endlos in den 2s-Timeout).
         return {
-            "running": False, "status": "down", "model": None, "loading_model": None, "available_models": None,
+            "running": False, "status": "down", "model": None, "loaded_models": None,
+            "loading_model": None, "available_models": None, "catalog_digest": None,
+            "model_states": None,
             "error": "DeBERTa health request timed out after 2 seconds",
             "code": "probe_timeout",
             "probe": "deberta",
         }
     except Exception:
         pass
-    return {"running": False, "status": "down", "model": None, "loading_model": None, "available_models": None}
+    return {
+        "running": False,
+        "status": "down",
+        "model": None,
+        "loaded_models": None,
+        "loading_model": None,
+        "available_models": None,
+        "catalog_digest": None,
+        "model_states": None,
+    }
 
 
 def _get_metrics_executor() -> concurrent.futures.ThreadPoolExecutor:
@@ -1231,6 +1288,13 @@ async def get_all_metrics() -> dict:
     else:
         gpu_process_vram_unknown_count = None
 
+    embedding_status = results.get("embedding")
+    deberta_status = results.get("deberta")
+    catalog_consistency = catalog_consistency_diagnostic(
+        embedding_status,
+        deberta_status,
+    )
+
     return {
         "cpu": results.get("cpu"),
         "memory": results.get("memory"),
@@ -1240,8 +1304,9 @@ async def get_all_metrics() -> dict:
         "gpu_processes": gpu_processes_payload,
         "gpu_process_vram_unknown_count": gpu_process_vram_unknown_count,
         "docling": results.get("docling"),
-        "embedding": results.get("embedding"),
-        "deberta": results.get("deberta"),
+        "embedding": embedding_status,
+        "deberta": deberta_status,
+        "catalog_consistency": catalog_consistency,
         "timestamp": time.time(),
     }
 

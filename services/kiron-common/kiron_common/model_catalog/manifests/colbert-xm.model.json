@@ -1,0 +1,157 @@
+{
+  "schema_version": 1,
+  "canonical_model_id": "colbert-xm:latest",
+  "aliases": [
+    "colbert-xm"
+  ],
+  "deployments": [
+    {
+      "id": "kiron-colbert-xm-multivector-v1.deployment",
+      "backend": {
+        "type": "kiron_embeddings",
+        "parameters": {
+          "implementation": "kiron-xmod-colbert",
+          "implementation_revision": "v1",
+          "model_name": "colbert-xm"
+        }
+      },
+      "artifact": {
+        "type": "huggingface",
+        "repository": "antoinelouis/colbert-xm",
+        "revision": "960de711799d210957d18df59c14c59a439b608a",
+        "manifest_digest": null,
+        "trust_remote_code": false,
+        "weights": [
+          {
+            "path": "model.safetensors",
+            "sha256": "9c74a0fabc96993d671aa8550eec103bd31ec62a5c50c570b41ec628a8985b3c"
+          }
+        ],
+        "auxiliary": [
+          {
+            "path": "artifact.metadata",
+            "sha256": "9df4cb28e86271ee5aa21eb3d3b97773315d7975fed800a50a0f4766da2cb9e3"
+          }
+        ],
+        "metadata": {}
+      },
+      "routes": [
+        {
+          "task": "embedding",
+          "endpoint": "/api/embed_colbert"
+        }
+      ],
+      "loader": {
+        "type": "colbert_xmod",
+        "parameters": {
+          "projection_weight_tensor": "linear.weight",
+          "tokenizer_use_fast": true
+        }
+      },
+      "metadata": {
+        "discovery": {
+          "family": "xmod",
+          "format": "safetensors",
+          "parameter_size": "0.9B",
+          "precision": null,
+          "size": 3410847320
+        }
+      }
+    }
+  ],
+  "profiles": [
+    {
+      "id": "kiron-colbert-xm-multivector-v1",
+      "deployment_id": "kiron-colbert-xm-multivector-v1.deployment",
+      "task": "embedding",
+      "endpoint": "/api/embed_colbert",
+      "default_for_endpoint": true,
+      "metadata": {
+        "kind": "multi_vector",
+        "dimensions": 128,
+        "max_input_tokens": {
+          "unit": "tokenizer_tokens",
+          "counting": "after_server_formatting_including_special_tokens",
+          "truncation": "right",
+          "overflow": "truncate",
+          "by_role": {
+            "search_document": 256,
+            "search_query": 32
+          }
+        },
+        "output_normalized": true,
+        "similarity": "maxsim_cosine",
+        "input_type": {
+          "supported": [
+            "search_document",
+            "search_query"
+          ],
+          "additional_task_roles": [],
+          "aliases": [
+            {
+              "alias": "document",
+              "canonical": "search_document"
+            },
+            {
+              "alias": "query",
+              "canonical": "search_query"
+            }
+          ],
+          "role_sensitive": true,
+          "required": true,
+          "default": null,
+          "missing_role_behavior": "reject"
+        },
+        "formatting_owner": "server",
+        "pipeline": {
+          "tokenizer": {
+            "repository": "antoinelouis/colbert-xm",
+            "revision": "960de711799d210957d18df59c14c59a439b608a"
+          },
+          "formatting": {
+            "search_document": {
+              "template": "{text}",
+              "parameters": {}
+            },
+            "search_query": {
+              "template": "{text}",
+              "parameters": {}
+            }
+          },
+          "pooling": {
+            "method": "token_projection",
+            "parameters": {
+              "default_language_adapter": "de_DE",
+              "mask_punctuation": true,
+              "remove_special_tokens": true,
+              "row_order": "token_order"
+            }
+          },
+          "normalization": {
+            "method": "l2",
+            "dtype": "float32",
+            "scope": "token"
+          },
+          "parameters": {
+            "projection_dimensions": 128
+          }
+        },
+        "verification": {
+          "status": "unverified",
+          "evidence": [
+            "hf-artifact-metadata:antoinelouis/colbert-xm@960de711799d210957d18df59c14c59a439b608a",
+            "local-artifact-metadata-sha256:9df4cb28e86271ee5aa21eb3d3b97773315d7975fed800a50a0f4766da2cb9e3",
+            "local-weight-sha256:9c74a0fabc96993d671aa8550eec103bd31ec62a5c50c570b41ec628a8985b3c",
+            "runtime-pipeline:kiron-colbert-xm-token-projection"
+          ],
+          "blocking_reasons": [
+            "artifact_marker_contract_not_injected_by_current_pipeline",
+            "missing_reference_vector_for_adapter_masking_projection_and_row_order"
+          ]
+        }
+      }
+    }
+  ],
+  "request_defaults": [],
+  "metadata": {}
+}

@@ -1,0 +1,153 @@
+{
+  "fixture_version": 1,
+  "catalog_schema_version": 1,
+  "catalog_digest": "sha256:c91229d7ea472b49d87f6344dbfb640fc760f43e8cace398421d5b364452e6f6",
+  "group_count": 13,
+  "profile_count": 23,
+  "manifest_files": [
+    "bge-m3.model.json",
+    "bge-reranker-v2-m3.model.json",
+    "colbert-xm.model.json",
+    "hellord-e5-mistral-7b-instruct.model.json",
+    "mankei-326m-embedder.model.json",
+    "mankei-326m-reranker.model.json",
+    "mdeberta-v3-xnli.model.json",
+    "ms-marco-minilm-l-6-v2.model.json",
+    "mxbai-embed-large.model.json",
+    "nli-deberta-v3-base.model.json",
+    "nomic-embed-text.model.json",
+    "since2006-gte-qwen2-7b-instruct.model.json",
+    "snowflake-arctic-embed.model.json"
+  ],
+  "groups": [
+    {
+      "canonical_model_id": "bge-m3:latest",
+      "aliases": [
+        "bge-m3"
+      ],
+      "profile_ids": [
+        "kiron-bge-m3-dense-v1",
+        "ollama-bge-m3-dense-v1"
+      ]
+    },
+    {
+      "canonical_model_id": "bge-reranker-v2-m3",
+      "aliases": [
+        "BAAI/bge-reranker-v2-m3"
+      ],
+      "profile_ids": [
+        "kiron-bge-reranker-v2-m3-rerank-v1",
+        "kiron-bge-reranker-v2-m3-score-v1"
+      ]
+    },
+    {
+      "canonical_model_id": "colbert-xm:latest",
+      "aliases": [
+        "colbert-xm"
+      ],
+      "profile_ids": [
+        "kiron-colbert-xm-multivector-v1"
+      ]
+    },
+    {
+      "canonical_model_id": "hellord/e5-mistral-7b-instruct:Q4_0",
+      "aliases": [
+        "e5-mistral-7b-instruct",
+        "hellord/e5-mistral-7b-instruct"
+      ],
+      "profile_ids": [
+        "ollama-e5-mistral-dense-v1"
+      ]
+    },
+    {
+      "canonical_model_id": "mankei-326m-embedder:latest",
+      "aliases": [
+        "mankei-326m-embedder"
+      ],
+      "profile_ids": [
+        "kiron-mankei-dense-v1"
+      ]
+    },
+    {
+      "canonical_model_id": "mankei-326m-reranker",
+      "aliases": [
+        "keyvan-ai/Mankei-326M-Reranker"
+      ],
+      "profile_ids": [
+        "kiron-mankei-326m-reranker-rerank-v1",
+        "kiron-mankei-326m-reranker-score-v1"
+      ]
+    },
+    {
+      "canonical_model_id": "mdeberta-v3-xnli",
+      "aliases": [
+        "MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7"
+      ],
+      "profile_ids": [
+        "kiron-mdeberta-v3-xnli-rerank-v1",
+        "kiron-mdeberta-v3-xnli-score-v1"
+      ]
+    },
+    {
+      "canonical_model_id": "ms-marco-MiniLM-L-6-v2",
+      "aliases": [
+        "cross-encoder/ms-marco-MiniLM-L-6-v2"
+      ],
+      "profile_ids": [
+        "kiron-ms-marco-minilm-l-6-v2-rerank-v1",
+        "kiron-ms-marco-minilm-l-6-v2-score-v1"
+      ]
+    },
+    {
+      "canonical_model_id": "mxbai-embed-large:latest",
+      "aliases": [
+        "mxbai-embed-large"
+      ],
+      "profile_ids": [
+        "kiron-mxbai-dense-v1",
+        "ollama-mxbai-dense-v1"
+      ]
+    },
+    {
+      "canonical_model_id": "nli-deberta-v3-base",
+      "aliases": [
+        "cross-encoder/nli-deberta-v3-base"
+      ],
+      "profile_ids": [
+        "kiron-nli-deberta-v3-base-rerank-v1",
+        "kiron-nli-deberta-v3-base-score-v1"
+      ]
+    },
+    {
+      "canonical_model_id": "nomic-embed-text:latest",
+      "aliases": [
+        "nomic-embed-text"
+      ],
+      "profile_ids": [
+        "kiron-nomic-dense-v1",
+        "kiron-nomic-late-v1",
+        "ollama-nomic-dense-v1"
+      ]
+    },
+    {
+      "canonical_model_id": "since2006/gte-Qwen2-7B-instruct:Q4_K_M",
+      "aliases": [
+        "gte-qwen2-7b-instruct",
+        "since2006/gte-Qwen2-7B-instruct"
+      ],
+      "profile_ids": [
+        "ollama-gte-qwen2-dense-v1"
+      ]
+    },
+    {
+      "canonical_model_id": "snowflake-arctic-embed:l",
+      "aliases": [
+        "snowflake-arctic-embed"
+      ],
+      "profile_ids": [
+        "kiron-snowflake-dense-v1",
+        "ollama-snowflake-dense-v1"
+      ]
+    }
+  ]
+}

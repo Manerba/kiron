@@ -15,6 +15,7 @@ huggingface_hub==1.6.0
 idna==3.11
 Jinja2==3.1.6
 joblib==1.5.3
+langdetect==1.0.9
 markdown-it-py==4.0.0
 MarkupSafe==3.0.2
 mdurl==0.1.2

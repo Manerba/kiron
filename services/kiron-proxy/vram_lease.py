@@ -13,13 +13,15 @@ Gemeinsames Modul fuer proxy.py, openai_api.py, app.py. Stellt:
 
 import asyncio
 from dataclasses import dataclass
+import errno
 import enum
 import fcntl
+import grp
 import json
 import logging
 import os
+import pwd
 import stat
-import sys
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -28,22 +30,10 @@ from typing import Any
 
 import httpx
 
-_COMMON_SRC = Path(__file__).resolve().parents[1] / "kiron-common"
-if _COMMON_SRC.exists() and str(_COMMON_SRC) not in sys.path:
-    sys.path.insert(0, str(_COMMON_SRC))
+from kiron_common.model_catalog import BackendType, ModelEndpoint, ModelTask
+from kiron_common.ollama_compat import ensure_num_gpu_zero, is_real_int
 
-try:
-    from kiron_common.ollama_compat import ensure_num_gpu_zero, is_real_int
-except ImportError:  # pragma: no cover - defensive fallback for half-upgraded venvs
-    def is_real_int(value: Any) -> bool:
-        return isinstance(value, int) and not isinstance(value, bool)
-
-    def ensure_num_gpu_zero(options: dict[str, Any] | None) -> dict[str, Any]:
-        if not isinstance(options, dict):
-            options = {}
-        if "num_gpu" not in options:
-            options["num_gpu"] = 0
-        return options
+from routing_catalog import PROXY_ROUTING_VIEW, ProxyRoute, ProxyRoutingView
 
 __all__ = [
     "LeaseOutcome",
@@ -53,7 +43,6 @@ __all__ = [
     "snapshot",
     "effective_snapshot",
     "apply_bytes",
-    "apply_ollama_embed_fallback",
     "apply_options_dict",
     "num_gpu_zero_effective",
     "runtime_capability_status",
@@ -91,12 +80,6 @@ DOCLING_LIFECYCLE_URL = "http://127.0.0.1:5001/_internal/lifecycle"
 # Referenz fuer die STREAMING_PATHS-Menge reused.
 STREAMING_INTERCEPT_PATHS = frozenset({"/api/chat", "/api/generate"})
 
-# Modelle fuer die Ollama selbst das Embedding bedient (7B+) — Teilintercept
-# auf /api/embed fuer diese Modelle (siehe Plan Pfad 2 / F1).
-_OLLAMA_EMBED_MODELS = frozenset({
-    "e5-mistral-7b-instruct", "gte-qwen2-7b-instruct",
-})
-
 # V1: Der fruehere Env-Bypass darf `/api/embed` nicht mehr lockern.
 _EMBED_BLOCK_FALLBACK = True
 if os.environ.get("KIRON_VRAM_LEASE_EMBED_BLOCK") == "0":
@@ -121,7 +104,11 @@ _runtime_capability_cache: dict[str, Any] = {
     "status": None,
 }
 
-RUNTIME_MARKER_DIR = Path(os.environ.get("KIRON_RUNTIME_DIR", "/run/kiron"))
+RUNTIME_MARKER_GROUP = "kiron-runtime"
+RUNTIME_MARKER_FILE_OWNER_NAMES = frozenset({"kiron-proxy", "kiron-docling"})
+RUNTIME_MARKER_DIR_MODE = 0o2770
+RUNTIME_MARKER_FILE_MODE = 0o660
+RUNTIME_MARKER_DIR = Path(os.environ.get("KIRON_RUNTIME_DIR", "/run/kiron/vram"))
 STARTUP_MARKER_PATH = RUNTIME_MARKER_DIR / "docling-vram-startup.json"
 SHUTDOWN_MARKER_PATH = RUNTIME_MARKER_DIR / "docling-vram-shutdown.json"
 GPU_SERVICE_LOADING_MARKER_PATH = RUNTIME_MARKER_DIR / "gpu-service-loading.json"
@@ -255,6 +242,132 @@ def _path_is_safe_regular_file(path: Path) -> tuple[bool, str, os.stat_result | 
     return True, "ok", st
 
 
+def _runtime_marker_group_gid() -> int | None:
+    try:
+        return grp.getgrnam(RUNTIME_MARKER_GROUP).gr_gid
+    except KeyError:
+        return None
+
+
+def _runtime_marker_file_owner_uids() -> frozenset[int]:
+    uids: set[int] = set()
+    for name in RUNTIME_MARKER_FILE_OWNER_NAMES:
+        try:
+            uids.add(pwd.getpwnam(name).pw_uid)
+        except KeyError:
+            continue
+    return frozenset(uids)
+
+
+def _runtime_marker_dir_owner_uid() -> int:
+    return 0
+
+
+def _stat_is_safe_runtime_file(st: os.stat_result) -> tuple[bool, str]:
+    if not stat.S_ISREG(st.st_mode):
+        return False, "not_regular"
+    if st.st_uid not in _runtime_marker_file_owner_uids():
+        return False, "file_owner_not_allowed"
+    runtime_gid = _runtime_marker_group_gid()
+    if runtime_gid is None:
+        return False, "runtime_group_missing"
+    if st.st_gid != runtime_gid:
+        return False, "file_group_not_runtime"
+    if st.st_mode & stat.S_IRWXO:
+        return False, "file_world_bits"
+    if (st.st_mode & 0o7777) != RUNTIME_MARKER_FILE_MODE:
+        return False, "file_mode_not_0660"
+    return True, "ok"
+
+
+def _fd_is_safe_runtime_file(fd: int) -> tuple[bool, str]:
+    return _stat_is_safe_runtime_file(os.fstat(fd))
+
+
+def _runtime_file_identity(
+    st: os.stat_result,
+) -> tuple[int, int, int, int, int, int, int, int]:
+    mtime_ns = getattr(st, "st_mtime_ns", int(st.st_mtime * 1_000_000_000))
+    ctime_ns = getattr(st, "st_ctime_ns", int(st.st_ctime * 1_000_000_000))
+    return (
+        st.st_dev,
+        st.st_ino,
+        st.st_mode,
+        st.st_uid,
+        st.st_gid,
+        st.st_size,
+        mtime_ns,
+        ctime_ns,
+    )
+
+
+def _path_is_safe_runtime_dir(path: Path) -> tuple[bool, str]:
+    try:
+        st = os.lstat(path)
+    except OSError as exc:
+        return False, f"parent_stat_failed:{exc}"
+    if stat.S_ISLNK(st.st_mode):
+        return False, "parent_symlink"
+    if not stat.S_ISDIR(st.st_mode):
+        return False, "parent_not_directory"
+    if st.st_uid != _runtime_marker_dir_owner_uid():
+        return False, "parent_owner_not_root"
+    runtime_gid = _runtime_marker_group_gid()
+    if runtime_gid is None:
+        return False, "runtime_group_missing"
+    if st.st_gid != runtime_gid:
+        return False, "parent_group_not_runtime"
+    if st.st_mode & stat.S_IRWXO:
+        return False, "parent_world_bits"
+    if (st.st_mode & 0o7777) != RUNTIME_MARKER_DIR_MODE:
+        return False, "parent_mode_not_2770"
+    return True, "ok"
+
+
+def _path_is_safe_runtime_file(path: Path) -> tuple[bool, str, os.stat_result | None]:
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return False, "missing", None
+    except OSError as exc:
+        return False, f"stat_failed:{exc}", None
+    if stat.S_ISLNK(st.st_mode):
+        return False, "symlink", st
+    parent_ok, parent_reason = _path_is_safe_runtime_dir(path.parent)
+    if not parent_ok:
+        return False, parent_reason, st
+    ok, reason = _stat_is_safe_runtime_file(st)
+    return ok, reason, st
+
+
+def _open_existing_runtime_file(
+    path: Path,
+    flags: int,
+) -> tuple[int | None, str, os.stat_result | None]:
+    parent_ok, parent_reason = _path_is_safe_runtime_dir(path.parent)
+    if not parent_ok:
+        return None, parent_reason, None
+    open_flags = flags | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, open_flags)
+    except FileNotFoundError:
+        return None, "missing", None
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            return None, "symlink", None
+        return None, f"open_failed:{exc}", None
+    try:
+        st = os.fstat(fd)
+        ok, reason = _stat_is_safe_runtime_file(st)
+        if not ok:
+            os.close(fd)
+            return None, reason, st
+        return fd, "ok", st
+    except Exception:
+        os.close(fd)
+        raise
+
+
 def invalidate_runtime_capability_cache() -> None:
     _runtime_capability_cache["ts"] = 0.0
     _runtime_capability_cache["stat_key"] = None
@@ -319,31 +432,37 @@ def num_gpu_zero_effective() -> bool:
     return bool(runtime_capability_status().get("safe"))
 
 
-def _marker_payload(path: Path) -> tuple[dict[str, Any] | None, bool]:
+def _marker_payload_with_stat(
+    path: Path,
+) -> tuple[dict[str, Any] | None, bool, os.stat_result | None]:
     """Return marker payload and active flag.
 
     Missing or expired markers are inactive. Unsafe, unreadable or malformed
     markers are active fail-closed and have no trusted payload.
     """
-    ok, reason, _ = _path_is_safe_regular_file(path)
-    if not ok:
+    fd, reason, st = _open_existing_runtime_file(path, os.O_RDONLY)
+    if fd is None:
         if reason == "missing":
-            return None, False
+            return None, False, None
         logger.warning("VRAM-Lease Marker %s unsafe: %s", path, reason)
-        return None, True
+        return None, True, st
     try:
-        with path.open("r", encoding="utf-8") as fh:
+        with os.fdopen(fd, "r", encoding="utf-8") as fh:
+            fd = None
             data = json.load(fh)
     except (OSError, json.JSONDecodeError) as exc:
         logger.warning("VRAM-Lease Marker %s nicht lesbar: %s", path, exc)
-        return None, True
+        return None, True, st
+    finally:
+        if fd is not None:
+            os.close(fd)
     if not isinstance(data, dict):
-        return None, True
+        return None, True, st
     deadline = data.get("deadline_monotonic")
     created_wall = data.get("created_wall")
     ttl = data.get("ttl_s")
     if isinstance(deadline, (int, float)) and not isinstance(deadline, bool):
-        return data, time.monotonic() < float(deadline)
+        return data, time.monotonic() < float(deadline), st
     if (
         isinstance(created_wall, (int, float))
         and not isinstance(created_wall, bool)
@@ -351,8 +470,13 @@ def _marker_payload(path: Path) -> tuple[dict[str, Any] | None, bool]:
         and not isinstance(ttl, bool)
     ):
         ttl_s = max(0.0, min(float(ttl), _MARKER_MAX_TTL_S))
-        return data, time.time() < float(created_wall) + ttl_s
-    return None, True
+        return data, time.time() < float(created_wall) + ttl_s, st
+    return None, True, st
+
+
+def _marker_payload(path: Path) -> tuple[dict[str, Any] | None, bool]:
+    data, active, _ = _marker_payload_with_stat(path)
+    return data, active
 
 
 def _marker_active(path: Path) -> bool:
@@ -393,20 +517,76 @@ def _marker_lock_path(path: Path) -> Path:
     return path.with_name(f".{path.name}.lock")
 
 
+def _open_marker_lock(path: Path) -> int:
+    lock_path = _marker_lock_path(path)
+    lock_path.parent.mkdir(
+        parents=True,
+        mode=RUNTIME_MARKER_DIR_MODE,
+        exist_ok=True,
+    )
+    parent_ok, parent_reason = _path_is_safe_runtime_dir(lock_path.parent)
+    if not parent_ok:
+        raise MarkerOwnershipError(
+            f"VRAM lock directory {lock_path.parent} unsafe: {parent_reason}"
+        )
+    flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+    created = False
+    for _ in range(2):
+        try:
+            lock_fd = os.open(
+                lock_path,
+                flags | os.O_CREAT | os.O_EXCL,
+                RUNTIME_MARKER_FILE_MODE,
+            )
+            created = True
+            break
+        except FileExistsError:
+            try:
+                lock_fd = os.open(lock_path, flags)
+                break
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                raise MarkerOwnershipError(
+                    f"VRAM lock {lock_path} unsafe: {exc}"
+                ) from exc
+        except OSError as exc:
+            raise MarkerOwnershipError(f"VRAM lock {lock_path} unsafe: {exc}") from exc
+    else:
+        raise MarkerOwnershipError(f"VRAM lock {lock_path} unstable")
+    try:
+        if created:
+            os.fchmod(lock_fd, RUNTIME_MARKER_FILE_MODE)
+        ok, reason = _fd_is_safe_runtime_file(lock_fd)
+        if not ok:
+            raise MarkerOwnershipError(f"VRAM lock {lock_path} unsafe: {reason}")
+    except Exception:
+        os.close(lock_fd)
+        raise
+    return lock_fd
+
+
 def _write_marker_payload(path: Path, payload: dict[str, Any]) -> None:
     tmp = path.with_name(f".{path.name}.{payload['token']}.tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    fd: int | None = os.open(
+        tmp,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+        RUNTIME_MARKER_FILE_MODE,
+    )
     try:
+        os.fchmod(fd, RUNTIME_MARKER_FILE_MODE)
+        ok, reason = _fd_is_safe_runtime_file(fd)
+        if not ok:
+            raise MarkerOwnershipError(f"VRAM marker {tmp} unsafe: {reason}")
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fd = None
             json.dump(payload, fh, separators=(",", ":"))
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(tmp, path)
-        try:
-            os.chmod(path, 0o600)
-        except OSError:
-            pass
     except Exception:
+        if fd is not None:
+            os.close(fd)
         try:
             os.unlink(tmp)
         except OSError:
@@ -424,8 +604,7 @@ def write_overlay_marker(
     """
     token = token or uuid.uuid4().hex
     path = _marker_path(kind)
-    path.parent.mkdir(parents=True, mode=0o755, exist_ok=True)
-    lock_path = _marker_lock_path(path)
+    path.parent.mkdir(parents=True, mode=RUNTIME_MARKER_DIR_MODE, exist_ok=True)
     payload = {
         "token": token,
         "kind": kind,
@@ -434,7 +613,7 @@ def write_overlay_marker(
         "deadline_monotonic": time.monotonic() + max(1.0, min(ttl_s, _MARKER_MAX_TTL_S)),
         "ttl_s": max(1.0, min(ttl_s, _MARKER_MAX_TTL_S)),
     }
-    lock_fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
+    lock_fd = _open_marker_lock(path)
     try:
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
         current, active = _marker_payload(path)
@@ -465,16 +644,29 @@ def clear_overlay_marker(kind: str = "startup", token: str | None = None) -> Non
     path = _marker_path(kind)
     if token is None:
         return
-    path.parent.mkdir(parents=True, mode=0o755, exist_ok=True)
-    lock_path = _marker_lock_path(path)
-    lock_fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
+    path.parent.mkdir(parents=True, mode=RUNTIME_MARKER_DIR_MODE, exist_ok=True)
+    lock_fd = _open_marker_lock(path)
     try:
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
-        data, active = _marker_payload(path)
+        data, active, marker_st = _marker_payload_with_stat(path)
+        if data is None and active:
+            return
         if data is None:
             return
         if data.get("token") != token:
             return
+        if marker_st is not None:
+            try:
+                current_st = os.lstat(path)
+            except OSError:
+                return
+            if _runtime_file_identity(current_st) != _runtime_file_identity(marker_st):
+                logger.warning("VRAM-Lease Marker %s changed before clear", path)
+                return
+            ok, reason = _stat_is_safe_runtime_file(current_st)
+            if not ok:
+                logger.warning("VRAM-Lease Marker %s unsafe before clear: %s", path, reason)
+                return
         try:
             path.unlink()
         except OSError:
@@ -732,15 +924,23 @@ def _explicit_verified_cpu_offload_from_body(body: bytes) -> bool:
     return _explicit_num_gpu_zero(options) and num_gpu_zero_effective()
 
 
-def _embed_outcome(model: str, lease_active: bool, policy: str) -> LeaseOutcome:
+def _embed_outcome(
+    route: ProxyRoute,
+    lease_active: bool,
+    policy: str,
+) -> LeaseOutcome:
     """Sub-Logik fuer /api/embed-Pfad (Pfad 2)."""
     if not lease_active:
         return LeaseOutcome.PASS
     if policy == "pass":
         _log_pass_passthrough_throttled()
         return LeaseOutcome.PASS
-    if model not in _OLLAMA_EMBED_MODELS:
-        # EMBED_SERVICE_MODELS + unbekannte: nicht Teil des Intercepts
+    if not (
+        route.backend is BackendType.OLLAMA
+        and route.task is ModelTask.EMBEDDING
+        and route.endpoint is ModelEndpoint.EMBED
+    ):
+        # Service-owned Catalog deployments are not part of this intercept.
         return LeaseOutcome.PASS
     if policy == "block":
         return LeaseOutcome.BLOCK
@@ -754,7 +954,10 @@ def _embed_outcome(model: str, lease_active: bool, policy: str) -> LeaseOutcome:
 # --- Public Intercept-Helfer ---
 
 async def apply_bytes(
-    body: bytes, path: str, model: str,
+    body: bytes,
+    path: str,
+    model: str,
+    routing_view: ProxyRoutingView = PROXY_ROUTING_VIEW,
 ) -> tuple[bytes, LeaseOutcome]:
     """Lease-Intercept fuer bytes-basierte Bodies (proxy.py-Pfad).
 
@@ -769,12 +972,23 @@ async def apply_bytes(
     - path nicht in STREAMING_INTERCEPT_PATHS ∪ {/api/embed} → PASS.
     - JSON-unparseable → PASS.
     - Client-`options.num_gpu` bereits gesetzt → PASS.
-    - /api/embed mit OLLAMA_EMBED_MODELS: siehe `_embed_outcome`.
+    - /api/embed only for an exact Catalog route whose selected deployment is
+      backend=ollama, task=embedding, endpoint=/api/embed.
+    - unknown or endpoint-foreign embedding names → PASS without consulting
+      an overlay marker or lease snapshot; proxy.py returns their 400.
     """
+    if not isinstance(routing_view, ProxyRoutingView):
+        raise TypeError("routing_view must be a ProxyRoutingView")
     normalized_path = path
     is_embed = normalized_path == "/api/embed"
     if normalized_path not in STREAMING_INTERCEPT_PATHS and not is_embed:
         return body, LeaseOutcome.PASS
+
+    embed_route = None
+    if is_embed:
+        embed_route = routing_view.resolve(model, ModelEndpoint.EMBED)
+        if embed_route is None:
+            return body, LeaseOutcome.PASS
 
     hard_kind = _hard_overlay_marker_kind()
     if hard_kind is not None:
@@ -789,8 +1003,9 @@ async def apply_bytes(
     policy = VRAM_LEASE_POLICY
 
     if is_embed:
-        outcome = _embed_outcome(_normalize_model_name(model),
-                                 lease_active, policy)
+        if embed_route is None:  # pragma: no cover - guarded above
+            raise AssertionError("resolved embedding route disappeared")
+        outcome = _embed_outcome(embed_route, lease_active, policy)
         if outcome == LeaseOutcome.PASS:
             return body, LeaseOutcome.PASS
         if outcome == LeaseOutcome.BLOCK:
@@ -824,29 +1039,6 @@ async def apply_bytes(
     new_body = json.dumps(data, ensure_ascii=False,
                           separators=(",", ":")).encode("utf-8")
     return new_body, outcome
-
-
-async def apply_ollama_embed_fallback(
-    body: bytes, path: str, model: str,
-) -> tuple[bytes, LeaseOutcome]:
-    """Gate final Ollama `/api/embed` fallback posts.
-
-    This is intentionally stricter than `apply_bytes(..., "/api/embed",
-    EMBED_SERVICE_MODEL)`: service-routed models normally pass to
-    kiron-embeddings, but the ConnectError fallback becomes a real Ollama
-    GPU path and must be blocked while Docling owns the effective gate.
-    """
-    if path != "/api/embed":
-        return body, LeaseOutcome.PASS
-    hard_kind = _hard_overlay_marker_kind()
-    if hard_kind is not None:
-        return body, LeaseOutcome.BLOCK
-    if not await snapshot():
-        return body, LeaseOutcome.PASS
-    if VRAM_LEASE_POLICY == "pass":
-        _log_pass_passthrough_throttled()
-        return body, LeaseOutcome.PASS
-    return body, LeaseOutcome.BLOCK
 
 
 async def apply_options_dict(options: dict) -> LeaseOutcome:
@@ -902,15 +1094,3 @@ def _inject_num_gpu_zero(body: bytes) -> bytes:
     data["options"] = options
     return json.dumps(data, ensure_ascii=False,
                       separators=(",", ":")).encode("utf-8")
-
-
-def _normalize_model_name(name: str) -> str:
-    """Gleiche Normalisierung wie proxy.normalize_embed_model, damit
-    /api/embed-Modellvergleich konsistent ist."""
-    if not isinstance(name, str) or not name:
-        return ""
-    if "/" in name:
-        name = name.rsplit("/", 1)[1]
-    if ":" in name:
-        name = name.split(":")[0]
-    return name.lower()

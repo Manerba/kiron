@@ -15,6 +15,8 @@ from pathlib import Path
 
 from fastapi import APIRouter, HTTPException
 
+from catalog_health import check_live_catalog_consistency
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/tests", tags=["selftest"])
@@ -23,7 +25,7 @@ _SERVICE_DIR = Path(__file__).resolve().parent
 _PROJECT_ROOT = _SERVICE_DIR.parent.parent
 _PYTEST_BIN = str(_SERVICE_DIR / "venv" / "bin" / "pytest")
 _TESTS_DIR = str(_SERVICE_DIR)
-_RESULTS_FILE = _PROJECT_ROOT / "data" / "selftest_results.json"
+_RESULTS_FILE = _PROJECT_ROOT / "data" / "kiron-proxy" / "selftest_results.json"
 
 _test_status = {
     "running": False,
@@ -53,7 +55,10 @@ def _save_results():
         _RESULTS_FILE.parent.mkdir(parents=True, exist_ok=True)
         snapshot = {k: v for k, v in _test_status.items() if k != "current_test"}
         snapshot["timestamp"] = time.strftime("%Y-%m-%d %H:%M:%S")
-        _RESULTS_FILE.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2))
+        tmp = _RESULTS_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2))
+        os.chmod(tmp, 0o640)
+        tmp.replace(_RESULTS_FILE)
     except Exception as exc:
         logger.warning("Selftest-Ergebnis konnte nicht gespeichert werden: %s", exc)
 
@@ -75,6 +80,42 @@ _load_results()
 
 def _run_tests():
     try:
+        start = time.monotonic()
+        with _status_lock:
+            _test_status["current_test"] = "catalog_consistency::managed_services"
+            _test_status["total"] = 1
+
+        catalog_report = check_live_catalog_consistency()
+        catalog_ok = catalog_report.get("consistent") is True
+        with _status_lock:
+            _test_status["progress"] = 1
+            if catalog_ok:
+                _test_status["passed"] = 1
+                _test_status["results"].append({
+                    "name": "catalog_consistency::managed_services",
+                    "status": "passed",
+                    "details": "",
+                })
+            else:
+                details = json.dumps(
+                    catalog_report,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+                _test_status["failed"] = 1
+                _test_status["results"].append({
+                    "name": "catalog_consistency::managed_services",
+                    "status": "failed",
+                    "details": details,
+                })
+                _test_status["error"] = (
+                    "Catalog-Konsistenz-Gate fehlgeschlagen; pytest wurde "
+                    "fail-closed nicht gestartet."
+                )
+                _test_status["duration"] = round(time.monotonic() - start, 1)
+        if not catalog_ok:
+            return
+
         # Phase 1: Tests zaehlen
         collect = subprocess.run(
             [_PYTEST_BIN, "--collect-only", "-q",
@@ -86,11 +127,10 @@ def _run_tests():
             m = _COLLECT_RE.search(line)
             if m:
                 with _status_lock:
-                    _test_status["total"] = int(m.group(1))
+                    _test_status["total"] = int(m.group(1)) + 1
                 break
 
         # Phase 2: Tests ausfuehren
-        start = time.monotonic()
         env = {**os.environ, "COLUMNS": "500"}
         proc = subprocess.Popen(
             [_PYTEST_BIN, _TESTS_DIR, "-v", "--tb=short", "--no-header",
@@ -197,7 +237,9 @@ def _run_tests():
         with _status_lock:
             _assign_failure_details(traceback_blocks, summary_details)
 
-            if rc != 0 and _test_status["progress"] == 0:
+            # progress==1 bedeutet: nur das vorangestellte Catalog-Gate lief,
+            # aber pytest konnte keinen Test ausfuehren.
+            if rc != 0 and _test_status["progress"] == 1:
                 error_lines = [
                     ln for ln in tail_buffer
                     if ln.strip() and not ln.startswith("=")

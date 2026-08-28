@@ -1,0 +1,63 @@
+[Unit]
+Description=Kiron kitt-worker Service Skeleton
+Wants=network-online.target
+After=network-online.target
+StartLimitBurst=5
+StartLimitIntervalSec=300
+
+[Service]
+Type=simple
+User=kitt-worker
+Group=kitt-worker
+WorkingDirectory=/usr/lib/kiron/services/kitt-worker
+ExecStart=/usr/lib/kiron/services/kitt-worker/venv/bin/python main.py
+ExecStartPost=/usr/lib/kiron/services/kitt-worker/venv/bin/python /usr/lib/kiron/services/kitt-worker/healthcheck.py --timeout 20 --interval 0.25
+Restart=on-failure
+RestartSec=5
+UMask=0027
+NoNewPrivileges=true
+PrivateDevices=false
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/usr/lib/kiron/data/kitt-worker /run/kiron/kitt-worker
+CapabilityBoundingSet=
+RestrictSUIDSGID=true
+LockPersonality=true
+Environment=PYTHONUNBUFFERED=1
+Environment=KITT_WORKER_BIND_HOST=localhost
+Environment=KITT_WORKER_PORT=11441
+Environment=KITT_WORKER_HEALTH_PATH=/internal/health
+Environment=KITT_WORKER_DATA_DIR=/usr/lib/kiron/data/kitt-worker
+Environment=KITT_WORKER_RUN_DIR=/run/kiron/kitt-worker
+Environment=KITT_WORKER_LOG_LEVEL=INFO
+Environment=KITT_WORKER_ID=kiron-kitt-worker
+Environment=KITT_WORKER_CONTRACT_VERSION=adr-0008.v2
+Environment=OLLAMA_HOST=http://127.0.0.1:11435
+Environment=KITT_WORKER_ENABLE_V1=true
+Environment=KITT_WORKER_AUTH_MODE=required
+Environment=KITT_WORKER_CREDENTIALS_FILE=/etc/kiron/kitt-worker/credentials.json
+Environment=KITT_WORKER_QUEUE_MAX_JOBS=1000
+Environment=KITT_WORKER_LEASE_TTL_SECONDS=300
+Environment=KITT_WORKER_RESUME_LIMIT=3
+Environment=KITT_WORKER_SQLITE_BUSY_TIMEOUT_MS=1000
+Environment=KITT_WORKER_DISPATCH_GATE=closed
+Environment=KITT_WORKER_EXECUTOR_ENABLED=false
+Environment=KITT_WORKER_EXECUTOR_RUNNER=sft_subprocess
+Environment="KITT_WORKER_SFT_COMMAND=/usr/lib/kiron/services/kitt-worker/venv/bin/python /usr/lib/kiron/services/kitt-worker/sft_trainer.py"
+Environment=KITT_WORKER_EXECUTOR_POLL_INTERVAL_SECONDS=1
+Environment=KITT_WORKER_EXECUTOR_RENEW_INTERVAL_SECONDS=60
+Environment=KITT_WORKER_EXECUTOR_JOB_TIMEOUT_SECONDS=300
+Environment=KITT_WORKER_EXECUTOR_SHUTDOWN_GRACE_SECONDS=10
+Environment=KITT_WORKER_ARTIFACT_MAX_BYTES=21474836480
+Environment=KITT_WORKER_ARTIFACT_JOB_QUOTA_BYTES=42949672960
+Environment=KITT_WORKER_ARTIFACT_TOTAL_QUOTA_BYTES=51539607552
+Environment=KITT_WORKER_ARTIFACT_MIN_FREE_BYTES=1073741824
+Environment=KITT_WORKER_MONITORING_ENABLED=true
+Environment=KITT_WORKER_ALERTS_ENABLED=true
+Environment=KITT_WORKER_MONITORING_INTERVAL_SECONDS=30
+Environment=KITT_WORKER_HEARTBEAT_STALE_SECONDS=300
+Environment=KITT_WORKER_ALERT_REPEAT_SECONDS=3600
+
+[Install]
+WantedBy=multi-user.target

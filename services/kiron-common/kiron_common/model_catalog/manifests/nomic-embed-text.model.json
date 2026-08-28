@@ -1,0 +1,383 @@
+{
+  "schema_version": 1,
+  "canonical_model_id": "nomic-embed-text:latest",
+  "aliases": [
+    "nomic-embed-text"
+  ],
+  "deployments": [
+    {
+      "id": "kiron-nomic-dense-v1.deployment",
+      "backend": {
+        "type": "kiron_embeddings",
+        "parameters": {
+          "implementation": "sentence-transformers",
+          "implementation_revision": "5.6.0",
+          "model_name": "nomic-embed-text"
+        }
+      },
+      "artifact": {
+        "type": "huggingface",
+        "repository": "nomic-ai/nomic-embed-text-v1.5",
+        "revision": "e9b6763023c676ca8431644204f50c2b100d9aab",
+        "manifest_digest": null,
+        "trust_remote_code": true,
+        "weights": [
+          {
+            "path": "model.safetensors",
+            "sha256": "9e7d262b1fe5ea350782829496efa831901b77486bbde1cea54a4c822d010d5c"
+          }
+        ],
+        "auxiliary": [],
+        "metadata": {}
+      },
+      "routes": [
+        {
+          "task": "embedding",
+          "endpoint": "/api/embed"
+        }
+      ],
+      "loader": {
+        "type": "sentence_transformers",
+        "parameters": {
+          "additional_role_template": "{input_type}: {text}"
+        }
+      },
+      "metadata": {
+        "discovery": {
+          "family": "nomic-bert",
+          "format": "safetensors",
+          "parameter_size": "137M",
+          "precision": null,
+          "size": 274000000
+        }
+      }
+    },
+    {
+      "id": "kiron-nomic-late-v1.deployment",
+      "backend": {
+        "type": "kiron_embeddings",
+        "parameters": {
+          "implementation": "kiron-late-chunking",
+          "implementation_revision": "v1",
+          "model_name": "nomic-embed-text"
+        }
+      },
+      "artifact": {
+        "type": "huggingface",
+        "repository": "nomic-ai/nomic-embed-text-v1.5",
+        "revision": "e9b6763023c676ca8431644204f50c2b100d9aab",
+        "manifest_digest": null,
+        "trust_remote_code": true,
+        "weights": [
+          {
+            "path": "model.safetensors",
+            "sha256": "9e7d262b1fe5ea350782829496efa831901b77486bbde1cea54a4c822d010d5c"
+          }
+        ],
+        "auxiliary": [],
+        "metadata": {}
+      },
+      "routes": [
+        {
+          "task": "embedding",
+          "endpoint": "/api/embed_late"
+        }
+      ],
+      "loader": {
+        "type": "sentence_transformers",
+        "parameters": {
+          "additional_role_template": "{input_type}: {text}"
+        }
+      },
+      "metadata": {
+        "discovery": {
+          "family": "nomic-bert",
+          "format": "safetensors",
+          "parameter_size": "137M",
+          "precision": null,
+          "size": 274000000
+        }
+      }
+    },
+    {
+      "id": "ollama-nomic-dense-v1.deployment",
+      "backend": {
+        "type": "ollama",
+        "parameters": {
+          "implementation": "ollama",
+          "implementation_revision": "0.18.0",
+          "model_name": "nomic-embed-text:latest"
+        }
+      },
+      "artifact": {
+        "type": "ollama",
+        "repository": null,
+        "revision": null,
+        "manifest_digest": "sha256:0a109f422b47e3a30ba2b10eca18548e944e8a23073ee3f3e947efcf3c45e59f",
+        "trust_remote_code": false,
+        "weights": [
+          {
+            "path": "model",
+            "sha256": "970aa74c0a90ef7482477cf803618e776e173c007bf957f635f1015bfcfef0e6"
+          }
+        ],
+        "auxiliary": [],
+        "metadata": {}
+      },
+      "routes": [
+        {
+          "task": "embedding",
+          "endpoint": "/api/embed"
+        }
+      ],
+      "loader": {
+        "type": "ollama",
+        "parameters": {}
+      },
+      "metadata": {}
+    }
+  ],
+  "profiles": [
+    {
+      "id": "kiron-nomic-dense-v1",
+      "deployment_id": "kiron-nomic-dense-v1.deployment",
+      "task": "embedding",
+      "endpoint": "/api/embed",
+      "default_for_endpoint": true,
+      "metadata": {
+        "kind": "dense",
+        "dimensions": 768,
+        "max_input_tokens": {
+          "unit": "tokenizer_tokens",
+          "counting": "after_server_formatting_including_special_tokens",
+          "truncation": "right",
+          "overflow": "truncate",
+          "by_role": {
+            "search_document": 8192,
+            "search_query": 8192
+          }
+        },
+        "output_normalized": true,
+        "similarity": "cosine",
+        "input_type": {
+          "supported": [
+            "search_document",
+            "search_query"
+          ],
+          "additional_task_roles": [
+            "classification",
+            "clustering"
+          ],
+          "aliases": [],
+          "role_sensitive": true,
+          "required": true,
+          "default": null,
+          "missing_role_behavior": "reject"
+        },
+        "formatting_owner": "server",
+        "pipeline": {
+          "tokenizer": {
+            "repository": "nomic-ai/nomic-embed-text-v1.5",
+            "revision": "e9b6763023c676ca8431644204f50c2b100d9aab"
+          },
+          "formatting": {
+            "search_document": {
+              "template": "search_document: {text}",
+              "parameters": {}
+            },
+            "search_query": {
+              "template": "search_query: {text}",
+              "parameters": {}
+            }
+          },
+          "pooling": {
+            "method": "mean",
+            "parameters": {
+              "pooling_mode_mean_tokens": true
+            }
+          },
+          "normalization": {
+            "method": "l2",
+            "dtype": "float32",
+            "scope": "vector"
+          },
+          "parameters": {}
+        },
+        "verification": {
+          "status": "verified",
+          "evidence": [
+            "hf-readme:nomic-ai/nomic-embed-text-v1.5@e9b6763023c676ca8431644204f50c2b100d9aab",
+            "local-weight-sha256:9e7d262b1fe5ea350782829496efa831901b77486bbde1cea54a4c822d010d5c",
+            "runtime-pipeline:kiron-embeddings-nomic-prefix-mean-fp32-l2"
+          ],
+          "blocking_reasons": []
+        }
+      }
+    },
+    {
+      "id": "kiron-nomic-late-v1",
+      "deployment_id": "kiron-nomic-late-v1.deployment",
+      "task": "embedding",
+      "endpoint": "/api/embed_late",
+      "default_for_endpoint": true,
+      "metadata": {
+        "kind": "late_chunking",
+        "dimensions": 768,
+        "max_input_tokens": {
+          "unit": "tokenizer_tokens",
+          "counting": "after_server_formatting_including_special_tokens",
+          "truncation": "right",
+          "overflow": "late_chunk_fallback",
+          "by_role": {
+            "search_document": 8192,
+            "search_query": 8192
+          }
+        },
+        "output_normalized": true,
+        "similarity": "cosine",
+        "input_type": {
+          "supported": [
+            "search_document",
+            "search_query"
+          ],
+          "additional_task_roles": [
+            "classification",
+            "clustering"
+          ],
+          "aliases": [],
+          "role_sensitive": true,
+          "required": true,
+          "default": null,
+          "missing_role_behavior": "reject"
+        },
+        "formatting_owner": "server",
+        "pipeline": {
+          "tokenizer": {
+            "repository": "nomic-ai/nomic-embed-text-v1.5",
+            "revision": "e9b6763023c676ca8431644204f50c2b100d9aab"
+          },
+          "formatting": {
+            "search_document": {
+              "template": "search_document: {text}",
+              "parameters": {}
+            },
+            "search_query": {
+              "template": "search_query: {text}",
+              "parameters": {}
+            }
+          },
+          "pooling": {
+            "method": "late_chunk_mean",
+            "parameters": {
+              "exclude_prefix_tokens": true,
+              "exclude_special_tokens": true,
+              "overlap_assignment": "character_offsets"
+            }
+          },
+          "normalization": {
+            "method": "l2",
+            "dtype": "float32",
+            "scope": "vector"
+          },
+          "parameters": {
+            "empty_overlap_fallback": "dense_encode"
+          }
+        },
+        "verification": {
+          "status": "unverified",
+          "evidence": [
+            "hf-readme:nomic-ai/nomic-embed-text-v1.5@e9b6763023c676ca8431644204f50c2b100d9aab",
+            "local-weight-sha256:9e7d262b1fe5ea350782829496efa831901b77486bbde1cea54a4c822d010d5c",
+            "runtime-pipeline:kiron-embed-late-custom"
+          ],
+          "blocking_reasons": [
+            "missing_reference_vector_for_chunk_overlap_and_fallback",
+            "missing_reference_vector_for_prefix_and_special_token_exclusion"
+          ]
+        }
+      }
+    },
+    {
+      "id": "ollama-nomic-dense-v1",
+      "deployment_id": "ollama-nomic-dense-v1.deployment",
+      "task": "embedding",
+      "endpoint": "/api/embed",
+      "default_for_endpoint": false,
+      "metadata": {
+        "kind": "dense",
+        "dimensions": 768,
+        "max_input_tokens": {
+          "unit": "tokenizer_tokens",
+          "counting": "after_server_formatting_including_special_tokens",
+          "truncation": "unknown",
+          "overflow": "unknown",
+          "by_role": {
+            "search_document": null,
+            "search_query": null
+          }
+        },
+        "output_normalized": null,
+        "similarity": "unknown",
+        "input_type": {
+          "supported": [
+            "search_document",
+            "search_query"
+          ],
+          "additional_task_roles": [],
+          "aliases": [],
+          "role_sensitive": null,
+          "required": false,
+          "default": null,
+          "missing_role_behavior": "unknown"
+        },
+        "formatting_owner": "server",
+        "pipeline": {
+          "tokenizer": {
+            "repository": null,
+            "revision": null
+          },
+          "formatting": {
+            "search_document": {
+              "template": null,
+              "parameters": {}
+            },
+            "search_query": {
+              "template": null,
+              "parameters": {}
+            }
+          },
+          "pooling": {
+            "method": "unknown",
+            "parameters": {
+              "observed_gguf_pooling_type": 1
+            }
+          },
+          "normalization": {
+            "method": "unknown",
+            "dtype": "unknown",
+            "scope": "unknown"
+          },
+          "parameters": {
+            "observed_gguf_context_length": 2048,
+            "observed_num_ctx": 8192
+          }
+        },
+        "verification": {
+          "status": "unverified",
+          "evidence": [
+            "local-ollama-manifest-sha256:0a109f422b47e3a30ba2b10eca18548e944e8a23073ee3f3e947efcf3c45e59f",
+            "local-ollama-model-blob-sha256:970aa74c0a90ef7482477cf803618e776e173c007bf957f635f1015bfcfef0e6",
+            "ollama-api-version:0.18.0"
+          ],
+          "blocking_reasons": [
+            "conflicting_effective_context_evidence",
+            "missing_exact_upstream_revision_and_conversion_provenance",
+            "missing_role_pooling_normalization_reference_witness"
+          ]
+        }
+      }
+    }
+  ],
+  "request_defaults": [],
+  "metadata": {}
+}

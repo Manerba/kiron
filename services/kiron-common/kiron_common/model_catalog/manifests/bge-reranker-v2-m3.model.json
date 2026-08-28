@@ -1,0 +1,80 @@
+{
+  "schema_version": 1,
+  "canonical_model_id": "bge-reranker-v2-m3",
+  "aliases": [
+    "BAAI/bge-reranker-v2-m3"
+  ],
+  "deployments": [
+    {
+      "id": "kiron-deberta-bge-reranker-v2-m3-v1.deployment",
+      "backend": {
+        "type": "kiron_deberta",
+        "parameters": {
+          "implementation": "sentence-transformers-cross-encoder",
+          "implementation_revision": "5.6.0",
+          "model_name": "bge-reranker-v2-m3"
+        }
+      },
+      "artifact": {
+        "type": "huggingface",
+        "repository": "BAAI/bge-reranker-v2-m3",
+        "revision": "953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e",
+        "manifest_digest": null,
+        "trust_remote_code": false,
+        "weights": [
+          {
+            "path": "model.safetensors",
+            "sha256": "d9e3e081faff1eefb84019509b2f5558fd74c1a05a2c7db22f74174fcedb5286"
+          }
+        ],
+        "auxiliary": [],
+        "metadata": {}
+      },
+      "routes": [
+        {
+          "task": "rerank",
+          "endpoint": "/api/rerank"
+        },
+        {
+          "task": "nli",
+          "endpoint": "/api/score"
+        }
+      ],
+      "loader": {
+        "type": "cross_encoder",
+        "parameters": {
+          "max_length": 512,
+          "torch_dtype": "float16"
+        }
+      },
+      "metadata": {
+        "service": {
+          "display_order": 3,
+          "labels": null,
+          "rerank_label": null,
+          "size": 2271071852
+        }
+      }
+    }
+  ],
+  "profiles": [
+    {
+      "id": "kiron-bge-reranker-v2-m3-rerank-v1",
+      "deployment_id": "kiron-deberta-bge-reranker-v2-m3-v1.deployment",
+      "task": "rerank",
+      "endpoint": "/api/rerank",
+      "default_for_endpoint": true,
+      "metadata": {}
+    },
+    {
+      "id": "kiron-bge-reranker-v2-m3-score-v1",
+      "deployment_id": "kiron-deberta-bge-reranker-v2-m3-v1.deployment",
+      "task": "nli",
+      "endpoint": "/api/score",
+      "default_for_endpoint": true,
+      "metadata": {}
+    }
+  ],
+  "request_defaults": [],
+  "metadata": {}
+}

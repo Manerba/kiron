@@ -1,0 +1,89 @@
+/* ========================================
+   Konfiguration
+   ======================================== */
+
+.config-page {
+    max-width: 1100px;
+    margin: 0 auto;
+}
+
+.config-section-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 16px;
+}
+
+.config-section-header h3 {
+    margin: 0;
+}
+
+.config-status {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
+.config-grid {
+    display: grid;
+    grid-template-columns: minmax(180px, 240px) repeat(3, minmax(140px, 1fr));
+    gap: 12px;
+    align-items: stretch;
+}
+
+.config-field,
+.config-readout {
+    min-height: 76px;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: 8px;
+}
+
+.config-field > span,
+.config-readout-label {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-secondary);
+}
+
+.config-number-input {
+    width: 120px;
+}
+
+.config-readout span:last-child {
+    min-height: 22px;
+    color: var(--text-primary);
+    overflow-wrap: anywhere;
+}
+
+.config-actions {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-top: 18px;
+}
+
+@media (max-width: 900px) {
+    .config-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+}
+
+@media (max-width: 560px) {
+    .config-section-header {
+        align-items: flex-start;
+        flex-direction: column;
+    }
+
+    .config-grid {
+        grid-template-columns: 1fr;
+    }
+
+    .config-actions {
+        flex-direction: column;
+        align-items: stretch;
+    }
+}

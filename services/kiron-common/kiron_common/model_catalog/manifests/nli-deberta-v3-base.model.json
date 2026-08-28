@@ -1,0 +1,84 @@
+{
+  "schema_version": 1,
+  "canonical_model_id": "nli-deberta-v3-base",
+  "aliases": [
+    "cross-encoder/nli-deberta-v3-base"
+  ],
+  "deployments": [
+    {
+      "id": "kiron-deberta-nli-deberta-v3-base-v1.deployment",
+      "backend": {
+        "type": "kiron_deberta",
+        "parameters": {
+          "implementation": "sentence-transformers-cross-encoder",
+          "implementation_revision": "5.6.0",
+          "model_name": "nli-deberta-v3-base"
+        }
+      },
+      "artifact": {
+        "type": "huggingface",
+        "repository": "cross-encoder/nli-deberta-v3-base",
+        "revision": "6c749ce3425cd33b46d187e45b92bbf96ee12ec7",
+        "manifest_digest": null,
+        "trust_remote_code": false,
+        "weights": [
+          {
+            "path": "model.safetensors",
+            "sha256": "d8148c6d49e0a7925134294c56326c71fe0ab1dc390e37355e00c7efbb488afa"
+          }
+        ],
+        "auxiliary": [],
+        "metadata": {}
+      },
+      "routes": [
+        {
+          "task": "rerank",
+          "endpoint": "/api/rerank"
+        },
+        {
+          "task": "nli",
+          "endpoint": "/api/score"
+        }
+      ],
+      "loader": {
+        "type": "cross_encoder",
+        "parameters": {
+          "max_length": 512,
+          "torch_dtype": "float16"
+        }
+      },
+      "metadata": {
+        "service": {
+          "display_order": 1,
+          "labels": [
+            "contradiction",
+            "entailment",
+            "neutral"
+          ],
+          "rerank_label": "entailment",
+          "size": 748850969
+        }
+      }
+    }
+  ],
+  "profiles": [
+    {
+      "id": "kiron-nli-deberta-v3-base-rerank-v1",
+      "deployment_id": "kiron-deberta-nli-deberta-v3-base-v1.deployment",
+      "task": "rerank",
+      "endpoint": "/api/rerank",
+      "default_for_endpoint": true,
+      "metadata": {}
+    },
+    {
+      "id": "kiron-nli-deberta-v3-base-score-v1",
+      "deployment_id": "kiron-deberta-nli-deberta-v3-base-v1.deployment",
+      "task": "nli",
+      "endpoint": "/api/score",
+      "default_for_endpoint": true,
+      "metadata": {}
+    }
+  ],
+  "request_defaults": [],
+  "metadata": {}
+}

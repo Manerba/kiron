@@ -202,6 +202,29 @@
     color: var(--text-primary);
 }
 
+/* Dashboard-Dichte fuer die div-basierte ExpandableTable. */
+[data-density="compact"] .table-header {
+    padding: 3px 12px;
+}
+
+[data-density="compact"] .table-body {
+    gap: 2px;
+    margin-top: 2px;
+}
+
+[data-density="compact"] .table-row {
+    padding: 3px 12px;
+}
+
+[data-density="compact"] .detail-content {
+    padding: 10px 14px;
+}
+
+[data-density="compact"] .detail-fields {
+    padding: 8px;
+    gap: 12px;
+}
+
 /* Detail-Sektionen */
 .detail-section {
     margin-bottom: 12px;

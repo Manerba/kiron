@@ -1,0 +1,120 @@
+{
+  "image": "ollama/ollama:0.18.0",
+  "compose_tag": "ollama/ollama:0.18.0",
+  "image_digest": "ollama/ollama@sha256:e23e6499890325d31f3454cdc83f7a613a2423c8a9e167bbafea0b0e3c27d7c6",
+  "published_version": null,
+  "tested_at": "2026-08-20T00:43:04Z",
+  "validator_version": "v1",
+  "mode": "standard",
+  "fixture_models": [
+    "smollm2:135m"
+  ],
+  "host_ollama_binary_version": "ollama version is 0.18.0",
+  "production_container_image": "ollama/ollama:0.18.0",
+  "production_container_id": "bc95ecd81eddc574146b8795eae2ddca8fc8da58c9f8cd70ac6a860e425b79ba",
+  "capabilities": {
+    "fixture_initial_pull": {
+      "ok": true,
+      "severity": "info",
+      "message": "fixture pull ok",
+      "data": null
+    },
+    "gpu_visible_in_container": {
+      "ok": true,
+      "severity": "info",
+      "message": "GPU visible in container",
+      "data": {
+        "nvidia_smi_l": "GPU 0: NVIDIA GeForce RTX 3060 (UUID: GPU-942daf6f-f8d9-1800-3a85-5410d7332cb4)",
+        "gpu_count": 1
+      }
+    },
+    "version_endpoint": {
+      "ok": true,
+      "severity": "fail",
+      "message": "version ok",
+      "data": {
+        "version": "0.18.0"
+      }
+    },
+    "tags_shape": {
+      "ok": true,
+      "severity": "fail",
+      "message": "tags shape ok",
+      "data": null
+    },
+    "ps_shape": {
+      "ok": true,
+      "severity": "fail",
+      "message": "ps shape ok",
+      "data": null
+    },
+    "generate_nonstream": {
+      "ok": true,
+      "severity": "fail",
+      "message": "generate ok",
+      "data": null
+    },
+    "chat_nonstream": {
+      "ok": true,
+      "severity": "fail",
+      "message": "chat ok",
+      "data": null
+    },
+    "baseline_gpu_resident": {
+      "ok": true,
+      "severity": "info",
+      "message": "baseline load GPU-resident size_vram=465315072",
+      "data": {
+        "size_vram": 465315072
+      }
+    },
+    "stream_ndjson": {
+      "ok": true,
+      "severity": "fail",
+      "message": "stream done ok",
+      "data": null
+    },
+    "think_false": {
+      "ok": true,
+      "severity": "fail",
+      "message": "think:false accepted",
+      "data": null
+    },
+    "keep_alive_zero_unload": {
+      "ok": true,
+      "severity": "info",
+      "message": "unload verified",
+      "data": null
+    },
+    "fixture_repull": {
+      "ok": true,
+      "severity": "info",
+      "message": "fixture pull ok",
+      "data": null
+    },
+    "num_gpu_zero_chat_generate": {
+      "ok": true,
+      "severity": "info",
+      "message": "num_gpu=0 effective on /api/generate and /api/chat",
+      "data": {
+        "num_gpu_zero_effective": true
+      }
+    },
+    "ps_size_vram": {
+      "ok": true,
+      "severity": "fail",
+      "message": "ps shape ok",
+      "data": null
+    },
+    "error_shape_normalizable": {
+      "ok": true,
+      "severity": "warn",
+      "message": "error shape normalizable",
+      "data": null
+    }
+  },
+  "failures": [],
+  "warnings": [],
+  "report_status": "passed",
+  "upgrade_allowed": true
+}

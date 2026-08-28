@@ -9,10 +9,13 @@ Call — `_shared_client` wird durch ein Fake ersetzt.
 """
 
 import asyncio
+import grp
 import importlib
 import json
 import os
 from pathlib import Path
+import pwd
+import tempfile
 import time
 import unittest
 from unittest import mock
@@ -75,6 +78,12 @@ def _reset_cache(vl, *, active: bool = False):
         Path(vl.RUNTIME_CAPABILITY_PATH).unlink()
     except FileNotFoundError:
         pass
+    runtime_dir = Path("/tmp/kiron-proxy-test-vram-lease")
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    for path in runtime_dir.iterdir():
+        if path.is_file():
+            path.unlink()
+    _configure_test_runtime_contract(vl, runtime_dir)
     if hasattr(vl, "invalidate_runtime_capability_cache"):
         vl.invalidate_runtime_capability_cache()
 
@@ -89,6 +98,34 @@ def _write_safe_handoff(vl):
     path.chmod(0o644)
     if hasattr(vl, "invalidate_runtime_capability_cache"):
         vl.invalidate_runtime_capability_cache()
+
+
+def _configure_test_runtime_contract(vl, runtime_dir: Path) -> None:
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(runtime_dir, 0o2770)
+    vl.RUNTIME_MARKER_DIR = runtime_dir
+    vl.STARTUP_MARKER_PATH = runtime_dir / "docling-vram-startup.json"
+    vl.SHUTDOWN_MARKER_PATH = runtime_dir / "docling-vram-shutdown.json"
+    vl.GPU_SERVICE_LOADING_MARKER_PATH = runtime_dir / "gpu-service-loading.json"
+    vl.RUNTIME_MARKER_GROUP = grp.getgrgid(os.getgid()).gr_name
+    vl.RUNTIME_MARKER_FILE_OWNER_NAMES = frozenset({pwd.getpwuid(os.getuid()).pw_name})
+    vl._runtime_marker_dir_owner_uid = lambda: os.getuid()
+
+
+def _write_valid_runtime_file(path: Path, payload: dict | None = None, mode: int = 0o660) -> None:
+    data = payload or {
+        "token": "test",
+        "deadline_monotonic": time.monotonic() + 60.0,
+    }
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fd = None
+            json.dump(data, fh)
+    finally:
+        if fd is not None:
+            os.close(fd)
+    os.chmod(path, mode)
 
 
 class PolicyResolverTests(unittest.TestCase):
@@ -271,9 +308,10 @@ class ApplyBytesTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(out, body)
 
     async def test_embed_ollama_model_lease_active_blocks_by_default(self):
-        """F1-Fallback: OLLAMA_EMBED_MODELS + lease_active + force_cpu
-        → konservativ BLOCK, weil Ollama num_gpu auf /api/embed nicht
-        zuverlaessig honoriert."""
+        """Catalog-routed Ollama embedding + active lease stays blocked.
+
+        Ollama cannot reliably honor ``num_gpu=0`` on ``/api/embed``.
+        """
         await self._set_lease(True)
         body = json.dumps({"model": "e5-mistral-7b-instruct"}).encode()
         _, outcome = await self.vl.apply_bytes(
@@ -281,9 +319,66 @@ class ApplyBytesTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(outcome, self.vl.LeaseOutcome.BLOCK)
 
+    async def test_every_exact_ollama_embedding_name_blocks_when_active(self):
+        await self._set_lease(True)
+        routes = self.vl.PROXY_ROUTING_VIEW.routes_for_endpoint(
+            self.vl.ModelEndpoint.EMBED,
+            backend=self.vl.BackendType.OLLAMA,
+        )
+        self.assertEqual(len(routes), 2)
+        for route in routes:
+            for name in route.input_names:
+                with self.subTest(name=name):
+                    body = json.dumps({"model": name}).encode()
+                    out, outcome = await self.vl.apply_bytes(
+                        body,
+                        "/api/embed",
+                        name,
+                    )
+                    self.assertEqual(outcome, self.vl.LeaseOutcome.BLOCK)
+                    self.assertEqual(out, body)
+
+    async def test_ollama_embedding_pass_policy_stays_pass(self):
+        self.vl.VRAM_LEASE_POLICY = "pass"
+        await self._set_lease(True)
+        route = self.vl.PROXY_ROUTING_VIEW.routes_for_endpoint(
+            self.vl.ModelEndpoint.EMBED,
+            backend=self.vl.BackendType.OLLAMA,
+        )[0]
+        body = json.dumps({"model": route.canonical_model_id}).encode()
+        with self.assertLogs("vram_lease", level="WARNING"):
+            out, outcome = await self.vl.apply_bytes(
+                body,
+                "/api/embed",
+                route.canonical_model_id,
+            )
+        self.assertEqual(outcome, self.vl.LeaseOutcome.PASS)
+        self.assertEqual(out, body)
+
+    async def test_ollama_embedding_explicit_num_gpu_zero_remains_blocked(self):
+        """Ollama /api/embed cannot safely honor num_gpu=0 (existing F1)."""
+        await self._set_lease(True)
+        _write_safe_handoff(self.vl)
+        route = self.vl.PROXY_ROUTING_VIEW.routes_for_endpoint(
+            self.vl.ModelEndpoint.EMBED,
+            backend=self.vl.BackendType.OLLAMA,
+        )[0]
+        body = json.dumps(
+            {
+                "model": route.backend_model_name,
+                "options": {"num_gpu": 0},
+            }
+        ).encode()
+        out, outcome = await self.vl.apply_bytes(
+            body,
+            "/api/embed",
+            route.backend_model_name,
+        )
+        self.assertEqual(outcome, self.vl.LeaseOutcome.BLOCK)
+        self.assertEqual(out, body)
+
     async def test_embed_service_model_lease_active_pass(self):
-        """EMBED_SERVICE_MODELS werden nicht interceptet —
-        Routing an kiron-embeddings, keine Ollama-GPU-Kollision."""
+        """A kiron-embeddings Catalog route is not intercepted."""
         await self._set_lease(True)
         body = json.dumps({"model": "nomic-embed-text"}).encode()
         out, outcome = await self.vl.apply_bytes(
@@ -300,6 +395,49 @@ class ApplyBytesTests(unittest.IsolatedAsyncioTestCase):
         out, outcome = await self.vl.apply_bytes(body, "/api/embed", "llama3")
         self.assertEqual(outcome, self.vl.LeaseOutcome.PASS)
         self.assertEqual(out, body)
+
+    async def test_unknown_or_endpoint_foreign_embed_never_hits_hard_gate(self):
+        await self._set_lease(True)
+        for name in (
+            "llama3",
+            "acme/e5-mistral-7b-instruct:bogus",
+            "mankei-326m-reranker",
+        ):
+            with self.subTest(name=name), mock.patch.object(
+                self.vl,
+                "_hard_overlay_marker_kind",
+                side_effect=AssertionError("unknown model reached hard gate"),
+            ), mock.patch.object(
+                self.vl,
+                "snapshot",
+                side_effect=AssertionError("unknown model reached lease lookup"),
+            ):
+                body = json.dumps({"model": name}).encode()
+                out, outcome = await self.vl.apply_bytes(
+                    body,
+                    "/api/embed",
+                    name,
+                )
+            self.assertEqual(outcome, self.vl.LeaseOutcome.PASS)
+            self.assertEqual(out, body)
+
+    async def test_chat_explicit_num_gpu_zero_keeps_force_cpu_outcome(self):
+        await self._set_lease(True)
+        _write_safe_handoff(self.vl)
+        body = json.dumps(
+            {
+                "model": "qwen3:8b",
+                "messages": [],
+                "options": {"num_gpu": 0},
+            }
+        ).encode()
+        out, outcome = await self.vl.apply_bytes(
+            body,
+            "/api/chat",
+            "qwen3:8b",
+        )
+        self.assertEqual(outcome, self.vl.LeaseOutcome.FORCE_CPU)
+        self.assertEqual(json.loads(out)["options"]["num_gpu"], 0)
 
     async def test_embed_empty_body_pass(self):
         await self._set_lease(True)
@@ -371,6 +509,100 @@ class LifespanClientTests(unittest.IsolatedAsyncioTestCase):
             self.assertIs(self.vl._shared_client, client)
         self.assertIsNone(self.vl._shared_client,
                           "Nach Exit muss _shared_client None sein")
+
+
+class RuntimeMarkerContractTests(unittest.TestCase):
+    def setUp(self):
+        self.vl = _reload_module({"KIRON_VRAM_LEASE_POLICY": "force_cpu"})
+        self.tmp = tempfile.TemporaryDirectory()
+        self.runtime_dir = Path(self.tmp.name)
+        _configure_test_runtime_contract(self.vl, self.runtime_dir)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_default_runtime_dir_matches_contract(self):
+        vl = _reload_module({"KIRON_RUNTIME_DIR": None})
+        self.assertEqual(vl.RUNTIME_MARKER_DIR, Path("/run/kiron/vram"))
+
+    def test_accepts_valid_kiron_runtime_marker(self):
+        _write_valid_runtime_file(self.vl.STARTUP_MARKER_PATH)
+
+        ok, reason, _ = self.vl._path_is_safe_runtime_file(
+            self.vl.STARTUP_MARKER_PATH
+        )
+
+        self.assertTrue(ok, reason)
+
+    def test_rejects_world_bits_and_special_bits(self):
+        for mode in (0o664, 0o2660):
+            with self.subTest(mode=oct(mode)):
+                _write_valid_runtime_file(
+                    self.vl.STARTUP_MARKER_PATH,
+                    mode=mode,
+                )
+
+                ok, reason, _ = self.vl._path_is_safe_runtime_file(
+                    self.vl.STARTUP_MARKER_PATH
+                )
+
+                self.assertFalse(ok)
+                self.assertIn(reason, {"file_world_bits", "file_mode_not_0660"})
+                self.vl.STARTUP_MARKER_PATH.unlink()
+
+    def test_open_marker_lock_accepts_existing_valid_lock_without_chmod(self):
+        lock_path = self.vl._marker_lock_path(self.vl.STARTUP_MARKER_PATH)
+        _write_valid_runtime_file(lock_path)
+
+        with mock.patch.object(
+            self.vl.os,
+            "fchmod",
+            side_effect=AssertionError("existing peer lock must not chmod"),
+        ):
+            lock_fd = self.vl._open_marker_lock(self.vl.STARTUP_MARKER_PATH)
+
+        os.close(lock_fd)
+
+    def test_marker_payload_uses_fd_bound_open(self):
+        _write_valid_runtime_file(self.vl.STARTUP_MARKER_PATH)
+
+        with mock.patch.object(
+            Path,
+            "open",
+            side_effect=AssertionError("marker reads must use os.open/fstat"),
+        ):
+            data, active = self.vl._marker_payload(self.vl.STARTUP_MARKER_PATH)
+
+        self.assertIsInstance(data, dict)
+        self.assertTrue(active)
+
+    def test_clear_does_not_unlink_replaced_marker(self):
+        old_payload = {
+            "token": "old",
+            "deadline_monotonic": time.monotonic() + 60.0,
+        }
+        replacement_payload = {
+            "token": "replacement",
+            "deadline_monotonic": time.monotonic() + 60.0,
+        }
+        _write_valid_runtime_file(self.vl.STARTUP_MARKER_PATH, payload=old_payload)
+        original_payload_with_stat = self.vl._marker_payload_with_stat
+
+        def replacing_payload(path):
+            result = original_payload_with_stat(path)
+            path.unlink()
+            _write_valid_runtime_file(path, payload=replacement_payload)
+            return result
+
+        with mock.patch.object(
+            self.vl,
+            "_marker_payload_with_stat",
+            replacing_payload,
+        ):
+            self.vl.clear_overlay_marker("startup", "old")
+
+        data = json.loads(self.vl.STARTUP_MARKER_PATH.read_text(encoding="utf-8"))
+        self.assertEqual(data["token"], "replacement")
 
 
 class AppLoadModelIntegrationTests(unittest.IsolatedAsyncioTestCase):

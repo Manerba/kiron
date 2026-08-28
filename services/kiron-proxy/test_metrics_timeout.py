@@ -1004,7 +1004,8 @@ class MetricsDBCompatTest(unittest.TestCase):
         conn = self.db._get_conn()
         row = conn.execute(
             "SELECT cpu_usage, memory_usage, disk_read_mb_s, "
-            "disk_write_mb_s, gpu_util, vram_usage FROM metrics_history"
+            "disk_write_mb_s, gpu_util, vram_usage, gpu_probe_state "
+            "FROM metrics_history"
         ).fetchone()
         self.assertIsNone(row[0])  # cpu_usage
         self.assertIsNone(row[1])  # memory_usage
@@ -1012,6 +1013,7 @@ class MetricsDBCompatTest(unittest.TestCase):
         self.assertIsNone(row[3])  # disk_write
         self.assertIsNone(row[4])  # gpu_util
         self.assertIsNone(row[5])  # vram_usage
+        self.assertEqual(row[6], "collection_timeout")
 
     def test_insert_accepts_backoff_and_inflight_variants(self):
         # Backoff-Payload
@@ -1030,13 +1032,15 @@ class MetricsDBCompatTest(unittest.TestCase):
 
         conn = self.db._get_conn()
         row = conn.execute(
-            "SELECT cpu_usage, memory_usage, gpu_util, disk_read_mb_s "
+            "SELECT cpu_usage, memory_usage, gpu_util, disk_read_mb_s, "
+            "gpu_probe_state "
             "FROM metrics_history"
         ).fetchone()
         self.assertIsNone(row[0])
         self.assertEqual(row[1], 50.0)
         self.assertIsNone(row[2])
         self.assertEqual(row[3], 1.0)
+        self.assertEqual(row[4], "probe_backoff")
 
 
 class RestPayloadSmokeTest(_BaseTimeoutTest):

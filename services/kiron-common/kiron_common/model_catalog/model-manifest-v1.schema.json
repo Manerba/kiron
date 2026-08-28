@@ -1,0 +1,407 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kiron.local/schemas/model-manifest-v1.schema.json",
+  "title": "KIron model manifest V1",
+  "description": "One immutable manifest per canonical model group. Profile.default_for_endpoint selects a profile only inside its model group. request_defaults separately declares catalog-wide request defaults for rerank and score. Cross-document uniqueness is enforced by kiron_common.model_catalog.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "canonical_model_id",
+    "aliases",
+    "deployments",
+    "profiles",
+    "request_defaults",
+    "metadata"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "canonical_model_id": {
+      "$ref": "#/$defs/literalName"
+    },
+    "aliases": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/literalName"
+      }
+    },
+    "deployments": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/deployment"
+      }
+    },
+    "profiles": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/profile"
+      }
+    },
+    "request_defaults": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/requestDefault"
+      }
+    },
+    "metadata": {
+      "$ref": "#/$defs/metadata"
+    }
+  },
+  "$defs": {
+    "literalName": {
+      "type": "string",
+      "minLength": 1
+    },
+    "stableId": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]*$"
+    },
+    "metadata": {
+      "type": "object"
+    },
+    "sha256Hex": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "sha256Id": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "artifactFile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": {
+          "$ref": "#/$defs/literalName"
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256Hex"
+        }
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "repository",
+        "revision",
+        "manifest_digest",
+        "trust_remote_code",
+        "weights",
+        "auxiliary",
+        "metadata"
+      ],
+      "properties": {
+        "type": {
+          "enum": ["huggingface", "ollama"]
+        },
+        "repository": {
+          "type": ["string", "null"]
+        },
+        "revision": {
+          "type": ["string", "null"]
+        },
+        "manifest_digest": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/sha256Id"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "trust_remote_code": {
+          "type": "boolean"
+        },
+        "weights": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/artifactFile"
+          }
+        },
+        "auxiliary": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/artifactFile"
+          }
+        },
+        "metadata": {
+          "$ref": "#/$defs/metadata"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "huggingface"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "repository": {
+                "type": "string",
+                "minLength": 1
+              },
+              "revision": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{40}$"
+              },
+              "manifest_digest": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "ollama"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "repository": {
+                "type": "null"
+              },
+              "revision": {
+                "type": "null"
+              },
+              "manifest_digest": {
+                "$ref": "#/$defs/sha256Id"
+              },
+              "trust_remote_code": {
+                "const": false
+              }
+            }
+          }
+        }
+      ]
+    },
+    "backend": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "parameters"],
+      "properties": {
+        "type": {
+          "enum": ["kiron_embeddings", "kiron_deberta", "ollama"]
+        },
+        "parameters": {
+          "type": "object"
+        }
+      }
+    },
+    "loader": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "parameters"],
+      "properties": {
+        "type": {
+          "enum": [
+            "sentence_transformers",
+            "transformers_last_token",
+            "colbert_xmod",
+            "cross_encoder",
+            "mankei_last_token",
+            "ollama"
+          ]
+        },
+        "parameters": {
+          "type": "object"
+        }
+      }
+    },
+    "route": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/embedRoute"
+        },
+        {
+          "$ref": "#/$defs/embedLateRoute"
+        },
+        {
+          "$ref": "#/$defs/embedMultiVectorRoute"
+        },
+        {
+          "$ref": "#/$defs/rerankRoute"
+        },
+        {
+          "$ref": "#/$defs/nliRoute"
+        }
+      ]
+    },
+    "embedRoute": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["task", "endpoint"],
+      "properties": {
+        "task": {
+          "const": "embedding"
+        },
+        "endpoint": {
+          "const": "/api/embed"
+        }
+      }
+    },
+    "embedLateRoute": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["task", "endpoint"],
+      "properties": {
+        "task": {
+          "const": "embedding"
+        },
+        "endpoint": {
+          "const": "/api/embed_late"
+        }
+      }
+    },
+    "embedMultiVectorRoute": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["task", "endpoint"],
+      "properties": {
+        "task": {
+          "const": "embedding"
+        },
+        "endpoint": {
+          "const": "/api/embed_colbert"
+        }
+      }
+    },
+    "rerankRoute": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["task", "endpoint"],
+      "properties": {
+        "task": {
+          "const": "rerank"
+        },
+        "endpoint": {
+          "const": "/api/rerank"
+        }
+      }
+    },
+    "nliRoute": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["task", "endpoint"],
+      "properties": {
+        "task": {
+          "const": "nli"
+        },
+        "endpoint": {
+          "const": "/api/score"
+        }
+      }
+    },
+    "deployment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "backend",
+        "artifact",
+        "routes",
+        "loader",
+        "metadata"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/stableId"
+        },
+        "backend": {
+          "$ref": "#/$defs/backend"
+        },
+        "artifact": {
+          "$ref": "#/$defs/artifact"
+        },
+        "routes": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/route"
+          }
+        },
+        "loader": {
+          "$ref": "#/$defs/loader"
+        },
+        "metadata": {
+          "$ref": "#/$defs/metadata"
+        }
+      }
+    },
+    "requestDefault": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["endpoint", "profile_id"],
+      "properties": {
+        "endpoint": {
+          "enum": [
+            "/api/rerank",
+            "/api/score"
+          ]
+        },
+        "profile_id": {
+          "$ref": "#/$defs/stableId"
+        }
+      }
+    },
+    "profile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "deployment_id",
+        "task",
+        "endpoint",
+        "default_for_endpoint",
+        "metadata"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/stableId"
+        },
+        "deployment_id": {
+          "$ref": "#/$defs/stableId"
+        },
+        "task": {
+          "enum": [
+            "embedding",
+            "rerank",
+            "nli"
+          ]
+        },
+        "endpoint": {
+          "enum": [
+            "/api/embed",
+            "/api/embed_late",
+            "/api/embed_colbert",
+            "/api/rerank",
+            "/api/score"
+          ]
+        },
+        "default_for_endpoint": {
+          "type": "boolean"
+        },
+        "metadata": {
+          "$ref": "#/$defs/metadata"
+        }
+      }
+    }
+  }
+}

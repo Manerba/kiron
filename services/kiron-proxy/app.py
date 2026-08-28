@@ -7,16 +7,31 @@ import os
 import re
 import secrets
 import subprocess
-import sys
+import tempfile
+import threading
 import time
 from pathlib import Path
 
 from fastapi import Body, FastAPI, Query, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse, JSONResponse
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from starlette.websockets import WebSocketState
 import uvicorn
 import httpx
+
+from kiron_common.embedding_registry import MODEL_CATALOG, MODEL_STATE_VIEW
+from kiron_common.local_model_registry import (
+    LocalModelProvider,
+    ModelRegistrationError,
+    ModelRegistrationService,
+)
+from kiron_common.local_model_registry.models import canonical_ollama_reference
+from kiron_common.local_model_registry.composition import (
+    DEFAULT_OLLAMA_BASE_URL,
+    build_model_registration_service,
+)
+from kiron_common.model_catalog import BackendType
+from kiron_common.ollama_compat import is_real_int
 
 from request_store import RequestStore, RequestStoreReadError
 from metrics import get_cached_payload
@@ -24,15 +39,16 @@ from history_db import MetricsDB
 from api_key_store import LastActiveApiKeyError
 import vram_lease
 from selftest import router as selftest_router
+from model_discovery import (
+    InventoryShapeError,
+    ServiceInventoryError,
+    build_local_models_payload,
+    service_huggingface_inventory,
+)
 
-_COMMON_SRC = Path(__file__).resolve().parent.parent / "kiron-common"
-if _COMMON_SRC.exists() and str(_COMMON_SRC) not in sys.path:
-    sys.path.insert(0, str(_COMMON_SRC))
-try:
-    from kiron_common.ollama_compat import is_real_int
-except ImportError:  # pragma: no cover - half-upgraded venv fallback
-    def is_real_int(value):
-        return isinstance(value, int) and not isinstance(value, bool)
+
+if MODEL_STATE_VIEW.catalog is not MODEL_CATALOG:
+    raise RuntimeError("proxy model state view must use the shared MODEL_CATALOG")
 
 app = FastAPI(title="Kiron Dashboard")
 
@@ -57,16 +73,171 @@ db_work_tracker = None
 # Globaler API Key Store (wird von main.py gesetzt)
 api_key_store = None
 
-OLLAMA_BASE_URL = "http://127.0.0.1:11435"
+OLLAMA_BASE_URL = DEFAULT_OLLAMA_BASE_URL
 EMBEDDING_HEALTH_URL = "http://127.0.0.1:11436/health"
 EMBEDDING_LOAD_URL = "http://127.0.0.1:11436/api/load"
+EMBEDDING_SERVICE = "kiron-embeddings.service"
 DEBERTA_HEALTH_URL = "http://127.0.0.1:11437/health"
 DEBERTA_LOAD_URL = "http://127.0.0.1:11437/api/load"
 DEBERTA_UNLOAD_URL = "http://127.0.0.1:11437/api/unload"
+DEBERTA_SERVICE = "kiron-deberta.service"
+DATA_ROOT = project_root / "data"
+PROXY_DATA_DIR = DATA_ROOT / "kiron-proxy"
+SHARED_DATA_DIR = DATA_ROOT / "shared"
+RUNTIME_CONFIG_FILE = SHARED_DATA_DIR / "runtime_config.json"
+SERVICE_CONTROL_HELPER = "/usr/local/sbin/kiron-service-control"
+FIREWALL_HELPER = "/usr/local/sbin/kiron-maintenance-firewall"
+EMBEDDING_MODEL_SLOTS_MIN = 1
+EMBEDDING_MODEL_SLOTS_DEFAULT = 2
+EMBEDDING_MODEL_SLOTS_MAX = 4
+_runtime_config_file_lock = threading.RLock()
+_SERVICE_CONTROL_ALLOWED = frozenset({
+    ("restart", "kiron-proxy.service"),
+    ("start", EMBEDDING_SERVICE),
+    ("stop", EMBEDDING_SERVICE),
+    ("restart", EMBEDDING_SERVICE),
+    ("start", DEBERTA_SERVICE),
+    ("stop", DEBERTA_SERVICE),
+    ("restart", DEBERTA_SERVICE),
+})
+_FIREWALL_ALLOWED_ACTIONS = frozenset({"check", "insert", "delete"})
+_FIREWALL_ALLOWED_CHAINS = frozenset({"INPUT", "DOCKER-USER"})
+_FIREWALL_ALLOWED_PORTS = frozenset({5001, 11434, 11435, 11440})
+_FIREWALL_ABSENT_EXIT = 10
 
 
 async def _to_thread(func, /, *args, **kwargs):
     return await asyncio.to_thread(func, *args, **kwargs)
+
+
+def _canonical_service_unit(unit: str) -> str:
+    if not isinstance(unit, str) or not unit:
+        raise ValueError("service unit must be a non-empty string")
+    return unit if unit.endswith(".service") else f"{unit}.service"
+
+
+def _service_control_command(verb: str, unit: str) -> list[str]:
+    canonical_unit = _canonical_service_unit(unit)
+    if (verb, canonical_unit) not in _SERVICE_CONTROL_ALLOWED:
+        raise ValueError(f"service-control operation not allowed: {verb} {canonical_unit}")
+    return ["sudo", "-n", SERVICE_CONTROL_HELPER, verb, canonical_unit]
+
+
+def _firewall_command(action: str, chain: str, port: int) -> list[str]:
+    if action not in _FIREWALL_ALLOWED_ACTIONS:
+        raise ValueError(f"firewall action not allowed: {action}")
+    if chain not in _FIREWALL_ALLOWED_CHAINS:
+        raise ValueError(f"firewall chain not allowed: {chain}")
+    if port not in _FIREWALL_ALLOWED_PORTS:
+        raise ValueError(f"firewall port not allowed: {port}")
+    return ["sudo", "-n", FIREWALL_HELPER, action, chain, str(port)]
+
+
+async def _run_service_control(verb: str, unit: str, *, timeout: float) -> subprocess.CompletedProcess:
+    return await _to_thread(
+        subprocess.run,
+        _service_control_command(verb, unit),
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+
+
+async def _run_firewall_helper(action: str, chain: str, port: int) -> subprocess.CompletedProcess:
+    try:
+        return await _to_thread(
+            subprocess.run,
+            _firewall_command(action, chain, port),
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (FileNotFoundError, PermissionError, OSError, subprocess.TimeoutExpired) as exc:
+        cmd = ["sudo", "-n", FIREWALL_HELPER, action, chain, str(port)]
+        return subprocess.CompletedProcess(cmd, returncode=1, stdout="", stderr=str(exc))
+
+
+def _coerce_embedding_model_slots(value, *, default=EMBEDDING_MODEL_SLOTS_DEFAULT) -> int:
+    if is_real_int(value):
+        slots = int(value)
+    elif isinstance(value, str) and re.fullmatch(r"[+-]?\d+", value.strip()):
+        slots = int(value)
+    else:
+        return default
+    return max(EMBEDDING_MODEL_SLOTS_MIN, min(EMBEDDING_MODEL_SLOTS_MAX, slots))
+
+
+def _runtime_config_default() -> dict:
+    return {"embedding": {"model_slots": EMBEDDING_MODEL_SLOTS_DEFAULT}}
+
+
+def _read_runtime_config_sync() -> dict:
+    cfg = _runtime_config_default()
+    try:
+        raw = json.loads(RUNTIME_CONFIG_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return cfg
+    if not isinstance(raw, dict):
+        return cfg
+    embedding = raw.get("embedding")
+    if not isinstance(embedding, dict):
+        embedding = {}
+    cfg.update({k: v for k, v in raw.items() if k != "embedding"})
+    cfg["embedding"] = {
+        **embedding,
+        "model_slots": _coerce_embedding_model_slots(
+            embedding.get("model_slots"),
+            default=EMBEDDING_MODEL_SLOTS_DEFAULT,
+        ),
+    }
+    return cfg
+
+
+def _write_runtime_config_sync(cfg: dict) -> None:
+    RUNTIME_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = None
+    with _runtime_config_file_lock:
+        try:
+            with tempfile.NamedTemporaryFile(
+                "w",
+                encoding="utf-8",
+                dir=RUNTIME_CONFIG_FILE.parent,
+                prefix=f".{RUNTIME_CONFIG_FILE.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as tmp:
+                tmp_path = Path(tmp.name)
+                json.dump(cfg, tmp, indent=2, ensure_ascii=False)
+                tmp.write("\n")
+            os.chmod(tmp_path, 0o640)
+            os.replace(tmp_path, RUNTIME_CONFIG_FILE)
+        finally:
+            if tmp_path is not None and tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    pass
+
+
+def _update_embedding_slots_config_sync(model_slots: int) -> dict:
+    with _runtime_config_file_lock:
+        cfg = _read_runtime_config_sync()
+        embedding = cfg.get("embedding")
+        if not isinstance(embedding, dict):
+            embedding = {}
+        embedding["model_slots"] = model_slots
+        cfg["embedding"] = embedding
+        _write_runtime_config_sync(cfg)
+        return cfg
+
+
+def _loaded_models_from_embedding_health(data: dict | None) -> set[str]:
+    if not isinstance(data, dict):
+        return set()
+    raw_loaded = data.get("loaded_models")
+    if isinstance(raw_loaded, list):
+        return {item for item in raw_loaded if isinstance(item, str)}
+    return set()
 
 
 def _gpu_gate_response(decision: vram_lease.GPUGateDecision) -> JSONResponse:
@@ -122,6 +293,25 @@ async def _wait_service_reachable(url: str, deadline_s: float) -> tuple[bool, di
         await asyncio.sleep(vram_lease.GPU_SERVICE_HEALTH_POLL_S)
 
 
+async def _restart_embedding_service_with_wait() -> tuple[bool, dict | None, str | None]:
+    try:
+        result = await _run_service_control("restart", EMBEDDING_SERVICE, timeout=30)
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
+        return False, None, f"Restart fehlgeschlagen: {exc}"
+    except Exception as exc:
+        return False, None, f"Restart fehlgeschlagen: {exc}"
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        return False, None, f"Restart fehlgeschlagen: {detail}"
+    ok, health = await _wait_service_reachable(
+        EMBEDDING_HEALTH_URL,
+        vram_lease.GPU_SERVICE_START_DEADLINE_S,
+    )
+    if not ok:
+        return False, health, "Embedding-Service wurde neugestartet, ist aber nicht HTTP-bereit"
+    return True, health, None
+
+
 def _clear_marker_for_service_response(resp: httpx.Response, data_readable: bool) -> bool:
     if 200 <= resp.status_code < 300:
         return data_readable
@@ -136,18 +326,11 @@ async def _db_to_thread(func, /, *args, **kwargs):
     return await _to_thread(func, *args, **kwargs)
 
 
-# Registry-Cache fuer Featured-Modelle (Single-Worker async, kein Locking noetig).
-# `timestamp` bleibt Wall-Time fuer den Disk-Cache; RAM-TTL laeuft monotonic.
-_registry_cache = {"data": None, "timestamp": 0, "monotonic_timestamp": 0.0}
-
 MODEL_NAME_PATTERN = re.compile(r'^[a-zA-Z0-9._:-]+(/[a-zA-Z0-9._:-]+)*$')
 
 # Benchmark-Cache (persistiert als JSON-Datei)
-BENCHMARKS_CACHE_FILE = Path(__file__).parent / "benchmarks_cache.json"
+BENCHMARKS_CACHE_FILE = PROXY_DATA_DIR / "benchmarks_cache.json"
 BENCHMARK_REFRESH_TTL_S = 7 * 86400
-
-# Registry-Cache (persistiert als JSON-Datei)
-REGISTRY_CACHE_FILE = Path(__file__).parent / "registry_cache.json"
 
 # Statische Benchmarks fuer Modelle die nicht auf dem Open LLM Leaderboard sind
 # Quelle: Offizielle Model Cards und Technical Reports
@@ -217,68 +400,21 @@ _OLLAMA_TO_EVALPLUS_MAP = {
 }
 
 
-def _is_valid_registry_models(data) -> bool:
-    # Verteidigt Cache + Consumer gegen Shape-Drift bei ollama.com / korrupte Disk-Caches.
-    return isinstance(data, list) and all(isinstance(m, dict) for m in data)
+_model_registration_service: ModelRegistrationService | None = None
 
 
-def _load_registry_disk_cache() -> dict:
-    """Registry-Cache von Disk laden.
-
-    Normalisiert die Shape, sodass Consumer immer
-    `{"registry": {"data": ..., "timestamp": <number>}, "tags": {<dict>}}`
-    sehen. Korrupter Inhalt (Liste, String, fehlende Keys, falsche Typen)
-    wird auf den leeren Default abgebildet, damit Available-Models und
-    Tags-Endpoint nicht ueber AttributeError/TypeError abstuerzen.
-    """
-    default = {"registry": {"data": None, "timestamp": 0}, "tags": {}}
-    if not REGISTRY_CACHE_FILE.exists():
-        return default
-    try:
-        raw = json.loads(REGISTRY_CACHE_FILE.read_text())
-    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as e:
-        import logging
-        logging.getLogger(__name__).warning("registry_cache.json nicht lesbar: %s", e)
-        return default
-    if not isinstance(raw, dict):
-        return default
-    registry = raw.get("registry")
-    if not isinstance(registry, dict):
-        registry = {"data": None, "timestamp": 0}
-    if not isinstance(registry.get("timestamp"), (int, float)):
-        registry = {**registry, "timestamp": 0}
-    tags = raw.get("tags")
-    if not isinstance(tags, dict):
-        tags = {}
-    else:
-        tags = {k: v for k, v in tags.items() if isinstance(v, dict) and isinstance(v.get("data"), dict)}
-    return {"registry": registry, "tags": tags}
+def get_model_registration_service() -> ModelRegistrationService:
+    global _model_registration_service
+    if _model_registration_service is None:
+        _model_registration_service = build_model_registration_service()
+    return _model_registration_service
 
 
-def _save_registry_disk_cache(cache: dict):
-    """Registry-Cache auf Disk speichern (atomar)."""
-    tmp = REGISTRY_CACHE_FILE.with_suffix(REGISTRY_CACHE_FILE.suffix + ".tmp")
-    try:
-        tmp.write_text(json.dumps(cache, indent=2, ensure_ascii=False))
-        tmp.replace(REGISTRY_CACHE_FILE)
-    except OSError as e:
-        import logging
-        logging.getLogger(__name__).warning("registry_cache.json speichern fehlgeschlagen: %s", e)
-        try:
-            tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
-
-
-_registry_disk_lock = asyncio.Lock()
-
-
-async def _update_registry_disk_cache(mutate):
-    # Serialisiert load-modify-save gegen Lost-Updates bei concurrent Endpoints.
-    async with _registry_disk_lock:
-        cache = await _to_thread(_load_registry_disk_cache)
-        mutate(cache)
-        await _to_thread(_save_registry_disk_cache, cache)
+def set_model_registration_service(service: ModelRegistrationService) -> None:
+    if not isinstance(service, ModelRegistrationService):
+        raise TypeError("service must be a ModelRegistrationService")
+    global _model_registration_service
+    _model_registration_service = service
 
 
 def set_store(request_store: RequestStore):
@@ -299,6 +435,97 @@ def set_db_work_tracker(tracker):
 def set_api_key_store(aks):
     global api_key_store
     api_key_store = aks
+
+
+async def _runtime_config_response_payload() -> dict:
+    cfg = await _to_thread(_read_runtime_config_sync)
+    desired_slots = _coerce_embedding_model_slots(
+        cfg.get("embedding", {}).get("model_slots")
+        if isinstance(cfg.get("embedding"), dict)
+        else None
+    )
+    reachable, health, _ = await _json_service_health(EMBEDDING_HEALTH_URL)
+    effective_slots = None
+    loaded_models: list[str] = []
+    loading_model = None
+    current_model = None
+    status = "down"
+    if reachable and isinstance(health, dict):
+        status = health.get("status") if isinstance(health.get("status"), str) else "unknown"
+        raw_slots = health.get("model_slots")
+        if isinstance(raw_slots, int) and not isinstance(raw_slots, bool):
+            effective_slots = raw_slots
+        current = health.get("current_model")
+        current_model = current if isinstance(current, str) else None
+        loading = health.get("loading_model")
+        loading_model = loading if isinstance(loading, str) else None
+        loaded_models = sorted(_loaded_models_from_embedding_health(health))
+    return {
+        "embedding": {
+            "model_slots": desired_slots,
+            "effective_model_slots": effective_slots,
+            "pending_restart": effective_slots is not None and effective_slots != desired_slots,
+            "service_running": reachable,
+            "service_status": status,
+            "current_model": current_model,
+            "loaded_models": loaded_models,
+            "loading_model": loading_model,
+            "min_model_slots": EMBEDDING_MODEL_SLOTS_MIN,
+            "max_model_slots": EMBEDDING_MODEL_SLOTS_MAX,
+            "default_model_slots": EMBEDDING_MODEL_SLOTS_DEFAULT,
+        }
+    }
+
+
+@app.get("/api/config/runtime")
+async def get_runtime_config():
+    return await _runtime_config_response_payload()
+
+
+@app.post("/api/config/embedding")
+async def update_embedding_config(body: dict | None = Body(default=None)):
+    body = body if isinstance(body, dict) else {}
+    raw_slots = body.get("model_slots")
+    if not is_real_int(raw_slots):
+        return JSONResponse(
+            {"error": "model_slots muss eine ganze Zahl sein."},
+            status_code=400,
+        )
+    model_slots = int(raw_slots)
+    if not EMBEDDING_MODEL_SLOTS_MIN <= model_slots <= EMBEDDING_MODEL_SLOTS_MAX:
+        return JSONResponse(
+            {
+                "error": (
+                    f"model_slots muss zwischen {EMBEDDING_MODEL_SLOTS_MIN} "
+                    f"und {EMBEDDING_MODEL_SLOTS_MAX} liegen."
+                )
+            },
+            status_code=400,
+        )
+
+    try:
+        await _to_thread(_update_embedding_slots_config_sync, model_slots)
+    except OSError as exc:
+        return JSONResponse(
+            {"error": f"Runtime-Konfiguration konnte nicht gespeichert werden: {exc}"},
+            status_code=500,
+        )
+
+    restart = body.get("restart") is True
+    restart_info = {"requested": restart, "ok": None, "error": None}
+    if restart:
+        ok, health, error = await _restart_embedding_service_with_wait()
+        restart_info = {"requested": True, "ok": ok, "error": error}
+        if not ok:
+            payload = await _runtime_config_response_payload()
+            payload["restart"] = restart_info
+            if health is not None:
+                payload["restart"]["health"] = health
+            return JSONResponse(payload, status_code=500)
+
+    payload = await _runtime_config_response_payload()
+    payload["restart"] = restart_info
+    return payload
 
 
 @app.middleware("http")
@@ -483,11 +710,11 @@ async def restart_dashboard():
     """Startet den Dashboard-Service neu."""
     try:
         subprocess.Popen(
-            ["systemctl", "restart", "kiron-proxy.service"],
+            _service_control_command("restart", "kiron-proxy.service"),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-    except (FileNotFoundError, OSError) as e:
+    except (FileNotFoundError, OSError, ValueError) as e:
         return JSONResponse(
             {"status": "error", "message": f"Restart fehlgeschlagen: {e}"},
             status_code=500,
@@ -550,13 +777,6 @@ def _json_backend_error(message: str, status_code: int = 502, code: str = "backe
 
 def _optional_int(value):
     return value if is_real_int(value) else None
-
-
-def _gb_or_none(value):
-    value = _optional_int(value)
-    if value is None:
-        return None
-    return round(value / (1024 ** 3), 2)
 
 
 def _canonical_model_name(name: str) -> str:
@@ -645,22 +865,92 @@ async def _verify_model_unloaded(client: httpx.AsyncClient, name: str) -> JSONRe
         await asyncio.sleep(UNLOAD_VERIFY_POLL_INTERVAL_S)
 
 
-def _classify_model_type(name: str, family: str) -> str:
-    """Modelltyp anhand Name und Familie bestimmen."""
-    name_lower = name.lower()
-    family_lower = family.lower()
-    # Embedding-Modelle: Name enthaelt embed/gte/e5, oder Familie ist bert-basiert
-    if ("embed" in name_lower or "bert" in family_lower
-            or "/gte-" in name_lower or "/e5-" in name_lower):
-        return "embedding"
-    if "vl" in family_lower or "vision" in name_lower:
-        return "vlm"
-    return "llm"
+_REGISTRATION_STATUS_BY_CODE = {
+    "invalid_provider": 400,
+    "invalid_reference": 400,
+    "invalid_loader": 400,
+    "model_not_found": 404,
+    "duplicate_model": 409,
+    "loader_metadata_invalid": 422,
+    "local_validation_failed": 502,
+    "registry_corrupt": 500,
+    "registry_access_failed": 503,
+}
+
+
+def _registration_error_response(error: ModelRegistrationError) -> JSONResponse:
+    return JSONResponse(
+        {
+            "status": "error",
+            "error": {"code": error.code, "message": str(error)},
+        },
+        status_code=_REGISTRATION_STATUS_BY_CODE.get(error.code, 500),
+    )
+
+
+def _catalog_ollama_reference_keys() -> frozenset[str]:
+    keys: set[str] = set()
+    for definition in MODEL_STATE_VIEW.for_backend(BackendType.OLLAMA):
+        for name in definition.input_names:
+            canonical = canonical_ollama_reference(name)
+            if canonical is not None:
+                keys.add(canonical.lower())
+    return frozenset(keys)
+
+
+@app.get("/api/models/registration-candidates")
+async def get_model_registration_candidates():
+    try:
+        candidates = await _to_thread(
+            get_model_registration_service().list_candidates
+        )
+    except ModelRegistrationError as exc:
+        return _registration_error_response(exc)
+    catalog_ollama = _catalog_ollama_reference_keys()
+    visible = [
+        candidate.to_dict()
+        for candidate in candidates
+        if not (
+            candidate.provider is LocalModelProvider.OLLAMA
+            and candidate.reference.lower() in catalog_ollama
+        )
+    ]
+    return {"status": "ok", "candidates": visible}
+
+
+@app.post("/api/models/register")
+async def register_local_model(body: object = Body(...)):
+    if type(body) is not dict or not set(body).issubset(
+        {"provider", "reference", "loader"}
+    ):
+        return JSONResponse(
+            {
+                "status": "error",
+                "error": {
+                    "code": "invalid_request",
+                    "message": "request must contain only provider, reference and loader",
+                },
+            },
+            status_code=400,
+        )
+    try:
+        entry = await _to_thread(
+            get_model_registration_service().register_model,
+            provider=body.get("provider"),
+            reference=body.get("reference"),
+            loader=body.get("loader"),
+        )
+    except ModelRegistrationError as exc:
+        return _registration_error_response(exc)
+    return JSONResponse(
+        {"status": "registered", "model": entry.to_dict()},
+        status_code=201,
+    )
 
 
 @app.get("/api/models/local")
 async def get_local_models():
-    """Lokale Modelle mit Lade-Status und Embedding-Service-Info."""
+    """Catalog configuration plus injected local and atomic runtime inventory."""
     try:
         async with httpx.AsyncClient(base_url=OLLAMA_BASE_URL, timeout=10) as client:
             tags_resp, ps_resp = await asyncio.gather(
@@ -685,6 +975,38 @@ async def get_local_models():
             return JSONResponse({"error": "Ungueltige JSON-Antwort von Ollama"}, status_code=502)
         if not isinstance(tags_data, dict) or not isinstance(tags_data.get("models"), list):
             return JSONResponse({"error": "Ungueltige /api/tags-Shape von Ollama"}, status_code=502)
+
+        async with httpx.AsyncClient(
+            base_url=OLLAMA_BASE_URL,
+            timeout=10,
+        ) as show_client:
+            async def _read_show(name: str):
+                try:
+                    response = await show_client.post(
+                        "/api/show",
+                        json={"model": name},
+                    )
+                    if response.status_code != 200:
+                        return name, None
+                    payload = response.json()
+                    return name, payload if isinstance(payload, dict) else None
+                except (httpx.RequestError, ValueError, TypeError):
+                    return name, None
+
+            show_results = await asyncio.gather(
+                *(
+                    _read_show(row["name"])
+                    for row in tags_data["models"]
+                    if isinstance(row, dict)
+                    and type(row.get("name")) is str
+                    and row["name"]
+                )
+            )
+        show_by_name = {
+            name: payload
+            for name, payload in show_results
+            if payload is not None
+        }
         if ps_resp is not None and ps_resp.status_code == 200:
             try:
                 ps_data = ps_resp.json()
@@ -693,101 +1015,57 @@ async def get_local_models():
         else:
             ps_data = None
 
-        # Embedding-Service Status abfragen. 503 no_model/loading mit JSON
-        # bedeutet: Prozess erreichbar, nur Modell nicht ready.
-        embed_available = set()
-        embed_current = None
-        embed_loading = None
-        embed_status = "down"
-        embed_running = False
-        reachable, embed_data, _ = await _json_service_health(EMBEDDING_HEALTH_URL)
-        if reachable and isinstance(embed_data, dict):
-            embed_running = True
-            raw_status = embed_data.get("status")
-            embed_status = raw_status if isinstance(raw_status, str) else "unknown"
-            raw_current = embed_data.get("current_model")
-            embed_current = raw_current if isinstance(raw_current, str) else None
-            raw_loading = embed_data.get("loading_model")
-            embed_loading = raw_loading if isinstance(raw_loading, str) else None
-            raw_available = embed_data.get("available_models")
-            if isinstance(raw_available, list):
-                embed_available = {x for x in raw_available if isinstance(x, str)}
-
-        # Geladene Modelle indexieren. Unknown bleibt fuer jedes Modell sichtbar.
-        loaded, ps_known = _parse_ps_models(ps_data)
-
-        models = []
-        for m in tags_data.get("models", []):
-            if not isinstance(m, dict):
-                continue
-            name = m.get("name")
-            if not isinstance(name, str) or not name:
-                continue
-            details = m.get("details", {})
-            if not isinstance(details, dict):
-                details = {}
-            family = details.get("family", "")
-            family = family if isinstance(family, str) else ""
-            size_bytes = m.get("size", 0)
-            size_gb = _gb_or_none(size_bytes)
-
-            # Basename fuer Embedding-Service Matching (ohne :tag)
-            basename = name.split(":")[0].rsplit("/", 1)[-1]
-            embedding_loading = embed_running and basename == embed_loading
-            lm = loaded.get(name)
-            if not ps_known:
-                load_state = "unknown"
-                loaded_flag = False
-            elif lm is not None:
-                load_state = "loaded"
-                loaded_flag = True
-            else:
-                load_state = "unloaded"
-                loaded_flag = False
-
-            entry = {
-                "name": name,
-                "parameter_size": details.get("parameter_size", ""),
-                "quantization_level": details.get("quantization_level", ""),
-                "family": family,
-                "model_type": _classify_model_type(name, family),
-                "size_gb": size_gb,
-                "loaded": loaded_flag,
-                "load_state": load_state,
-                "embedding_capable": basename in embed_available,
-                "embedding_active": embed_running and basename == embed_current,
-                "embedding_loading": embedding_loading,
-                "vram_gb": None if load_state == "unknown" else 0.0,
-                "ram_gb": None if load_state == "unknown" else 0.0,
-                "context_length": None,
-                "expires_at": None,
-            }
-
-            if lm is not None:
-                total = _optional_int(lm.get("size"))
-                vram = _optional_int(lm.get("size_vram"))
-                entry["vram_gb"] = _gb_or_none(vram)
-                entry["ram_gb"] = (
-                    round(max(0, total - vram) / (1024 ** 3), 2)
-                    if total is not None and vram is not None
-                    else None
-                )
-                entry["context_length"] = lm.get("context_length")
-                entry["expires_at"] = lm.get("expires_at")
-
-            models.append(entry)
-
-        return {
-            "models": models,
-            "models_loaded_state": "known" if ps_known else "unknown",
-            "embedding_service": {
-                "running": embed_running,
-                "status": embed_status,
-                "current_model": embed_current,
-                "loading_model": embed_loading,
-                "available_models": sorted(embed_available),
-            },
-        }
+        cached = get_cached_payload()
+        system = cached.get("system") if isinstance(cached, dict) else None
+        system = system if isinstance(system, dict) else {}
+        embed_data = system.get("embedding")
+        deberta_data = system.get("deberta")
+        embed_reachable = (
+            isinstance(embed_data, dict) and embed_data.get("running") is True
+        )
+        deberta_reachable = (
+            isinstance(deberta_data, dict) and deberta_data.get("running") is True
+        )
+        try:
+            hf_revisions = service_huggingface_inventory(
+                MODEL_STATE_VIEW,
+                {
+                    BackendType.KIRON_EMBEDDINGS: embed_data,
+                    BackendType.KIRON_DEBERTA: deberta_data,
+                },
+            )
+        except ServiceInventoryError as exc:
+            return JSONResponse(
+                {
+                    "error": f"Verwaltetes Service-Inventar inkonsistent: {exc}",
+                    "catalog_digest": MODEL_STATE_VIEW.catalog_digest,
+                },
+                status_code=503,
+            )
+        try:
+            registrations = await _to_thread(
+                get_model_registration_service().list_models
+            )
+        except ModelRegistrationError as exc:
+            return _registration_error_response(exc)
+        try:
+            return build_local_models_payload(
+                state_view=MODEL_STATE_VIEW,
+                huggingface_revisions=hf_revisions,
+                ollama_tag_rows=tags_data["models"],
+                ollama_ps=ps_data,
+                embedding_health=embed_data,
+                embedding_reachable=embed_reachable,
+                deberta_health=deberta_data,
+                deberta_reachable=deberta_reachable,
+                registrations=registrations,
+                ollama_show_by_name=show_by_name,
+            )
+        except InventoryShapeError as exc:
+            return JSONResponse(
+                {"error": f"Ungueltiges lokales Modellinventar: {exc}"},
+                status_code=502,
+            )
 
     except httpx.ConnectError:
         return JSONResponse({"error": "Ollama nicht erreichbar"}, status_code=503)
@@ -820,6 +1098,48 @@ async def load_embedding_model(body: dict):
                 data = resp.json()
             except json.JSONDecodeError:
                 return JSONResponse({"error": "Ungueltige JSON-Antwort vom Embedding-Service"}, status_code=502)
+            op.clear_marker = _clear_marker_for_service_response(resp, True)
+            status = resp.status_code if 200 <= resp.status_code < 600 else 502
+            return JSONResponse(data, status_code=status)
+        except httpx.ConnectError:
+            op.clear_marker = True
+            return JSONResponse({"error": "Embedding-Service nicht erreichbar"}, status_code=503)
+        except httpx.TimeoutException:
+            return JSONResponse({"error": "Embedding-Service Timeout"}, status_code=504)
+        except httpx.RequestError as exc:
+            return _json_backend_error(f"Embedding-Service Backend-Fehler: {exc}")
+
+
+@app.post("/api/embedding/colbert/warmup")
+async def warmup_colbert_model(body: dict):
+    """ColBERT-Modell ueber den Token-Level-Endpoint warm laufen lassen."""
+    model = body.get("model", "")
+    if not _validate_model_name(model):
+        return JSONResponse({"error": "Ungueltiger Modellname"}, status_code=400)
+    force = body.get("force") is True
+    async with vram_lease.gpu_service_operation(
+        force=force,
+        service_name="Embedding-Service",
+    ) as op:
+        if not op.allowed:
+            return _gpu_gate_response(op.decision)
+        try:
+            async with httpx.AsyncClient(timeout=300) as client:
+                resp = await client.post(
+                    "http://127.0.0.1:11436/api/embed_colbert",
+                    json={
+                        "model": model,
+                        "input": ["warmup"],
+                        "language": "de",
+                    },
+                )
+            try:
+                data = resp.json()
+            except json.JSONDecodeError:
+                return JSONResponse(
+                    {"error": "Ungueltige JSON-Antwort vom Embedding-Service"},
+                    status_code=502,
+                )
             op.clear_marker = _clear_marker_for_service_response(resp, True)
             status = resp.status_code if 200 <= resp.status_code < 600 else 502
             return JSONResponse(data, status_code=status)
@@ -961,203 +1281,6 @@ async def unload_model(body: dict):
             return _json_backend_error(f"Ollama Backend-Fehler beim Entladen: {exc}")
 
 
-# Aktive Pull-Downloads (wird von Background-Tasks aktualisiert)
-_active_pulls = {}
-_MAX_ACTIVE_PULLS = 50
-PULL_STATUS_FINISHED_TTL_S = 30
-
-
-def _evict_active_pulls_if_full():
-    """Entfernt aelteste finished Pulls wenn Dict das Limit ueberschreitet (#191)."""
-    if len(_active_pulls) < _MAX_ACTIVE_PULLS:
-        return
-    finished = [
-        (name, s.get("finished_at", 0))
-        for name, s in _active_pulls.items()
-        if s.get("finished_at")
-    ]
-    finished.sort(key=lambda x: x[1])
-    for name, _ in finished[: max(1, len(_active_pulls) - _MAX_ACTIVE_PULLS + 1)]:
-        _active_pulls.pop(name, None)
-
-
-async def _do_pull(model_name: str):
-    """Background-Task: Modell von Ollama pullen und _active_pulls aktualisieren."""
-    state = _active_pulls.get(model_name)
-    if not state:
-        return
-    try:
-        async with httpx.AsyncClient(base_url=OLLAMA_BASE_URL, timeout=None) as client:
-            async with client.stream("POST", "/api/pull", json={"model": model_name, "stream": True}) as resp:
-                if not (200 <= resp.status_code < 300):
-                    # Body als Fehlermeldung lesen (begrenzt, falls sehr gross)
-                    try:
-                        body = (await resp.aread()).decode("utf-8", errors="replace")[:500]
-                    except Exception:
-                        body = ""
-                    state["status"] = "error"
-                    state["error"] = f"HTTP {resp.status_code}: {body}".rstrip(": ").strip()
-                    return
-                saw_success = False
-                async for line in resp.aiter_lines():
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        data = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if "error" in data:
-                        state["status"] = "error"
-                        state["error"] = data["error"] or "Ollama-Pull-Fehler ohne Details"
-                        return
-                    status_str = data.get("status", "")
-                    state["status"] = status_str
-                    if status_str == "success":
-                        saw_success = True
-                    if "total" in data:
-                        state["total"] = data["total"]
-                    if "completed" in data:
-                        state["completed"] = data["completed"]
-                    if "digest" in data:
-                        state["digest"] = data.get("digest", "")
-        if saw_success:
-            state["status"] = "success"
-        else:
-            state["status"] = "error"
-            state["error"] = "Ollama-Pull-Stream ohne success-Status beendet"
-    except httpx.ConnectError:
-        state["status"] = "error"
-        state["error"] = "Ollama nicht erreichbar"
-    except Exception as e:
-        state["status"] = "error"
-        state["error"] = str(e)
-    finally:
-        # Abgeschlossene Pulls nach 30s aufraeumen.
-        # #832: monotonic statt time.time(), damit ein NTP-/Admin-Sprung der
-        # Systemuhr rueckwaerts nicht (now - finished_at) negativ macht und
-        # den Cleanup ewig blockiert.
-        # Nur schreiben, wenn der Eintrag noch unsere Instanz ist — sonst
-        # ueberschreibt ein paralleler Re-Pull seinen frischen state.
-        if _active_pulls.get(model_name) is state:
-            state["finished_at"] = time.monotonic()
-
-
-@app.post("/api/models/pull")
-async def pull_model(body: dict):
-    """Neues Modell herunterladen (NDJSON-Streaming via Background-Task)."""
-    model_name = body.get("name", "")
-    if not _validate_model_name(model_name):
-        return JSONResponse({"error": "Ungueltiger Modellname"}, status_code=400)
-
-    # Background-Pull starten falls nicht bereits aktiv
-    existing = _active_pulls.get(model_name)
-    if not existing or existing.get("status") in ("success", "error"):
-        # #276: Vor dem Eviction-Versuch pruefen ob noch Platz nach Evict da ist.
-        # _evict_active_pulls_if_full entfernt nur finished Pulls - wenn alle 50 Slots
-        # von laufenden Pulls belegt sind, wuerden weitere Background-Tasks gestartet.
-        active_running = sum(
-            1 for s in _active_pulls.values()
-            if s.get("status") not in ("success", "error")
-        )
-        if active_running >= _MAX_ACTIVE_PULLS:
-            return JSONResponse(
-                {
-                    "error": "Zu viele parallele Pulls",
-                    "hint": f"Maximal {_MAX_ACTIVE_PULLS} gleichzeitige Downloads. "
-                            "Bitte auf Abschluss warten oder einen laufenden Pull stoppen.",
-                    "active_running": active_running,
-                },
-                status_code=429,
-            )
-        _evict_active_pulls_if_full()
-        _active_pulls[model_name] = {
-            "model": model_name,
-            "status": "starting",
-            "completed": 0,
-            "total": 0,
-            "digest": "",
-            "error": None,
-            "started_at": time.time(),
-            "finished_at": None,
-        }
-        asyncio.create_task(_do_pull(model_name))
-
-    # Status als NDJSON an den Client streamen (liest aus _active_pulls)
-    async def stream_status():
-        prev_line = ""
-        # #926: Referenz auf den state-dict halten. Wird der Eintrag waehrend
-        # eines Sleeps von /pull/status (TTL-Cleanup) per pop entfernt, sieht
-        # _active_pulls.get() None und der Loop bricht ab — der dict selbst
-        # lebt aber weiter, weil _do_pull denselben dict mutiert. Nach dem
-        # Loop reichen wir einen finalen Frame nach, falls wir das terminal
-        # status (success/error) nicht mehr im Loop gesehen haben.
-        last_state = None
-        while True:
-            state = _active_pulls.get(model_name)
-            if not state:
-                break
-            last_state = state
-            line_data = {"status": state["status"]}
-            if state["total"]:
-                line_data["total"] = state["total"]
-                line_data["completed"] = state["completed"]
-            if state.get("digest"):
-                line_data["digest"] = state["digest"]
-            if state.get("error"):
-                line_data["error"] = state["error"]
-
-            line = json.dumps(line_data)
-            if line != prev_line:
-                yield line + "\n"
-                prev_line = line
-
-            if state["status"] in ("success", "error"):
-                break
-            await asyncio.sleep(0.3)
-
-        if last_state and last_state.get("status") in ("success", "error"):
-            line_data = {"status": last_state["status"]}
-            if last_state["total"]:
-                line_data["total"] = last_state["total"]
-                line_data["completed"] = last_state["completed"]
-            if last_state.get("digest"):
-                line_data["digest"] = last_state["digest"]
-            if last_state.get("error"):
-                line_data["error"] = last_state["error"]
-            line = json.dumps(line_data)
-            if line != prev_line:
-                yield line + "\n"
-
-    return StreamingResponse(stream_status(), media_type="application/x-ndjson")
-
-
-@app.get("/api/models/pull/status")
-async def get_pull_status():
-    """Status aller aktiven Pull-Downloads."""
-    # #832: finished_at ist monotonic (siehe _do_pull), Vergleich also gegen monotonic now.
-    now = time.monotonic()
-    # Abgeschlossene Pulls aufraeumen (nach 30s) - Snapshot gegen concurrent modification
-    to_remove = [
-        name for name, s in list(_active_pulls.items())
-        if s.get("finished_at") and (now - s["finished_at"]) > PULL_STATUS_FINISHED_TTL_S
-    ]
-    for name in to_remove:
-        _active_pulls.pop(name, None)
-
-    active = {}
-    for name, state in list(_active_pulls.items()):
-        active[name] = {
-            "model": name,
-            "status": state["status"],
-            "completed": state["completed"],
-            "total": state["total"],
-            "started_at": state["started_at"],
-            "error": state.get("error"),
-        }
-    return {"active_pulls": active}
-
-
 @app.delete("/api/models/delete")
 async def delete_model(body: dict):
     """Modell loeschen."""
@@ -1270,21 +1393,32 @@ async def _gpu_service_lease_guard(force: bool, service: str) -> JSONResponse | 
     return _gpu_gate_response(decision)
 
 
-async def _docling_lifecycle_snapshot() -> dict | None:
+async def _docling_lifecycle_snapshot() -> tuple[bool, dict | None]:
     """Liest den Lifecycle-Snapshot vom Docling-Proxy.
 
-    Rueckgabe: Snapshot-dict bei 200; `None` bei jeder Art Fehler
-    (ConnectError, Timeout, Non-200, JSON-Decode). `None` signalisiert
-    dem Drain-Loop: Proxy wahrscheinlich tot, Fallback = direkt stoppen.
+    Rueckgabe: `(reachable, snapshot)`.
+    - `(False, None)`: Proxy nicht erreichbar/Transportfehler. Drain-Fallback
+      darf direkt stoppen.
+    - `(True, None)`: Proxy antwortet, aber Lifecycle ist ungesund/ungueltig.
+      Drain darf das nicht als "fertig" interpretieren.
+    - `(True, dict)`: valider Snapshot.
     """
     try:
         async with httpx.AsyncClient(timeout=2.0) as client:
             resp = await client.get(DOCLING_LIFECYCLE_URL)
-            if resp.status_code != 200:
-                return None
-            return resp.json()
+    except (httpx.ConnectError, httpx.TimeoutException, httpx.RequestError):
+        return False, None
     except Exception:
-        return None
+        return False, None
+    if resp.status_code != 200:
+        return True, None
+    try:
+        snap = resp.json()
+    except (ValueError, TypeError):
+        return True, None
+    if not isinstance(snap, dict):
+        return True, None
+    return True, snap
 
 
 async def _trigger_docling_proxy_start() -> tuple[int, dict]:
@@ -1383,43 +1517,54 @@ async def _drain_docling_for_stop(force: bool) -> JSONResponse | None:
 
     TRANSIENT = {"starting", "stopping"}
 
-    def _drain_done(snap: dict | None) -> bool:
-        if snap is None:
+    def _drain_done(reachable: bool, snap: dict | None) -> bool:
+        if not reachable:
             return True  # Fallback: Proxy unreachable -> nichts zu drainen
+        if snap is None:
+            return False
         if snap.get("active_requests", 0) != 0:
             return False
         return snap.get("state") not in TRANSIENT
 
-    first_snap = await _docling_lifecycle_snapshot()
-    if _drain_done(first_snap):
+    def _lifecycle_state(reachable: bool, snap: dict | None) -> str | None:
+        if snap is not None:
+            return snap.get("state")
+        return "lifecycle-unhealthy" if reachable else "lifecycle-unreachable"
+
+    first_reachable, first_snap = await _docling_lifecycle_snapshot()
+    if _drain_done(first_reachable, first_snap):
         return None
 
     _log.info(
         "Docling-Drain gestartet: active=%s state=%s",
         first_snap.get("active_requests") if first_snap else None,
-        first_snap.get("state") if first_snap else None,
+        _lifecycle_state(first_reachable, first_snap),
     )
     start = time.monotonic()
     deadline = start + DRAIN_DEADLINE_S
+    reachable = first_reachable
     snap = first_snap
     while time.monotonic() < deadline:
         await asyncio.sleep(DRAIN_POLL_INTERVAL_S)
-        snap = await _docling_lifecycle_snapshot()
-        if _drain_done(snap):
+        reachable, snap = await _docling_lifecycle_snapshot()
+        if _drain_done(reachable, snap):
             _log.info(
                 "Docling-Drain fertig nach %.1fs (active=%s, state=%s)",
                 time.monotonic() - start,
                 snap.get("active_requests") if snap else None,
-                snap.get("state") if snap else None,
+                _lifecycle_state(reachable, snap),
             )
             return None
 
-    final = snap if snap is not None else (await _docling_lifecycle_snapshot() or {})
+    if snap is None:
+        final_reachable, final_snap = await _docling_lifecycle_snapshot()
+        reachable, snap = final_reachable, final_snap
+    final_state = _lifecycle_state(reachable, snap)
     _log.warning(
         "Docling-Drain-Timeout nach %.1fs (active=%s, state=%s, force=%s)",
         time.monotonic() - start,
-        final.get("active_requests") if final else None,
-        final.get("state") if final else None,
+        snap.get("active_requests") if snap else None,
+        final_state,
         force,
     )
     if force:
@@ -1427,8 +1572,8 @@ async def _drain_docling_for_stop(force: bool) -> JSONResponse | None:
     return JSONResponse(
         {
             "error": "Aktive Docling-Konvertierungen — Drain-Deadline erreicht",
-            "active_requests": final.get("active_requests") if final else None,
-            "state": final.get("state") if final else None,
+            "active_requests": snap.get("active_requests") if snap else None,
+            "state": final_state,
             "drain_deadline_s": DRAIN_DEADLINE_S,
             "hint": "force=true im Body setzen um trotzdem zu stoppen",
         },
@@ -1524,16 +1669,16 @@ def _stderr_has(stderr: str, *needles: str) -> bool:
     return any(n in s for n in needles)
 
 
-def _json_systemctl_error(exc: BaseException, action: str) -> JSONResponse:
-    """Mappt systemctl-/Subprocess-Exceptions auf JSON-Fehler."""
+def _json_service_control_error(exc: BaseException, action: str) -> JSONResponse:
+    """Mappt Service-Control-/Subprocess-Exceptions auf JSON-Fehler."""
     if isinstance(exc, subprocess.TimeoutExpired):
         return JSONResponse(
-            {"error": f"{action}: systemctl-Timeout"},
+            {"error": f"{action}: service-control Timeout"},
             status_code=504,
         )
     if isinstance(exc, FileNotFoundError):
         return JSONResponse(
-            {"error": f"{action}: systemctl nicht verfuegbar"},
+            {"error": f"{action}: service-control nicht verfuegbar"},
             status_code=500,
         )
     if isinstance(exc, OSError):
@@ -1759,9 +1904,6 @@ async def stop_docling(body: dict | None = Body(default=None)):
 # Embedding-Service-Steuerung
 # =============================================
 
-EMBEDDING_SERVICE = "kiron-embeddings.service"
-
-
 @app.post("/api/embedding/start")
 async def start_embedding(body: dict | None = Body(default=None)):
     """Embedding-Service starten. Prozessstart ist lifecycle-only."""
@@ -1770,15 +1912,11 @@ async def start_embedding(body: dict | None = Body(default=None)):
     if reachable:
         return {"status": "started", "already": True, "health": data}
     try:
-        result = await _to_thread(
-            subprocess.run,
-            ["systemctl", "start", EMBEDDING_SERVICE],
-            capture_output=True, text=True, timeout=15,
-        )
+        result = await _run_service_control("start", EMBEDDING_SERVICE, timeout=15)
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
-        return _json_systemctl_error(e, "Start")
+        return _json_service_control_error(e, "Start")
     except Exception as e:
-        return _json_systemctl_error(e, "Start")
+        return _json_service_control_error(e, "Start")
     already = False
     if result.returncode != 0:
         if _stderr_has(result.stderr, "already active", "is already"):
@@ -1814,15 +1952,11 @@ async def stop_embedding(body: dict | None = Body(default=None)):
         if not op.allowed:
             return _gpu_gate_response(op.decision)
         try:
-            result = await _to_thread(
-                subprocess.run,
-                ["systemctl", "stop", EMBEDDING_SERVICE],
-                capture_output=True, text=True, timeout=15,
-            )
+            result = await _run_service_control("stop", EMBEDDING_SERVICE, timeout=15)
         except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
-            return _json_systemctl_error(e, "Stop")
+            return _json_service_control_error(e, "Stop")
         except Exception as e:
-            return _json_systemctl_error(e, "Stop")
+            return _json_service_control_error(e, "Stop")
         if result.returncode != 0:
             if _stderr_has(result.stderr, "not loaded", "inactive", "not found"):
                 op.clear_marker = True
@@ -1843,8 +1977,6 @@ async def stop_embedding(body: dict | None = Body(default=None)):
 # DeBERTa Cross-Encoder Service-Steuerung
 # =============================================
 
-DEBERTA_SERVICE = "kiron-deberta"
-
 
 @app.post("/api/deberta/start")
 async def start_deberta(body: dict | None = Body(default=None)):
@@ -1854,15 +1986,11 @@ async def start_deberta(body: dict | None = Body(default=None)):
     if reachable:
         return {"status": "started", "already": True, "health": data}
     try:
-        result = await _to_thread(
-            subprocess.run,
-            ["systemctl", "start", DEBERTA_SERVICE],
-            capture_output=True, text=True, timeout=15,
-        )
+        result = await _run_service_control("start", DEBERTA_SERVICE, timeout=15)
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
-        return _json_systemctl_error(e, "Start")
+        return _json_service_control_error(e, "Start")
     except Exception as e:
-        return _json_systemctl_error(e, "Start")
+        return _json_service_control_error(e, "Start")
     already = False
     if result.returncode != 0:
         if _stderr_has(result.stderr, "already active", "is already"):
@@ -1898,15 +2026,11 @@ async def stop_deberta(body: dict | None = Body(default=None)):
         if not op.allowed:
             return _gpu_gate_response(op.decision)
         try:
-            result = await _to_thread(
-                subprocess.run,
-                ["systemctl", "stop", DEBERTA_SERVICE],
-                capture_output=True, text=True, timeout=15,
-            )
+            result = await _run_service_control("stop", DEBERTA_SERVICE, timeout=15)
         except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
-            return _json_systemctl_error(e, "Stop")
+            return _json_service_control_error(e, "Stop")
         except Exception as e:
-            return _json_systemctl_error(e, "Stop")
+            return _json_service_control_error(e, "Stop")
         if result.returncode != 0:
             if _stderr_has(result.stderr, "not loaded", "inactive", "not found"):
                 op.clear_marker = True
@@ -1990,7 +2114,7 @@ async def unload_deberta_model(body: dict | None = Body(default=None)):
 # Wartungsmodus (Maintenance Mode)
 # =============================================
 
-MAINTENANCE_STATE_FILE = Path(__file__).resolve().parent.parent.parent / "data" / "maintenance_mode.json"
+MAINTENANCE_STATE_FILE = PROXY_DATA_DIR / "maintenance_mode.json"
 MAINTENANCE_PORTS = [
     {"port": 5001, "desc": "Docling"},
     {"port": 11434, "desc": "Ollama API"},
@@ -2033,9 +2157,11 @@ def _get_maintenance_state() -> bool:
 
 def _set_maintenance_state(active: bool):
     """Schreibt den Wartungsmodus-Status in die State-Datei (atomar)."""
+    MAINTENANCE_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     tmp = MAINTENANCE_STATE_FILE.with_suffix(".tmp")
     try:
         tmp.write_text(json.dumps({"active": active}))
+        os.chmod(tmp, 0o640)
         tmp.replace(MAINTENANCE_STATE_FILE)
     except OSError as e:
         import logging
@@ -2100,63 +2226,43 @@ async def _apply_iptables_rules(enable: bool) -> dict:
     """Setzt oder entfernt iptables-Regeln fuer den Wartungsmodus (idempotent)."""
     errors = []
 
-    async def _run(cmd: list):
-        try:
-            return await _to_thread(
-                subprocess.run, cmd,
-                capture_output=True, text=True, timeout=10,
-            )
-        except (FileNotFoundError, PermissionError, OSError, subprocess.TimeoutExpired) as e:
-            return subprocess.CompletedProcess(cmd, returncode=1, stdout="", stderr=str(e))
+    def _completed_error(proc: subprocess.CompletedProcess) -> str:
+        return (proc.stderr or proc.stdout or "").strip()
 
-    async def _exists(chain: str, args: list):
+    async def _exists(chain: str, port: int):
         # #561: Tri-State (present, absent, error). Plain bool hat Permission/Timeout/
         # ENOENT als 'absent' interpretiert, sodass der Disable-Loop ohne Fehlereintrag
         # abbrach und State=false geschrieben wurde, obwohl DROP-Regeln noch aktiv sein
-        # konnten. Absent wird nur bei expliziten iptables-Markern erkannt.
-        proc = await _run(["iptables", "-C", chain] + args)
+        # konnten. Absent wird nur bei expliziten Wrapper-Markern erkannt.
+        proc = await _run_firewall_helper("check", chain, port)
         if proc.returncode == 0:
             return ("present", "")
-        err = proc.stderr.strip()
-        if "Bad rule" in err or "matching rule exist" in err or "No chain" in err:
+        out = (proc.stdout or "").strip().lower()
+        if proc.returncode == _FIREWALL_ABSENT_EXIT or out == "absent":
             return ("absent", "")
-        return ("error", err or "iptables -C fehlgeschlagen ohne stderr")
+        err = _completed_error(proc)
+        return ("error", err or "Firewall-Check fehlgeschlagen ohne stderr")
 
     for entry in MAINTENANCE_PORTS:
         port = entry["port"]
-        rules = [
-            ("INPUT", [
-                "-p", "tcp", "--dport", str(port),
-                "!", "-i", "lo",
-                "-j", "DROP",
-                "-m", "comment", "--comment", "ollama-monitor-maintenance",
-            ]),
-            ("DOCKER-USER", [
-                "-p", "tcp", "--dport", str(port),
-                "-j", "DROP",
-                "-m", "comment", "--comment", "ollama-monitor-maintenance",
-            ]),
-        ]
-
-        for chain, args in rules:
+        for chain in ("INPUT", "DOCKER-USER"):
             if enable:
                 # Nur einfuegen wenn Regel noch nicht existiert (idempotent).
-                # Check-Fehler hier nicht separat sammeln: das nachfolgende -I scheitert
-                # mit demselben Fehler und wird unten erfasst.
-                state, _ = await _exists(chain, args)
+                state, check_err = await _exists(chain, port)
                 if state == "present":
                     continue
-                result = await _run(["iptables", "-I", chain] + args)
+                if state == "error":
+                    errors.append(f"{chain} port {port} (check): {check_err}")
+                    continue
+                result = await _run_firewall_helper("insert", chain, port)
                 if result.returncode != 0:
-                    if chain == "DOCKER-USER" and "No chain" in result.stderr:
-                        continue
-                    errors.append(f"{chain} port {port}: {result.stderr.strip()}")
+                    errors.append(f"{chain} port {port}: {_completed_error(result)}")
             else:
                 # Alle passenden Regeln entfernen (inkl. Duplikate aus fruheren Runs).
                 # #281: Fehler beim Deaktivieren muessen genauso gesammelt werden wie
                 # beim Aktivieren, sonst bleibt State=false aber Firewall hat noch Regeln.
                 for _ in range(20):  # Schutz vor Endlos-Loop
-                    state, exists_err = await _exists(chain, args)
+                    state, exists_err = await _exists(chain, port)
                     if state == "error":
                         # #561: Check-Fehler im Disable-Pfad MUESSEN errors fuellen,
                         # sonst greift der Schutz in toggle_maintenance nicht.
@@ -2166,19 +2272,17 @@ async def _apply_iptables_rules(enable: bool) -> dict:
                         break
                     if state == "absent":
                         break
-                    result = await _run(["iptables", "-D", chain] + args)
+                    result = await _run_firewall_helper("delete", chain, port)
                     if result.returncode != 0:
-                        if chain == "DOCKER-USER" and "No chain" in result.stderr:
-                            break
                         errors.append(
-                            f"{chain} port {port} (delete): {result.stderr.strip()}"
+                            f"{chain} port {port} (delete): {_completed_error(result)}"
                         )
                         break
                 else:
                     # #576: Loop-Limit ohne break erreicht — Regel kann immer noch
                     # da sein. Ohne diesen Check meldet toggle_maintenance Erfolg
                     # bei >20 Duplikaten und schreibt state=inactive.
-                    state, exists_err = await _exists(chain, args)
+                    state, exists_err = await _exists(chain, port)
                     if state == "present":
                         errors.append(
                             f"{chain} port {port} (delete): >20 Duplikate, Loop-Limit erreicht"
@@ -2275,328 +2379,6 @@ async def toggle_maintenance():
             _clear_maintenance_transition()
 
 
-@app.get("/api/models/available")
-async def get_available_models():
-    """Merged List: Registry-Modelle + lokale Modelle mit Source-Feld."""
-    global _registry_cache
-
-    now_wall = time.time()
-    now_monotonic = time.monotonic()
-    disk_cache = _load_registry_disk_cache()
-    registry_models = None
-
-    # 1. In-Memory-Cache pruefen (1 Stunde)
-    if (
-        _registry_cache["data"] is not None
-        and (now_monotonic - _registry_cache.get("monotonic_timestamp", 0.0)) < 3600
-    ):
-        registry_models = _registry_cache["data"]
-    else:
-        # 2. Disk-Cache pruefen (1 Stunde)
-        disk_reg = disk_cache.get("registry", {})
-        disk_data = disk_reg.get("data") if isinstance(disk_reg, dict) else None
-        disk_valid = _is_valid_registry_models(disk_data)
-        disk_age = now_wall - disk_reg.get("timestamp", 0)
-        if disk_valid and disk_age < 3600:
-            registry_models = disk_data
-            _registry_cache["data"] = registry_models
-            _registry_cache["timestamp"] = disk_reg["timestamp"]
-            # #954: Memory-TTL relativ zum Disk-Alter, sonst kann ein 30min
-            # alter Disk-Cache nach Restart effektiv 90min stale werden.
-            _registry_cache["monotonic_timestamp"] = now_monotonic - max(disk_age, 0.0)
-        else:
-            # 3. Von ollama.com fetchen
-            try:
-                async with httpx.AsyncClient(timeout=10) as client:
-                    resp = await client.get("https://ollama.com/api/tags")
-                    if resp.status_code != 200:
-                        raise httpx.HTTPStatusError(
-                            f"ollama.com lieferte HTTP {resp.status_code}",
-                            request=resp.request, response=resp,
-                        )
-                    registry_data = resp.json()
-                    if not isinstance(registry_data, dict) or "models" not in registry_data:
-                        raise ValueError("ollama.com /api/tags lieferte unerwartete Root-Shape")
-                    fetched = registry_data.get("models")
-                    if not _is_valid_registry_models(fetched):
-                        raise ValueError("ollama.com /api/tags models-Feld hat unerwartete Shape")
-                    registry_models = fetched
-                    # In-Memory + Disk aktualisieren
-                    _registry_cache["data"] = registry_models
-                    _registry_cache["timestamp"] = now_wall
-                    _registry_cache["monotonic_timestamp"] = now_monotonic
-                    await _update_registry_disk_cache(
-                        lambda c: c.__setitem__("registry", {"data": registry_models, "timestamp": now_wall})
-                    )
-            except Exception:
-                # 4. Disk-Cache als Fallback (auch abgelaufen). Nicht in den
-                # Memory-Cache uebernehmen: sonst wuerde die 1h-Frische-Pruefung
-                # erneute Live-Fetches blockieren, obwohl ollama.com wieder
-                # erreichbar sein koennte.
-                if disk_valid:
-                    registry_models = disk_data
-                else:
-                    registry_models = []
-
-    # Lokale Modelle abrufen (mit Details fuer family/parameter_size)
-    local_models_raw = []
-    try:
-        async with httpx.AsyncClient(base_url=OLLAMA_BASE_URL, timeout=5) as client:
-            tags_resp = await client.get("/api/tags")
-            if tags_resp.status_code == 200:
-                try:
-                    tags_data = tags_resp.json()
-                    if not isinstance(tags_data, dict):
-                        tags_data = {}
-                    models_field = tags_data.get("models", [])
-                    local_models_raw = models_field if isinstance(models_field, list) else []
-                except json.JSONDecodeError as exc:
-                    import logging
-                    logging.getLogger(__name__).warning("Ollama /api/tags JSON-Decode-Fehler: %s", exc)
-            else:
-                import logging
-                logging.getLogger(__name__).warning("Ollama /api/tags HTTP %d", tags_resp.status_code)
-    except httpx.RequestError as exc:
-        import logging
-        logging.getLogger(__name__).warning("Ollama /api/tags nicht erreichbar: %s", exc)
-
-    def _safe_size_bytes(v):
-        if isinstance(v, bool):
-            return 0
-        if isinstance(v, (int, float)):
-            return int(v) if v > 0 else 0
-        return 0
-
-    local_names = set()
-    local_canonical_to_entry = {}
-    local_base_names = {}
-    for m in local_models_raw:
-        if not isinstance(m, dict):
-            continue
-        name = m.get("name")
-        if not name or not isinstance(name, str):
-            continue
-        local_names.add(name)
-        canonical = _canonical_model_name(name)
-        local_canonical_to_entry[canonical] = m
-        base = name.split(":")[0]
-        local_base_names.setdefault(base, m)
-
-    # Registry-Modelle aufbauen
-    registry_canonical_names = set()
-    models = []
-    for m in registry_models if isinstance(registry_models, list) else []:
-        if not isinstance(m, dict):
-            continue
-        name = m.get("name", "")
-        if not isinstance(name, str):
-            name = ""
-        base = name.split(":")[0]
-        canonical = _canonical_model_name(name) if name else ""
-        if canonical:
-            registry_canonical_names.add(canonical)
-        size_bytes = _safe_size_bytes(m.get("size", 0))
-        size_gb = round(size_bytes / (1024 ** 3), 1) if size_bytes else None
-
-        # Exakter Match per canonical Name; sonst Base als Metadaten-Fallback
-        # (parameter_size kann zwischen Varianten abweichen, aber besser als nichts).
-        local_m = local_canonical_to_entry.get(canonical) if canonical else None
-        if local_m is None:
-            local_m = local_base_names.get(base)
-        local_details = local_m.get("details") if local_m else None
-        details = local_details if isinstance(local_details, dict) else {}
-
-        models.append({
-            "name": name,
-            "description": m.get("description", ""),
-            "size_gb": size_gb,
-            "installed": canonical in local_canonical_to_entry,
-            "source": "ollama",
-            "family": details.get("family", ""),
-            "parameter_size": details.get("parameter_size", ""),
-        })
-
-    # Lokale Modelle deren kanonischer Name NICHT in der Registry -> source "other"
-    seen_other_canonicals = set()
-    for m in local_models_raw:
-        if not isinstance(m, dict):
-            continue
-        name = m.get("name")
-        if not name or not isinstance(name, str):
-            continue
-        canonical = _canonical_model_name(name)
-        if canonical not in registry_canonical_names and canonical not in seen_other_canonicals:
-            seen_other_canonicals.add(canonical)
-            raw_details = m.get("details", {})
-            details = raw_details if isinstance(raw_details, dict) else {}
-            size_bytes = _safe_size_bytes(m.get("size", 0))
-            size_gb = round(size_bytes / (1024 ** 3), 1) if size_bytes else None
-            models.append({
-                "name": name,
-                "description": "",
-                "size_gb": size_gb,
-                "installed": True,
-                "source": "other",
-                "family": details.get("family", ""),
-                "parameter_size": details.get("parameter_size", ""),
-            })
-
-    return {"models": models}
-
-
-# Cache fuer Modell-Tags (pro Modellname, 1 Stunde)
-_tags_cache = {}
-_TAGS_CACHE_MAX = 1024
-# Request-Coalescing: gleichzeitige Cache-Misses fuer denselben base_name
-# teilen sich einen einzigen ollama.com-Fetch (sonst N parallele 5-MB-Buffer
-# + N httpx-Clients pro Tab-Reload).
-_tags_inflight: dict[str, asyncio.Future] = {}
-
-
-def _tags_cache_set(key: str, entry: dict) -> None:
-    """Insert + Eviction: abgelaufene Eintraege entfernen, bei Bedarf aelteste droppen."""
-    now_monotonic = time.monotonic()
-    for k in [
-        k for k, v in _tags_cache.items()
-        if (now_monotonic - v.get("monotonic_timestamp", 0.0)) >= 3600
-    ]:
-        _tags_cache.pop(k, None)
-    if len(_tags_cache) >= _TAGS_CACHE_MAX:
-        oldest = sorted(
-            _tags_cache.items(),
-            key=lambda kv: kv[1].get("monotonic_timestamp", 0.0),
-        )
-        for k, _ in oldest[: len(_tags_cache) - _TAGS_CACHE_MAX + 1]:
-            _tags_cache.pop(k, None)
-    cache_entry = dict(entry)
-    cache_entry["monotonic_timestamp"] = now_monotonic
-    _tags_cache[key] = cache_entry
-
-
-async def _fetch_registry_tags_uncached(base_name: str, disk_tags: dict, now_wall: float):
-    """Fetcht Tag-HTML von ollama.com, parst Tags und befuellt In-Memory- + Disk-Cache."""
-    # #579: httpx.timeout=15 deckt nur Einzel-Reads, kein Gesamt-Deadline —
-    # Slow-Drip-Upstream koennte die Schleife beliebig lange offenhalten.
-    # Wontfix: geplanter UI-Cache-Layer eliminiert die Live-Exposure; bis dahin
-    # bleibt der Disk-Cache-Fallback (unten) das Sicherheitsnetz.
-    try:
-        max_bytes = 5 * 1024 * 1024
-        async with httpx.AsyncClient(timeout=15) as client:
-            async with client.stream("GET", f"https://ollama.com/library/{base_name}") as resp:
-                if resp.status_code == 404:
-                    return JSONResponse({"error": "Modell nicht gefunden"}, status_code=404)
-                if resp.status_code != 200:
-                    # Transiente Upstream-Fehler (429, 5xx) -> raise fuer Cache-Fallback
-                    raise httpx.HTTPStatusError(
-                        f"ollama.com HTTP {resp.status_code}",
-                        request=resp.request, response=resp,
-                    )
-                buf = bytearray()
-                async for chunk in resp.aiter_bytes():
-                    buf.extend(chunk)
-                    if len(buf) > max_bytes:
-                        # Disk-Cache-Fallback + Negative-Cache verhindern, dass
-                        # jeder Folgeaufruf erneut bis 5 MB streamt, falls
-                        # Upstream dauerhaft uebergrosse Antworten liefert.
-                        if base_name in disk_tags and disk_tags[base_name].get("data"):
-                            _tags_cache_set(base_name, disk_tags[base_name])
-                            return disk_tags[base_name]["data"]
-                        error_response = {"tags": [], "model": base_name, "error": "Antwort zu gross"}
-                        _tags_cache_set(base_name, {"data": error_response, "timestamp": now_wall})
-                        return error_response
-                html = buf.decode("utf-8", errors="replace")
-    except Exception:
-        # Disk-Cache als Fallback (auch abgelaufen)
-        if base_name in disk_tags and disk_tags[base_name].get("data"):
-            _tags_cache_set(base_name, disk_tags[base_name])
-            return disk_tags[base_name]["data"]
-        return {"tags": [], "model": base_name, "error": "ollama.com nicht erreichbar"}
-
-    # Tags aus HTML parsen (mobile Bloecke enthalten alle Infos)
-    tag_pattern = re.compile(
-        r'href="/library/(' + re.escape(base_name) + r':[^"]+)"[^>]*class="sm:hidden[^"]*"[^>]*>(.*?)</a>',
-        re.DOTALL,
-    )
-
-    tags = []
-    seen = set()
-    for tag_name, block_html in tag_pattern.findall(html):
-        if tag_name in seen:
-            continue
-        seen.add(tag_name)
-
-        text = re.sub(r'<[^>]+>', ' ', block_html)
-        text = ' '.join(text.split())
-
-        size_m = re.search(r'(\d+(?:\.\d+)?\s*(?:MB|GB|TB))', text)
-        ctx_m = re.search(r'(\d+K)\s*context', text)
-        # Input-Typ aus dem Textblock
-        input_m = re.search(r'(?:Text(?:,\s*Image)?|Image)', text)
-
-        tags.append({
-            "tag": tag_name,
-            "size": size_m.group(1) if size_m else None,
-            "context": ctx_m.group(1) if ctx_m else None,
-            "input_type": input_m.group(0) if input_m else "Text",
-        })
-
-    result = {"tags": tags, "model": base_name}
-    _tags_cache_set(base_name, {"data": result, "timestamp": now_wall})
-
-    # Disk-Cache aktualisieren (unter Lock gegen Lost-Updates)
-    await _update_registry_disk_cache(
-        lambda c: c.setdefault("tags", {}).__setitem__(base_name, {"data": result, "timestamp": now_wall})
-    )
-
-    return result
-
-
-@app.get("/api/models/registry/{model_name:path}/tags")
-async def get_registry_model_tags(model_name: str):
-    """Verfuegbare Tags/Varianten eines Modells von ollama.com (cached, 1h)."""
-    # Base-Name extrahieren (z.B. "qwen3:8b" -> "qwen3", "gemma3" -> "gemma3")
-    base_name = model_name.split(":")[0]
-
-    # Path-Traversal verhindern: httpx normalisiert /library/../x -> /x
-    if not _validate_model_name(base_name) or any(seg in (".", "..") for seg in base_name.split("/")):
-        return JSONResponse({"error": "Ungueltiger Modellname"}, status_code=400)
-
-    now_wall = time.time()
-    now_monotonic = time.monotonic()
-
-    # 1. In-Memory-Cache pruefen
-    if (
-        base_name in _tags_cache
-        and (now_monotonic - _tags_cache[base_name].get("monotonic_timestamp", 0.0)) < 3600
-    ):
-        return _tags_cache[base_name]["data"]
-
-    # 2. Disk-Cache pruefen
-    disk_cache = _load_registry_disk_cache()
-    disk_tags = disk_cache.get("tags", {})
-    if base_name in disk_tags and disk_tags[base_name].get("data") and (now_wall - disk_tags[base_name].get("timestamp", 0)) < 3600:
-        _tags_cache_set(base_name, disk_tags[base_name])
-        return disk_tags[base_name]["data"]
-
-    # 3. Request-Coalescing: laeuft schon ein Fetch fuer denselben base_name,
-    # warten alle Aufrufer auf das eine Resultat (verhindert Cache-Stampede).
-    # Fetch laeuft als unabhaengige Task; shield isoliert sie von Cancel
-    # einzelner Caller (Tab-Reload-Race darf Wartende nicht mit abbrechen).
-    inflight = _tags_inflight.get(base_name)
-    if inflight is not None:
-        return await asyncio.shield(inflight)
-
-    async def _coalesced_fetch():
-        try:
-            return await _fetch_registry_tags_uncached(base_name, disk_tags, now_wall)
-        finally:
-            _tags_inflight.pop(base_name, None)
-
-    task = asyncio.ensure_future(_coalesced_fetch())
-    _tags_inflight[base_name] = task
-    return await asyncio.shield(task)
-
-
 # ============================================================
 # Benchmark API-Endpunkte
 # ============================================================
@@ -2657,9 +2439,11 @@ def _copy_benchmark_source_fields(
 
 def _save_benchmarks_cache(cache: dict) -> bool:
     """Benchmark-Cache auf Disk speichern (atomar). Gibt True bei Erfolg zurueck."""
+    BENCHMARKS_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
     tmp = BENCHMARKS_CACHE_FILE.with_suffix(BENCHMARKS_CACHE_FILE.suffix + ".tmp")
     try:
         tmp.write_text(json.dumps(cache, indent=2, ensure_ascii=False))
+        os.chmod(tmp, 0o640)
         tmp.replace(BENCHMARKS_CACHE_FILE)
         return True
     except OSError as e:
@@ -2893,8 +2677,8 @@ async def get_benchmarks():
 async def refresh_benchmarks():
     """Benchmark-Daten von externen APIs abrufen und Cache aktualisieren.
 
-    Sucht fuer jedes lokal installierte Modell und jeden Registry-Eintrag
-    nach Benchmark-Scores im Open LLM Leaderboard und EvalPlus.
+    Sucht fuer jedes lokal installierte Ollama-Modell nach
+    Benchmark-Scores im Open LLM Leaderboard und EvalPlus.
     """
     # Lock serialisiert load-modify-save gegen parallele Refreshes
     # (Doppelklick / paralleler API-Aufruf), die sonst Lost-Updates oder
@@ -2936,22 +2720,6 @@ async def _refresh_benchmarks_locked():
             continue
         if base not in model_bases or params:
             model_bases[base] = params
-
-    # Registry-Modelle hinzufuegen (Benchmarks auch fuer nicht-installierte)
-    registry_data = _registry_cache.get("data")
-    if not _is_valid_registry_models(registry_data):
-        disk_cache = await _to_thread(_load_registry_disk_cache)
-        disk_reg = disk_cache.get("registry", {})
-        disk_data = disk_reg.get("data") if isinstance(disk_reg, dict) else None
-        registry_data = disk_data if _is_valid_registry_models(disk_data) else None
-    if registry_data:
-        for m in registry_data:
-            if not isinstance(m, dict):
-                continue
-            name = m.get("name", "")
-            base = name.split(":")[0] if isinstance(name, str) else ""
-            if base and base not in model_bases:
-                model_bases[base] = None
 
     # Fuer jeden Basis-Namen Benchmarks parallel suchen (max 5 gleichzeitig)
     hf_searched = 0

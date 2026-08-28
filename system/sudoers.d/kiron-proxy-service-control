@@ -1,0 +1,4 @@
+# Installed by scripts/install-system-configs.sh.
+# The wrapper validates the verb/unit allowlist fail-closed.
+Cmnd_Alias KIRON_PROXY_SERVICE_CONTROL = /usr/local/sbin/kiron-service-control *
+kiron-proxy ALL=(root) NOPASSWD: KIRON_PROXY_SERVICE_CONTROL

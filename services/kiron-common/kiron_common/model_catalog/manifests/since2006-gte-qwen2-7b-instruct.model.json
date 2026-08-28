@@ -1,0 +1,129 @@
+{
+  "schema_version": 1,
+  "canonical_model_id": "since2006/gte-Qwen2-7B-instruct:Q4_K_M",
+  "aliases": [
+    "gte-qwen2-7b-instruct",
+    "since2006/gte-Qwen2-7B-instruct"
+  ],
+  "deployments": [
+    {
+      "id": "ollama-gte-qwen2-dense-v1.deployment",
+      "backend": {
+        "type": "ollama",
+        "parameters": {
+          "implementation": "ollama",
+          "implementation_revision": "0.18.0",
+          "model_name": "since2006/gte-Qwen2-7B-instruct:Q4_K_M"
+        }
+      },
+      "artifact": {
+        "type": "ollama",
+        "repository": null,
+        "revision": null,
+        "manifest_digest": "sha256:9df7ed75fb1b6adfa6c538e751352a9b27f13769c34f594cf10ae8f1ca650892",
+        "trust_remote_code": false,
+        "weights": [
+          {
+            "path": "model",
+            "sha256": "537509a18d9593e0022fbee0d5eda902dddba19ceaf1e8b446ff2d6f4201b6b9"
+          }
+        ],
+        "auxiliary": [],
+        "metadata": {}
+      },
+      "routes": [
+        {
+          "task": "embedding",
+          "endpoint": "/api/embed"
+        }
+      ],
+      "loader": {
+        "type": "ollama",
+        "parameters": {}
+      },
+      "metadata": {}
+    }
+  ],
+  "profiles": [
+    {
+      "id": "ollama-gte-qwen2-dense-v1",
+      "deployment_id": "ollama-gte-qwen2-dense-v1.deployment",
+      "task": "embedding",
+      "endpoint": "/api/embed",
+      "default_for_endpoint": true,
+      "metadata": {
+        "kind": "dense",
+        "dimensions": 3584,
+        "max_input_tokens": {
+          "unit": "tokenizer_tokens",
+          "counting": "after_server_formatting_including_special_tokens",
+          "truncation": "unknown",
+          "overflow": "unknown",
+          "by_role": {
+            "search_document": null,
+            "search_query": null
+          }
+        },
+        "output_normalized": null,
+        "similarity": "unknown",
+        "input_type": {
+          "supported": [
+            "search_document",
+            "search_query"
+          ],
+          "additional_task_roles": [],
+          "aliases": [],
+          "role_sensitive": null,
+          "required": false,
+          "default": null,
+          "missing_role_behavior": "unknown"
+        },
+        "formatting_owner": "server",
+        "pipeline": {
+          "tokenizer": {
+            "repository": null,
+            "revision": null
+          },
+          "formatting": {
+            "search_document": {
+              "template": null,
+              "parameters": {}
+            },
+            "search_query": {
+              "template": null,
+              "parameters": {}
+            }
+          },
+          "pooling": {
+            "method": "unknown",
+            "parameters": {}
+          },
+          "normalization": {
+            "method": "unknown",
+            "dtype": "unknown",
+            "scope": "unknown"
+          },
+          "parameters": {
+            "observed_context_length": 131072,
+            "observed_quantization": "Q4_K_M"
+          }
+        },
+        "verification": {
+          "status": "unverified",
+          "evidence": [
+            "local-ollama-manifest-sha256:9df7ed75fb1b6adfa6c538e751352a9b27f13769c34f594cf10ae8f1ca650892",
+            "local-ollama-model-blob-sha256:537509a18d9593e0022fbee0d5eda902dddba19ceaf1e8b446ff2d6f4201b6b9",
+            "ollama-api-version:0.18.0"
+          ],
+          "blocking_reasons": [
+            "api_show_advertises_completion_only",
+            "missing_embedding_pipeline_reference_witness",
+            "missing_exact_upstream_revision_and_conversion_provenance"
+          ]
+        }
+      }
+    }
+  ],
+  "request_defaults": [],
+  "metadata": {}
+}

@@ -8,15 +8,15 @@ JSON-Fehlervertrag (F126) fuer /api/docling/device|start|stop ab.
 """
 
 import asyncio
+import grp
 import json
 import os
 from pathlib import Path
+import pwd
 import subprocess
 import time
 import unittest
 from unittest import mock
-
-import httpx
 
 
 TEST_RUNTIME_DIR = Path(os.environ.get(
@@ -39,14 +39,11 @@ def _load_app():
     import app as _app  # noqa
     module = importlib.reload(_app)
     TEST_RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
-    for path in TEST_RUNTIME_DIR.glob("docling-vram-*.json"):
+    os.chmod(TEST_RUNTIME_DIR, 0o2770)
+    for path in TEST_RUNTIME_DIR.iterdir():
         try:
-            path.unlink()
-        except OSError:
-            pass
-    for path in TEST_RUNTIME_DIR.glob("gpu-service-loading.json"):
-        try:
-            path.unlink()
+            if path.is_file():
+                path.unlink()
         except OSError:
             pass
     module.vram_lease.RUNTIME_MARKER_DIR = TEST_RUNTIME_DIR
@@ -56,6 +53,11 @@ def _load_app():
         TEST_RUNTIME_DIR / "docling-vram-shutdown.json")
     module.vram_lease.GPU_SERVICE_LOADING_MARKER_PATH = (
         TEST_RUNTIME_DIR / "gpu-service-loading.json")
+    module.vram_lease.RUNTIME_MARKER_GROUP = grp.getgrgid(os.getgid()).gr_name
+    module.vram_lease.RUNTIME_MARKER_FILE_OWNER_NAMES = frozenset({
+        pwd.getpwuid(os.getuid()).pw_name,
+    })
+    module.vram_lease._runtime_marker_dir_owner_uid = lambda: os.getuid()
 
     async def inline_to_thread(func, /, *args, **kwargs):
         return func(*args, **kwargs)
@@ -90,6 +92,18 @@ def _async_sequence(values):
         except StopIteration:
             return last
     return _coro
+
+
+def _lifecycle_ok(snapshot):
+    return True, snapshot
+
+
+def _lifecycle_unreachable():
+    return False, None
+
+
+def _lifecycle_unhealthy():
+    return True, None
 
 
 class PortInspectionTests(unittest.TestCase):
@@ -145,11 +159,11 @@ class SetDoclingDeviceTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.app_mod = _load_app()
         # Drain-Helper patchen: sonst schlaegt jeder Testaufruf den 2s
-        # httpx-Timeout zum nicht laufenden Docling-Proxy zu Buche. None =
-        # Lifecycle-Endpoint unerreichbar -> Fallback "direkt stoppen".
+        # httpx-Timeout zum nicht laufenden Docling-Proxy zu Buche.
+        # `(False, None)` = Lifecycle-Endpoint unerreichbar -> direkt stoppen.
         patcher = mock.patch.object(
             self.app_mod, "_docling_lifecycle_snapshot",
-            new=_async_return(None))
+            new=_async_return(_lifecycle_unreachable()))
         patcher.start()
         self.addCleanup(patcher.stop)
         restart_patcher = mock.patch.object(
@@ -292,7 +306,7 @@ class StartStopControlTests(unittest.IsolatedAsyncioTestCase):
         self.app_mod = _load_app()
         patcher = mock.patch.object(
             self.app_mod, "_docling_lifecycle_snapshot",
-            new=_async_return(None))
+            new=_async_return(_lifecycle_unreachable()))
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -476,9 +490,9 @@ class DoclingDrainTests(unittest.IsolatedAsyncioTestCase):
         """
         lifecycle = mock.patch.object(
             self.app_mod, "_docling_lifecycle_snapshot",
-            new=_async_return(
+            new=_async_return(_lifecycle_ok(
                 {"state": "running", "active_requests": 0,
-                 "last_request_age_s": 1.0, "backend_failed": False}))
+                 "last_request_age_s": 1.0, "backend_failed": False})))
         lifecycle.start()
         self.addCleanup(lifecycle.stop)
 
@@ -514,10 +528,12 @@ class DoclingDrainTests(unittest.IsolatedAsyncioTestCase):
         lifecycle = mock.patch.object(
             self.app_mod, "_docling_lifecycle_snapshot",
             new=_async_sequence([
-                {"state": "running", "active_requests": 2,
-                 "last_request_age_s": 1.0, "backend_failed": False},
-                {"state": "running", "active_requests": 0,
-                 "last_request_age_s": 1.5, "backend_failed": False},
+                _lifecycle_ok({"state": "running", "active_requests": 2,
+                               "last_request_age_s": 1.0,
+                               "backend_failed": False}),
+                _lifecycle_ok({"state": "running", "active_requests": 0,
+                               "last_request_age_s": 1.5,
+                               "backend_failed": False}),
             ]))
         lifecycle.start()
         self.addCleanup(lifecycle.stop)
@@ -547,9 +563,9 @@ class DoclingDrainTests(unittest.IsolatedAsyncioTestCase):
         """Lifecycle liefert dauerhaft active=1 -> 409, KEIN docker stop."""
         lifecycle = mock.patch.object(
             self.app_mod, "_docling_lifecycle_snapshot",
-            new=_async_return(
+            new=_async_return(_lifecycle_ok(
                 {"state": "running", "active_requests": 1,
-                 "last_request_age_s": 1.0, "backend_failed": False}))
+                 "last_request_age_s": 1.0, "backend_failed": False})))
         lifecycle.start()
         self.addCleanup(lifecycle.stop)
 
@@ -573,9 +589,9 @@ class DoclingDrainTests(unittest.IsolatedAsyncioTestCase):
         """Lifecycle dauerhaft active=1, force=true -> Stop laeuft durch."""
         lifecycle = mock.patch.object(
             self.app_mod, "_docling_lifecycle_snapshot",
-            new=_async_return(
+            new=_async_return(_lifecycle_ok(
                 {"state": "running", "active_requests": 1,
-                 "last_request_age_s": 1.0, "backend_failed": False}))
+                 "last_request_age_s": 1.0, "backend_failed": False})))
         lifecycle.start()
         self.addCleanup(lifecycle.stop)
 
@@ -607,16 +623,7 @@ class DoclingDrainTests(unittest.IsolatedAsyncioTestCase):
                          "force=true soll docker create erreichen")
 
     async def test_drain_lifecycle_unreachable_fallback(self):
-        """Lifecycle-Endpoint wirft ConnectError -> kein Drain, Stop direkt."""
-        async def unreachable(*a, **kw):
-            raise httpx.ConnectError("refused", request=None)
-
-        lifecycle = mock.patch.object(
-            self.app_mod, "_docling_lifecycle_snapshot",
-            new=unreachable)
-        lifecycle.start()
-        self.addCleanup(lifecycle.stop)
-
+        """Lifecycle-Endpoint unerreichbar -> kein Drain, Stop direkt."""
         ports_json = json.dumps({
             "5001/tcp": [{"HostIp": "127.0.0.1", "HostPort": "5002"}],
         })
@@ -635,15 +642,37 @@ class DoclingDrainTests(unittest.IsolatedAsyncioTestCase):
             raise AssertionError(f"Unerwartete Docker-Command: {cmd}")
 
         # _docling_lifecycle_snapshot fangt Exceptions selbst ab und liefert
-        # None — hier simulieren wir den Wrapper direkt (snapshot returned
-        # None bei ConnectError).
+        # `(False, None)` — hier simulieren wir den Wrapper direkt.
         with mock.patch.object(
                 self.app_mod, "_docling_lifecycle_snapshot",
-                new=_async_return(None)):
+                new=_async_return(_lifecycle_unreachable())):
             with mock.patch.object(subprocess, "run", side_effect=fake_run):
                 resp = await self.app_mod.set_docling_device(
                     {"device": "cuda"})
         self.assertEqual(resp, {"status": "recreated", "device": "cuda"})
+
+    async def test_drain_lifecycle_unhealthy_times_out_without_force(self):
+        """Proxy antwortet, aber Lifecycle ist unbrauchbar -> 409 statt Stop."""
+        lifecycle = mock.patch.object(
+            self.app_mod, "_docling_lifecycle_snapshot",
+            new=_async_return(_lifecycle_unhealthy()))
+        lifecycle.start()
+        self.addCleanup(lifecycle.stop)
+
+        docker_calls = []
+
+        def fake_run(cmd, **kw):
+            docker_calls.append(cmd)
+            raise AssertionError(
+                f"docker darf vor 409 nicht aufgerufen werden: {cmd}")
+
+        with mock.patch.object(subprocess, "run", side_effect=fake_run):
+            resp = await self.app_mod.set_docling_device({"device": "cuda"})
+        self.assertEqual(resp.status_code, 409)
+        body = json.loads(bytes(resp.body).decode())
+        self.assertEqual(body["state"], "lifecycle-unhealthy")
+        self.assertIsNone(body["active_requests"])
+        self.assertEqual(docker_calls, [])
 
     async def test_drain_waits_on_starting_state(self):
         """Lifecycle liefert erst state=starting,active=0, dann running,0.
@@ -653,12 +682,15 @@ class DoclingDrainTests(unittest.IsolatedAsyncioTestCase):
         lifecycle = mock.patch.object(
             self.app_mod, "_docling_lifecycle_snapshot",
             new=_async_sequence([
-                {"state": "starting", "active_requests": 0,
-                 "last_request_age_s": None, "backend_failed": False},
-                {"state": "starting", "active_requests": 0,
-                 "last_request_age_s": None, "backend_failed": False},
-                {"state": "running", "active_requests": 0,
-                 "last_request_age_s": 1.0, "backend_failed": False},
+                _lifecycle_ok({"state": "starting", "active_requests": 0,
+                               "last_request_age_s": None,
+                               "backend_failed": False}),
+                _lifecycle_ok({"state": "starting", "active_requests": 0,
+                               "last_request_age_s": None,
+                               "backend_failed": False}),
+                _lifecycle_ok({"state": "running", "active_requests": 0,
+                               "last_request_age_s": 1.0,
+                               "backend_failed": False}),
             ]))
         lifecycle.start()
         self.addCleanup(lifecycle.stop)
@@ -697,9 +729,9 @@ class DoclingDrainTests(unittest.IsolatedAsyncioTestCase):
         """
         lifecycle = mock.patch.object(
             self.app_mod, "_docling_lifecycle_snapshot",
-            new=_async_return(
+            new=_async_return(_lifecycle_ok(
                 {"state": "stopping", "active_requests": 0,
-                 "last_request_age_s": None, "backend_failed": False}))
+                 "last_request_age_s": None, "backend_failed": False})))
         lifecycle.start()
         self.addCleanup(lifecycle.stop)
 
@@ -724,9 +756,9 @@ class DoclingDrainTests(unittest.IsolatedAsyncioTestCase):
         """
         lifecycle = mock.patch.object(
             self.app_mod, "_docling_lifecycle_snapshot",
-            new=_async_return(
+            new=_async_return(_lifecycle_ok(
                 {"state": "running", "active_requests": 0,
-                 "last_request_age_s": 1.0, "backend_failed": False}))
+                 "last_request_age_s": 1.0, "backend_failed": False})))
         lifecycle.start()
         self.addCleanup(lifecycle.stop)
 
@@ -770,9 +802,9 @@ class DoclingDrainTests(unittest.IsolatedAsyncioTestCase):
         # Lifecycle: immer active=0 — Drain exittet sofort
         lifecycle = mock.patch.object(
             self.app_mod, "_docling_lifecycle_snapshot",
-            new=_async_return(
+            new=_async_return(_lifecycle_ok(
                 {"state": "running", "active_requests": 0,
-                 "last_request_age_s": 1.0, "backend_failed": False}))
+                 "last_request_age_s": 1.0, "backend_failed": False})))
         lifecycle.start()
         self.addCleanup(lifecycle.stop)
 
@@ -816,9 +848,9 @@ class DoclingDrainTests(unittest.IsolatedAsyncioTestCase):
     async def test_stop_drain_skip_when_active_zero(self):
         lifecycle = mock.patch.object(
             self.app_mod, "_docling_lifecycle_snapshot",
-            new=_async_return(
+            new=_async_return(_lifecycle_ok(
                 {"state": "running", "active_requests": 0,
-                 "last_request_age_s": 1.0, "backend_failed": False}))
+                 "last_request_age_s": 1.0, "backend_failed": False})))
         lifecycle.start()
         self.addCleanup(lifecycle.stop)
 
@@ -830,10 +862,12 @@ class DoclingDrainTests(unittest.IsolatedAsyncioTestCase):
         lifecycle = mock.patch.object(
             self.app_mod, "_docling_lifecycle_snapshot",
             new=_async_sequence([
-                {"state": "running", "active_requests": 3,
-                 "last_request_age_s": 1.0, "backend_failed": False},
-                {"state": "running", "active_requests": 0,
-                 "last_request_age_s": 2.0, "backend_failed": False},
+                _lifecycle_ok({"state": "running", "active_requests": 3,
+                               "last_request_age_s": 1.0,
+                               "backend_failed": False}),
+                _lifecycle_ok({"state": "running", "active_requests": 0,
+                               "last_request_age_s": 2.0,
+                               "backend_failed": False}),
             ]))
         lifecycle.start()
         self.addCleanup(lifecycle.stop)
@@ -845,9 +879,9 @@ class DoclingDrainTests(unittest.IsolatedAsyncioTestCase):
     async def test_stop_drain_timeout_409_without_force(self):
         lifecycle = mock.patch.object(
             self.app_mod, "_docling_lifecycle_snapshot",
-            new=_async_return(
+            new=_async_return(_lifecycle_ok(
                 {"state": "running", "active_requests": 2,
-                 "last_request_age_s": 1.0, "backend_failed": False}))
+                 "last_request_age_s": 1.0, "backend_failed": False})))
         lifecycle.start()
         self.addCleanup(lifecycle.stop)
 
@@ -868,9 +902,9 @@ class DoclingDrainTests(unittest.IsolatedAsyncioTestCase):
     async def test_stop_drain_timeout_with_force_stops(self):
         lifecycle = mock.patch.object(
             self.app_mod, "_docling_lifecycle_snapshot",
-            new=_async_return(
+            new=_async_return(_lifecycle_ok(
                 {"state": "running", "active_requests": 1,
-                 "last_request_age_s": 1.0, "backend_failed": False}))
+                 "last_request_age_s": 1.0, "backend_failed": False})))
         lifecycle.start()
         self.addCleanup(lifecycle.stop)
 
@@ -888,11 +922,11 @@ class DoclingDrainTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(stop_calls), 1)
 
     async def test_stop_drain_lifecycle_unreachable(self):
-        """Lifecycle unerreichbar (snapshot=None) -> kein Drain, Stop direkt.
+        """Lifecycle unerreichbar -> kein Drain, Stop direkt.
         """
         lifecycle = mock.patch.object(
             self.app_mod, "_docling_lifecycle_snapshot",
-            new=_async_return(None))
+            new=_async_return(_lifecycle_unreachable()))
         lifecycle.start()
         self.addCleanup(lifecycle.stop)
 
@@ -900,12 +934,34 @@ class DoclingDrainTests(unittest.IsolatedAsyncioTestCase):
             resp = await self.app_mod.stop_docling({})
         self.assertEqual(resp, {"status": "stopped"})
 
+    async def test_stop_drain_lifecycle_unhealthy_409_without_force(self):
+        lifecycle = mock.patch.object(
+            self.app_mod, "_docling_lifecycle_snapshot",
+            new=_async_return(_lifecycle_unhealthy()))
+        lifecycle.start()
+        self.addCleanup(lifecycle.stop)
+
+        docker_calls = []
+
+        def fake_run(cmd, **kw):
+            docker_calls.append(cmd)
+            raise AssertionError(
+                f"docker darf vor 409 nicht aufgerufen werden: {cmd}")
+
+        with mock.patch.object(subprocess, "run", side_effect=fake_run):
+            resp = await self.app_mod.stop_docling({})
+        self.assertEqual(resp.status_code, 409)
+        body = json.loads(bytes(resp.body).decode())
+        self.assertEqual(body["state"], "lifecycle-unhealthy")
+        self.assertIsNone(body["active_requests"])
+        self.assertEqual(docker_calls, [])
+
     async def test_stop_drain_body_none_compatible(self):
         """Dashboard-JS ruft /api/docling/stop ohne Body — Direktaufruf mit
         body=None darf nicht 422 werfen und muss default {} behandeln."""
         lifecycle = mock.patch.object(
             self.app_mod, "_docling_lifecycle_snapshot",
-            new=_async_return(None))
+            new=_async_return(_lifecycle_unreachable()))
         lifecycle.start()
         self.addCleanup(lifecycle.stop)
 

@@ -493,8 +493,8 @@ async def daily_retention(
 
 
 async def main():
-    # Datenverzeichnis
-    data_dir = Path(__file__).resolve().parent.parent.parent / "data"
+    data_root = Path(__file__).resolve().parent.parent.parent / "data"
+    data_dir = data_root / "kiron-proxy"
     try:
         data_dir.mkdir(parents=True, exist_ok=True)
     except OSError as e:
@@ -503,7 +503,7 @@ async def main():
         raise SystemExit(1)
 
     # DB-Config laden
-    db_config_path = data_dir / "db_config.json"
+    db_config_path = data_root / "db_config.json"
     if not db_config_path.exists():
         print(f"FEHLER: DB-Config nicht gefunden: {db_config_path}")
         print("Bitte db_config.json mit MariaDB-Credentials anlegen.")

@@ -14,6 +14,7 @@
     <link rel="stylesheet" href="/static/css/charts.css">
     <link rel="stylesheet" href="/static/css/models.css">
     <link rel="stylesheet" href="/static/css/apikeys.css">
+    <link rel="stylesheet" href="/static/css/config.css">
     <link rel="stylesheet" href="/static/ui_core/css/table.css">
 </head>
 <body>
@@ -62,11 +63,9 @@
         <a class="tab" href="/history" data-tab="history">Verlauf</a>
         <a class="tab" href="/models" data-tab="models">Modelle</a>
         <a class="tab" href="/apikeys" data-tab="apikeys">API Keys</a>
+        <a class="tab" href="/config" data-tab="config">Konfiguration</a>
         <a class="tab" href="/selftest" data-tab="selftest">Selbsttest</a>
     </nav>
-
-    <!-- Sub-Tabs (dynamisch je Haupt-Tab befuellt) -->
-    <nav class="tabs sub-tabs is-hidden" id="subTabs"></nav>
 
     <!-- Filter Bar -->
     <div class="filter-bar" id="filterBar" style="display: none;"></div>
@@ -90,6 +89,7 @@
     <script src="/static/js/tab_history.js"></script>
     <script src="/static/js/tab_models.js"></script>
     <script src="/static/js/tab_apikeys.js"></script>
+    <script src="/static/js/tab_config.js"></script>
     <script src="/static/js/tab_selftest.js"></script>
     <script src="/static/js/app_core.js"></script>
 </body>

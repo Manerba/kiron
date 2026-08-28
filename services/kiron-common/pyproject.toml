@@ -11,6 +11,16 @@ dependencies = [
     "httpx>=0.27",
 ]
 
+[project.scripts]
+kiron-model-registry = "kiron_common.local_model_registry.cli:main"
+
+[tool.setuptools]
+include-package-data = true
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["kiron_common*"]
+
+[tool.setuptools.package-data]
+"kiron_common.model_catalog" = ["*.json"]
+"kiron_common.model_catalog.manifests" = ["*.model.json"]

@@ -60,7 +60,8 @@ class _ProxyHttpClient:
         pass
 
 
-async def _pass_vram_lease(body, path, model):
+async def _pass_vram_lease(body, path, model, routing_view):
+    del path, model, routing_view
     return body, proxy.vram_lease.LeaseOutcome.PASS
 
 

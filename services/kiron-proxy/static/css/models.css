@@ -1,355 +1,326 @@
-/* ========================================
-   Models Tab - Styling
-   ======================================== */
+/* Models: unified Catalog and local registration view. */
 
 .models-page {
-    max-width: 1500px;
-    margin: 0 auto;
-}
-
-/* Pull Section */
-
-/* Manual Pull Input */
-.models-pull-manual {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    margin-bottom: 12px;
-}
-
-.models-pull-input {
-    width: 280px;
-}
-
-.models-search-link {
-    font-size: 13px;
-    color: var(--accent-primary);
-    text-decoration: none;
-    white-space: nowrap;
-    transition: color var(--transition-speed);
-}
-
-.models-search-link:hover {
-    color: var(--accent-hover);
-    text-decoration: underline;
-}
-
-/* Pull Progress */
-.models-pull-progress {
-    margin-top: 12px;
-    margin-bottom: 12px;
-}
-
-.models-progress-bar-container {
     width: 100%;
-    height: 20px;
-    background-color: var(--bg-primary);
-    border: 1px solid var(--border-color);
-    border-radius: 10px;
-    overflow: hidden;
 }
 
-.models-progress-bar {
-    height: 100%;
-    background: linear-gradient(90deg, var(--accent-primary), var(--color-bullish));
-    border-radius: 10px;
-    transition: width 0.3s ease;
-    width: 0%;
+.models-control-group {
+    margin-left: auto;
 }
 
-.models-progress-text {
-    font-size: 12px;
-    color: var(--text-secondary);
-    margin-top: 4px;
-}
-
-/* Registry Section */
-.models-registry-section {
-    margin-top: 8px;
-}
-
-/* Models Table */
-.models-table {
+.models-table-viewport {
     width: 100%;
-    border-collapse: collapse;
-    font-size: 13px;
+    overflow-x: auto;
 }
 
-.models-table th {
-    text-align: left;
-    padding: 10px 12px;
-    background-color: var(--bg-secondary);
-    border-bottom: 2px solid var(--border-color);
-    color: var(--text-secondary);
-    font-weight: 600;
-    font-size: 12px;
-    white-space: nowrap;
+#modelsTableContainer {
+    min-width: 1420px;
 }
 
-.models-table td {
-    padding: 10px 12px;
-    border-bottom: 1px solid var(--border-color);
-    vertical-align: middle;
-}
-
-.models-table tr:hover {
-    background-color: var(--bg-row-hover);
-}
-
-/* Registry Table specifics */
-.models-registry-table th {
-    background-color: transparent;
-}
-
-/* Expand Button */
-.models-expand-cell {
-    width: 30px;
-    text-align: center;
-}
-
-.models-expand-btn {
-    background: none;
-    border: 1px solid var(--border-color);
-    border-radius: 4px;
-    cursor: pointer;
-    font-size: 10px;
-    color: var(--text-secondary);
-    width: 24px;
-    height: 24px;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    transition: all var(--transition-speed);
-}
-
-.models-expand-btn:hover {
-    background-color: var(--bg-row-hover);
+.models-name {
     color: var(--text-primary);
+    font-weight: 400;
 }
 
-.models-expand-btn.expanded {
-    color: var(--accent-primary);
-    border-color: var(--accent-primary);
+.models-page .table-row-detail {
+    white-space: normal;
 }
 
-/* Tags Row (expanded) */
-.models-tags-row {
-    background-color: var(--bg-primary) !important;
-}
-
-.models-tags-row:hover {
-    background-color: var(--bg-primary) !important;
-}
-
-.models-tags-container {
-    padding: 4px 0 8px 30px;
-}
-
-/* Tags Sub-Table */
-.models-tags-table {
-    width: 100%;
-    border-collapse: collapse;
-    font-size: 12px;
-}
-
-.models-tags-table th {
-    text-align: left;
-    padding: 6px 10px;
-    color: var(--text-secondary);
-    font-weight: 600;
-    font-size: 11px;
-    border-bottom: 1px solid var(--border-color);
-    background-color: transparent;
-}
-
-.models-tags-table td {
-    padding: 6px 10px;
-    border-bottom: 1px solid var(--border-color);
-}
-
-.models-tags-table tr:last-child td {
-    border-bottom: none;
-}
-
-.models-tags-table tr:hover {
-    background-color: var(--bg-row-hover);
-}
-
-/* Status Badges */
 .models-badge {
     display: inline-block;
-    padding: 3px 10px;
-    border-radius: 12px;
+    padding: 2px 8px;
+    border-radius: 4px;
     font-size: 11px;
-    font-weight: 600;
+    font-weight: 500;
     white-space: nowrap;
 }
 
-.models-badge-vram {
-    background-color: rgba(40, 167, 69, 0.15);
-    color: var(--color-bullish);
-    border: 1px solid var(--color-bullish);
+.models-badge + .models-badge {
+    margin-left: 4px;
 }
 
-.models-badge-ram {
-    background-color: rgba(52, 152, 219, 0.15);
+.models-badge-catalog {
     color: var(--accent-primary);
     border: 1px solid var(--accent-primary);
+    background: rgba(52, 152, 219, 0.12);
 }
 
-.models-badge-mixed {
-    background-color: rgba(253, 126, 20, 0.15);
-    color: var(--color-unclear);
-    border: 1px solid var(--color-unclear);
+.models-badge-local {
+    color: var(--color-bullish);
+    border: 1px solid var(--color-bullish);
+    background: rgba(40, 167, 69, 0.12);
+}
+
+.models-badge-loaded {
+    color: var(--color-bullish);
+    border: 1px solid var(--color-bullish);
+    background: rgba(40, 167, 69, 0.12);
 }
 
 .models-badge-unloaded {
-    background-color: rgba(108, 117, 125, 0.1);
     color: var(--color-neutral);
     border: 1px solid var(--color-neutral);
+    background: rgba(108, 117, 125, 0.1);
 }
 
-.models-badge-ollama {
-    background-color: rgba(52, 152, 219, 0.15);
-    color: var(--accent-primary);
-    border: 1px solid var(--accent-primary);
+.models-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 5px;
+    white-space: nowrap;
 }
 
-.models-badge-other {
-    background-color: rgba(108, 117, 125, 0.1);
-    color: var(--color-neutral);
-    border: 1px solid var(--color-neutral);
+.models-actions .action-btn {
+    padding: 2px 6px;
+    min-width: 28px;
 }
 
-/* Embedding-Service aktiv (blau) */
-.models-badge-embed-active {
-    background-color: rgba(52, 152, 219, 0.15);
-    color: var(--accent-primary);
-    border: 1px solid var(--accent-primary);
+.models-detail-content {
+    display: grid;
+    gap: 16px;
 }
 
-/* Modelltyp-Badges */
-.models-badge-type-llm {
-    background-color: rgba(52, 152, 219, 0.12);
-    color: #5b9bd5;
-    border: 1px solid rgba(52, 152, 219, 0.4);
+.models-detail-block {
+    padding: 14px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
 }
 
-.models-badge-type-vlm {
-    background-color: rgba(155, 89, 182, 0.12);
-    color: #b07cc6;
-    border: 1px solid rgba(155, 89, 182, 0.4);
+.models-detail-block h3 {
+    margin: 0 0 12px;
+    color: var(--text-primary);
+    font-size: 14px;
+    font-weight: 600;
 }
 
-.models-badge-type-embed {
-    background-color: rgba(0, 188, 180, 0.12);
-    color: #2ec4b6;
-    border: 1px solid rgba(0, 188, 180, 0.4);
+.models-detail-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+    gap: 12px 20px;
+    margin: 0;
 }
 
-/* Embedding-Service Button */
+.models-detail-item {
+    min-width: 0;
+}
+
+.models-detail-item dt,
+.models-detail-subheading {
+    color: var(--text-secondary);
+    font-size: 11px;
+    text-transform: uppercase;
+}
+
+.models-detail-item dd {
+    margin: 3px 0 0;
+    color: var(--text-primary);
+    font-size: 13px;
+    overflow-wrap: anywhere;
+}
+
+.models-detail-code {
+    font-family: 'Consolas', 'Monaco', monospace;
+    font-size: 12px;
+}
+
+.models-detail-subheading {
+    margin: 16px 0 8px;
+}
+
+.models-context-note {
+    margin: 12px 0 0;
+    color: var(--text-secondary);
+    font-size: 12px;
+}
+
+.models-detail-empty {
+    margin: 0;
+    color: var(--text-secondary);
+    font-size: 12px;
+}
+
+.models-token-limits {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 10px;
+}
+
+.models-token-profile {
+    padding: 10px 12px;
+    background: var(--bg-primary);
+    border: 1px solid var(--border-color);
+    border-radius: 5px;
+}
+
+.models-token-profile h4 {
+    margin: 0 0 8px;
+    font-family: 'Consolas', 'Monaco', monospace;
+    font-size: 12px;
+    font-weight: 500;
+    overflow-wrap: anywhere;
+}
+
+.models-token-roles {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px 16px;
+}
+
+.models-token-role {
+    display: inline-flex;
+    gap: 6px;
+    align-items: baseline;
+}
+
+.models-token-role span {
+    color: var(--text-secondary);
+    font-size: 12px;
+}
+
+.models-token-role strong {
+    font-size: 13px;
+    font-variant-numeric: tabular-nums;
+}
+
+.models-token-profile p {
+    margin: 8px 0 0;
+    color: var(--text-secondary);
+    font-family: 'Consolas', 'Monaco', monospace;
+    font-size: 11px;
+    overflow-wrap: anywhere;
+}
+
 .models-btn-embed {
-    background-color: rgba(0, 188, 180, 0.1);
     color: #2ec4b6;
     border-color: rgba(0, 188, 180, 0.4);
+    background-color: rgba(0, 188, 180, 0.1);
 }
 
 .models-btn-embed:hover {
     background-color: rgba(0, 188, 180, 0.25);
 }
 
-/* Context & Expires Info */
-.models-ctx,
-.models-expires {
-    font-size: 11px;
-    color: var(--text-secondary);
-    margin-top: 3px;
-}
-
-/* Memory Bar */
-.models-mem-bar-wrapper {
-    min-width: 120px;
-}
-
-.models-mem-bar {
+.models-registration-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 1000;
     display: flex;
-    height: 14px;
-    border-radius: 7px;
-    overflow: hidden;
-    background-color: var(--bg-primary);
+    align-items: center;
+    justify-content: center;
+    box-sizing: border-box;
+    padding: 16px;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    background: rgba(0, 0, 0, 0.58);
+}
+
+.models-registration-overlay[hidden] {
+    display: none;
+}
+
+.models-registration-dialog {
+    width: min(520px, calc(100vw - 32px));
+    max-height: calc(100vh - 32px);
+    overflow-y: auto;
+    padding: 0;
+    color: var(--text-primary);
+    background: var(--bg-content);
     border: 1px solid var(--border-color);
+    border-radius: var(--border-radius);
+    box-shadow: var(--shadow-lg);
 }
 
-.models-mem-vram {
-    background-color: var(--color-bullish);
-    height: 100%;
-    transition: width 0.3s;
+.models-registration-dialog form {
+    display: grid;
+    gap: 9px;
+    padding: 20px;
 }
 
-.models-mem-ram {
-    background-color: var(--accent-primary);
-    height: 100%;
-    transition: width 0.3s;
-}
-
-.models-mem-labels {
+.models-dialog-header {
     display: flex;
-    gap: 8px;
-    margin-top: 2px;
-    font-size: 10px;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
 }
 
-.models-mem-label-vram {
-    color: var(--color-bullish);
+.models-dialog-header h2 {
+    margin: 0;
+    font-size: 20px;
 }
 
-.models-mem-label-ram {
-    color: var(--accent-primary);
+.models-dialog-close {
+    width: 34px;
+    height: 34px;
+    color: var(--text-secondary);
+    background: transparent;
+    border: 0;
+    border-radius: var(--border-radius);
+    cursor: pointer;
+    font-size: 25px;
+    line-height: 1;
 }
 
-/* Benchmark Columns */
-.models-bench-col {
-    text-align: right;
-    font-variant-numeric: tabular-nums;
-    white-space: nowrap;
-    min-width: 55px;
+.models-dialog-close:hover,
+.models-dialog-close:focus-visible {
+    color: var(--text-primary);
+    background: var(--bg-row-hover);
+    outline: none;
+    box-shadow: var(--shadow-focus);
 }
 
-/* Load Split-Button Group */
-.models-load-group {
+.models-registration-dialog label {
+    font-weight: 600;
+}
+
+.models-registration-dialog input,
+.models-registration-dialog select {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 9px 10px;
+    color: var(--text-primary);
+    background: var(--bg-primary);
+    border: 1px solid var(--border-color);
+    border-radius: var(--border-radius);
+}
+
+.models-registration-dialog input:focus-visible,
+.models-registration-dialog select:focus-visible {
+    outline: none;
+    border-color: var(--accent-primary);
+    box-shadow: var(--shadow-focus);
+}
+
+.models-loader-field {
+    display: grid;
+    gap: 9px;
+}
+
+.models-loader-field[hidden] {
+    display: none;
+}
+
+.models-registration-error {
+    min-height: 20px;
+    margin: 2px 0 0;
+    color: var(--color-bearish);
+    overflow-wrap: anywhere;
+}
+
+.models-dialog-actions {
     display: flex;
-    gap: 4px;
-}
-
-/* Actions */
-.models-actions {
-    white-space: nowrap;
-    display: flex;
-    gap: 6px;
     justify-content: flex-end;
+    gap: 8px;
+    margin-top: 4px;
 }
 
-/* Responsive */
 @media (max-width: 900px) {
-    .models-pull-manual {
-        flex-direction: column;
-        align-items: stretch;
+    .models-actions {
+        flex-wrap: wrap;
     }
 
-    .models-pull-input {
-        width: 100%;
-    }
-
-    .models-table {
-        font-size: 12px;
-    }
-
-    .models-table th,
-    .models-table td {
-        padding: 8px 6px;
-    }
-
-    .models-tags-container {
-        padding-left: 8px;
+    .models-detail-grid,
+    .models-token-limits {
+        grid-template-columns: 1fr;
     }
 }

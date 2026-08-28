@@ -1,0 +1,248 @@
+{
+  "schema_version": 1,
+  "canonical_model_id": "bge-m3:latest",
+  "aliases": [
+    "bge-m3"
+  ],
+  "deployments": [
+    {
+      "id": "kiron-bge-m3-dense-v1.deployment",
+      "backend": {
+        "type": "kiron_embeddings",
+        "parameters": {
+          "implementation": "sentence-transformers",
+          "implementation_revision": "5.6.0",
+          "model_name": "bge-m3"
+        }
+      },
+      "artifact": {
+        "type": "huggingface",
+        "repository": "BAAI/bge-m3",
+        "revision": "5617a9f61b028005a4858fdac845db406aefb181",
+        "manifest_digest": null,
+        "trust_remote_code": false,
+        "weights": [
+          {
+            "path": "pytorch_model.bin",
+            "sha256": "b5e0ce3470abf5ef3831aa1bd5553b486803e83251590ab7ff35a117cf6aad38"
+          }
+        ],
+        "auxiliary": [],
+        "metadata": {}
+      },
+      "routes": [
+        {
+          "task": "embedding",
+          "endpoint": "/api/embed"
+        }
+      ],
+      "loader": {
+        "type": "sentence_transformers",
+        "parameters": {
+          "additional_role_template": null
+        }
+      },
+      "metadata": {
+        "discovery": {
+          "family": "xlm-roberta",
+          "format": "safetensors",
+          "parameter_size": "568M",
+          "precision": null,
+          "size": 1136000000
+        }
+      }
+    },
+    {
+      "id": "ollama-bge-m3-dense-v1.deployment",
+      "backend": {
+        "type": "ollama",
+        "parameters": {
+          "implementation": "ollama",
+          "implementation_revision": "0.18.0",
+          "model_name": "bge-m3:latest"
+        }
+      },
+      "artifact": {
+        "type": "ollama",
+        "repository": null,
+        "revision": null,
+        "manifest_digest": "sha256:7907646426070047a77226ac3e684fbbe8410524f7b4a74d02837e43f2146bab",
+        "trust_remote_code": false,
+        "weights": [
+          {
+            "path": "model",
+            "sha256": "daec91ffb5dd0c27411bd71f29932917c49cf529a641d0168496c3a501e3062c"
+          }
+        ],
+        "auxiliary": [],
+        "metadata": {}
+      },
+      "routes": [
+        {
+          "task": "embedding",
+          "endpoint": "/api/embed"
+        }
+      ],
+      "loader": {
+        "type": "ollama",
+        "parameters": {}
+      },
+      "metadata": {}
+    }
+  ],
+  "profiles": [
+    {
+      "id": "kiron-bge-m3-dense-v1",
+      "deployment_id": "kiron-bge-m3-dense-v1.deployment",
+      "task": "embedding",
+      "endpoint": "/api/embed",
+      "default_for_endpoint": true,
+      "metadata": {
+        "kind": "dense",
+        "dimensions": 1024,
+        "max_input_tokens": {
+          "unit": "tokenizer_tokens",
+          "counting": "after_server_formatting_including_special_tokens",
+          "truncation": "right",
+          "overflow": "truncate",
+          "by_role": {
+            "search_document": 8192,
+            "search_query": 8192
+          }
+        },
+        "output_normalized": true,
+        "similarity": "cosine",
+        "input_type": {
+          "supported": [
+            "search_document",
+            "search_query"
+          ],
+          "additional_task_roles": [],
+          "aliases": [],
+          "role_sensitive": false,
+          "required": false,
+          "default": null,
+          "missing_role_behavior": "no_op"
+        },
+        "formatting_owner": "server",
+        "pipeline": {
+          "tokenizer": {
+            "repository": "BAAI/bge-m3",
+            "revision": "5617a9f61b028005a4858fdac845db406aefb181"
+          },
+          "formatting": {
+            "search_document": {
+              "template": "{text}",
+              "parameters": {}
+            },
+            "search_query": {
+              "template": "{text}",
+              "parameters": {}
+            }
+          },
+          "pooling": {
+            "method": "cls",
+            "parameters": {
+              "pooling_mode_cls_token": true
+            }
+          },
+          "normalization": {
+            "method": "l2",
+            "dtype": "float32",
+            "scope": "vector"
+          },
+          "parameters": {}
+        },
+        "verification": {
+          "status": "verified",
+          "evidence": [
+            "hf-readme:BAAI/bge-m3@5617a9f61b028005a4858fdac845db406aefb181",
+            "local-weight-sha256:b5e0ce3470abf5ef3831aa1bd5553b486803e83251590ab7ff35a117cf6aad38",
+            "runtime-pipeline:kiron-embeddings-role-independent-cls-fp32-l2"
+          ],
+          "blocking_reasons": []
+        }
+      }
+    },
+    {
+      "id": "ollama-bge-m3-dense-v1",
+      "deployment_id": "ollama-bge-m3-dense-v1.deployment",
+      "task": "embedding",
+      "endpoint": "/api/embed",
+      "default_for_endpoint": false,
+      "metadata": {
+        "kind": "dense",
+        "dimensions": 1024,
+        "max_input_tokens": {
+          "unit": "tokenizer_tokens",
+          "counting": "after_server_formatting_including_special_tokens",
+          "truncation": "unknown",
+          "overflow": "unknown",
+          "by_role": {
+            "search_document": null,
+            "search_query": null
+          }
+        },
+        "output_normalized": null,
+        "similarity": "unknown",
+        "input_type": {
+          "supported": [
+            "search_document",
+            "search_query"
+          ],
+          "additional_task_roles": [],
+          "aliases": [],
+          "role_sensitive": null,
+          "required": false,
+          "default": null,
+          "missing_role_behavior": "unknown"
+        },
+        "formatting_owner": "server",
+        "pipeline": {
+          "tokenizer": {
+            "repository": null,
+            "revision": null
+          },
+          "formatting": {
+            "search_document": {
+              "template": null,
+              "parameters": {}
+            },
+            "search_query": {
+              "template": null,
+              "parameters": {}
+            }
+          },
+          "pooling": {
+            "method": "unknown",
+            "parameters": {
+              "observed_gguf_pooling_type": 2
+            }
+          },
+          "normalization": {
+            "method": "unknown",
+            "dtype": "unknown",
+            "scope": "unknown"
+          },
+          "parameters": {
+            "observed_context_length": 8192
+          }
+        },
+        "verification": {
+          "status": "unverified",
+          "evidence": [
+            "local-ollama-manifest-sha256:7907646426070047a77226ac3e684fbbe8410524f7b4a74d02837e43f2146bab",
+            "local-ollama-model-blob-sha256:daec91ffb5dd0c27411bd71f29932917c49cf529a641d0168496c3a501e3062c",
+            "ollama-api-version:0.18.0"
+          ],
+          "blocking_reasons": [
+            "missing_exact_upstream_revision_and_conversion_provenance",
+            "missing_role_pooling_normalization_reference_witness"
+          ]
+        }
+      }
+    }
+  ],
+  "request_defaults": [],
+  "metadata": {}
+}

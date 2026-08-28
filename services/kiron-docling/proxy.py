@@ -15,13 +15,17 @@ Single-Worker uvicorn-Annahme: die State-Maschine lebt per-Prozess.
 import asyncio
 from dataclasses import dataclass
 import enum
+import errno
 import fcntl
+import grp
 import json
 import logging
 import os
+import pwd
 import re
 import stat
 import subprocess
+import sys
 import time
 import uuid
 from pathlib import Path
@@ -49,6 +53,8 @@ KIRON_ACTIVE_REQUESTS_URL = os.environ.get(
     "KIRON_ACTIVE_REQUESTS_URL",
     "http://127.0.0.1:8505/api/requests/active",
 )
+KIRON_DASHBOARD_USER = os.environ.get("KIRON_DASHBOARD_USER", "admin")
+KIRON_DASHBOARD_PASSWORD = os.environ.get("KIRON_DASHBOARD_PASSWORD", "admin")
 LISTEN_PORT = 5001
 IDLE_TIMEOUT_S = 3600          # 60 Minuten Warmhaltephase
 HEALTH_CHECK_TIMEOUT_S = 180   # Max. Wartezeit beim Starten (Cold-Start)
@@ -71,7 +77,14 @@ START_COOLDOWN_DURATION_S: float = 600.0
 # docling braucht ~7 GiB aktiv. Bei 12 GiB GPU bleiben ~4.5 GiB
 # als kumulatives Keep-Budget fuer alle Ollama-Modelle zusammen.
 VRAM_BUDGET_BYTES = int(4.5 * 1024**3)
-RUNTIME_MARKER_DIR = Path(os.environ.get("KIRON_RUNTIME_DIR", "/run/kiron"))
+RUNTIME_MARKER_DIR = Path(os.environ.get("KIRON_RUNTIME_DIR", "/run/kiron/vram"))
+RUNTIME_MARKER_GROUP = "kiron-runtime"
+RUNTIME_MARKER_FILE_OWNER_NAMES: frozenset[str] = frozenset({
+    "kiron-proxy",
+    "kiron-docling",
+})
+RUNTIME_MARKER_DIR_MODE = 0o2770
+RUNTIME_MARKER_FILE_MODE = 0o660
 STARTUP_MARKER_PATH = RUNTIME_MARKER_DIR / "docling-vram-startup.json"
 SHUTDOWN_MARKER_PATH = RUNTIME_MARKER_DIR / "docling-vram-shutdown.json"
 GPU_SERVICE_LOADING_MARKER_PATH = RUNTIME_MARKER_DIR / "gpu-service-loading.json"
@@ -114,10 +127,18 @@ _GPU_INFLIGHT_PATHS: frozenset[str] = frozenset({
     "/api/score",
     "/v1/chat/completions",
 })
+JOURNAL_CRIT = 2
+JOURNAL_ERR = 3
+JOURNAL_WARNING = 4
 TASK_MAX_AGE_S: float = 4 * 3600.0
 
 
 SlotToken = int
+
+
+def _journal_log(priority: int, message: str) -> None:
+    """Schreibt mit systemd-kompatiblem Syslog-Priority-Prefix nach stderr."""
+    print(f"<{priority}>{message}", file=sys.stderr, flush=True)
 
 
 class VramGateError(RuntimeError):
@@ -191,13 +212,13 @@ def _is_running() -> bool:
         )
         return r.stdout.strip() == "true"
     except subprocess.TimeoutExpired:
-        print("  WARNUNG: docker inspect Timeout")
+        _journal_log(JOURNAL_WARNING, "docker inspect Timeout")
         return False
     except (FileNotFoundError, OSError) as e:
-        print(f"  WARNUNG: docker inspect nicht ausfuehrbar: {e}")
+        _journal_log(JOURNAL_WARNING, f"docker inspect nicht ausfuehrbar: {e}")
         return False
     except Exception as e:
-        print(f"  WARNUNG: docker inspect unerwarteter Fehler: {e}")
+        _journal_log(JOURNAL_WARNING, f"docker inspect unerwarteter Fehler: {e}")
         return False
 
 
@@ -210,22 +231,34 @@ def _has_expected_image() -> bool:
         )
         if r.returncode != 0:
             stderr = (r.stderr or "").strip()[:200]
-            print(f"  WARNUNG: Docker-Image-Inspect exit {r.returncode}: {stderr}")
+            _journal_log(
+                JOURNAL_WARNING,
+                f"Docker-Image-Inspect exit {r.returncode}: {stderr}",
+            )
             return False
         image = (r.stdout or "").strip()
         if image == EXPECTED_CONTAINER_IMAGE:
             return True
-        print("  WARNUNG: Docling-Container-Image unerwartet: "
-              f"{image!r} != {EXPECTED_CONTAINER_IMAGE!r}")
+        _journal_log(
+            JOURNAL_WARNING,
+            "Docling-Container-Image unerwartet: "
+            f"{image!r} != {EXPECTED_CONTAINER_IMAGE!r}",
+        )
         return False
     except subprocess.TimeoutExpired:
-        print("  WARNUNG: Docker-Image-Inspect Timeout")
+        _journal_log(JOURNAL_WARNING, "Docker-Image-Inspect Timeout")
         return False
     except (FileNotFoundError, OSError) as e:
-        print(f"  WARNUNG: Docker-Image-Inspect nicht ausfuehrbar: {e}")
+        _journal_log(
+            JOURNAL_WARNING,
+            f"Docker-Image-Inspect nicht ausfuehrbar: {e}",
+        )
         return False
     except Exception as e:
-        print(f"  WARNUNG: Docker-Image-Inspect unerwarteter Fehler: {e}")
+        _journal_log(
+            JOURNAL_WARNING,
+            f"Docker-Image-Inspect unerwarteter Fehler: {e}",
+        )
         return False
 
 
@@ -244,23 +277,34 @@ def _has_expected_port_binding() -> bool:
         )
         if r.returncode != 0:
             stderr = (r.stderr or "").strip()[:200]
-            print(f"  WARNUNG: Docker-PortBindings-Inspect exit "
-                  f"{r.returncode}: {stderr}")
+            _journal_log(
+                JOURNAL_WARNING,
+                f"Docker-PortBindings-Inspect exit {r.returncode}: {stderr}",
+            )
             return False
         try:
             bindings = json.loads((r.stdout or "").strip() or "{}")
         except json.JSONDecodeError as e:
-            print(f"  WARNUNG: Docker-PortBindings-Inspect JSON-Fehler: {e}")
+            _journal_log(
+                JOURNAL_WARNING,
+                f"Docker-PortBindings-Inspect JSON-Fehler: {e}",
+            )
             return False
         if not isinstance(bindings, dict):
-            print(f"  WARNUNG: Docker-PortBindings-Inspect "
-                  f"unerwarteter Typ: {type(bindings).__name__}")
+            _journal_log(
+                JOURNAL_WARNING,
+                "Docker-PortBindings-Inspect "
+                f"unerwarteter Typ: {type(bindings).__name__}",
+            )
             return False
         binding_list = bindings.get(EXPECTED_CONTAINER_PORT_SPEC)
         if not isinstance(binding_list, list) or not binding_list:
-            print(f"  WARNUNG: Docling-Container-PortBinding fehlt: "
-                  f"{EXPECTED_CONTAINER_PORT_SPEC} -> "
-                  f"{EXPECTED_HOST_BIND_IP}:{EXPECTED_HOST_BIND_PORT}")
+            _journal_log(
+                JOURNAL_WARNING,
+                "Docling-Container-PortBinding fehlt: "
+                f"{EXPECTED_CONTAINER_PORT_SPEC} -> "
+                f"{EXPECTED_HOST_BIND_IP}:{EXPECTED_HOST_BIND_PORT}",
+            )
             return False
         for entry in binding_list:
             if not isinstance(entry, dict):
@@ -270,20 +314,27 @@ def _has_expected_port_binding() -> bool:
             if (host_ip == EXPECTED_HOST_BIND_IP
                     and str(host_port) == EXPECTED_HOST_BIND_PORT):
                 return True
-        print(f"  WARNUNG: Docling-Container-PortBinding unerwartet: "
-              f"{binding_list!r} != "
-              f"{EXPECTED_HOST_BIND_IP}:{EXPECTED_HOST_BIND_PORT}")
+        _journal_log(
+            JOURNAL_WARNING,
+            "Docling-Container-PortBinding unerwartet: "
+            f"{binding_list!r} != "
+            f"{EXPECTED_HOST_BIND_IP}:{EXPECTED_HOST_BIND_PORT}",
+        )
         return False
     except subprocess.TimeoutExpired:
-        print("  WARNUNG: Docker-PortBindings-Inspect Timeout")
+        _journal_log(JOURNAL_WARNING, "Docker-PortBindings-Inspect Timeout")
         return False
     except (FileNotFoundError, OSError) as e:
-        print(f"  WARNUNG: Docker-PortBindings-Inspect "
-              f"nicht ausfuehrbar: {e}")
+        _journal_log(
+            JOURNAL_WARNING,
+            f"Docker-PortBindings-Inspect nicht ausfuehrbar: {e}",
+        )
         return False
     except Exception as e:
-        print(f"  WARNUNG: Docker-PortBindings-Inspect "
-              f"unerwarteter Fehler: {e}")
+        _journal_log(
+            JOURNAL_WARNING,
+            f"Docker-PortBindings-Inspect unerwarteter Fehler: {e}",
+        )
         return False
 
 
@@ -313,23 +364,141 @@ def _is_running_for_dirty() -> bool:
                 return True
             if out == "false":
                 return False
-            print(f"  WARNUNG: Dirty-Inspect unerwartete Ausgabe: {out!r}")
+            _journal_log(
+                JOURNAL_WARNING,
+                f"Dirty-Inspect unerwartete Ausgabe: {out!r}",
+            )
             return True
         stderr = (r.stderr or "").strip().lower()
         if "no such object" in stderr:
             return False
-        print(f"  WARNUNG: Dirty-Inspect exit {r.returncode}: "
-              f"{stderr[:200]}")
+        _journal_log(
+            JOURNAL_WARNING,
+            f"Dirty-Inspect exit {r.returncode}: {stderr[:200]}",
+        )
         return True
     except subprocess.TimeoutExpired:
-        print("  WARNUNG: Dirty-Inspect Timeout")
+        _journal_log(JOURNAL_WARNING, "Dirty-Inspect Timeout")
         return True
     except (FileNotFoundError, OSError) as e:
-        print(f"  WARNUNG: Dirty-Inspect nicht ausfuehrbar: {e}")
+        _journal_log(JOURNAL_WARNING, f"Dirty-Inspect nicht ausfuehrbar: {e}")
         return True
     except Exception as e:
-        print(f"  WARNUNG: Dirty-Inspect unerwarteter Fehler: {e}")
+        _journal_log(
+            JOURNAL_WARNING,
+            f"Dirty-Inspect unerwarteter Fehler: {e}",
+        )
         return True
+
+
+def _runtime_marker_group_gid() -> int | None:
+    try:
+        return grp.getgrnam(RUNTIME_MARKER_GROUP).gr_gid
+    except KeyError:
+        return None
+
+
+def _runtime_marker_file_owner_uids() -> frozenset[int]:
+    uids: set[int] = set()
+    for name in RUNTIME_MARKER_FILE_OWNER_NAMES:
+        try:
+            uids.add(pwd.getpwnam(name).pw_uid)
+        except KeyError:
+            continue
+    return frozenset(uids)
+
+
+def _runtime_marker_dir_owner_uid() -> int:
+    return 0
+
+
+def _stat_is_safe_runtime_file(st: os.stat_result) -> tuple[bool, str]:
+    if not stat.S_ISREG(st.st_mode):
+        return False, "not_regular"
+    if st.st_uid not in _runtime_marker_file_owner_uids():
+        return False, "file_owner_not_allowed"
+    runtime_gid = _runtime_marker_group_gid()
+    if runtime_gid is None:
+        return False, "runtime_group_missing"
+    if st.st_gid != runtime_gid:
+        return False, "file_group_not_runtime"
+    if st.st_mode & stat.S_IRWXO:
+        return False, "file_world_bits"
+    if (st.st_mode & 0o777) != RUNTIME_MARKER_FILE_MODE:
+        return False, "file_mode_not_0660"
+    return True, "ok"
+
+
+def _fd_is_safe_runtime_file(fd: int) -> tuple[bool, str]:
+    return _stat_is_safe_runtime_file(os.fstat(fd))
+
+
+def _runtime_file_identity(
+    st: os.stat_result,
+) -> tuple[int, int, int, int, int, int, int, int]:
+    mtime_ns = getattr(st, "st_mtime_ns", int(st.st_mtime * 1_000_000_000))
+    ctime_ns = getattr(st, "st_ctime_ns", int(st.st_ctime * 1_000_000_000))
+    return (
+        st.st_dev,
+        st.st_ino,
+        st.st_mode,
+        st.st_uid,
+        st.st_gid,
+        st.st_size,
+        mtime_ns,
+        ctime_ns,
+    )
+
+
+def _open_existing_runtime_file(
+    path: Path,
+    flags: int,
+) -> tuple[int | None, str, os.stat_result | None]:
+    parent_ok, parent_reason = _path_is_safe_runtime_dir(path.parent)
+    if not parent_ok:
+        return None, parent_reason, None
+    open_flags = flags | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, open_flags)
+    except FileNotFoundError:
+        return None, "missing", None
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            return None, "symlink", None
+        return None, f"open_failed:{exc}", None
+    try:
+        st = os.fstat(fd)
+        ok, reason = _stat_is_safe_runtime_file(st)
+        if not ok:
+            os.close(fd)
+            return None, reason, st
+        return fd, "ok", st
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def _path_is_safe_runtime_dir(path: Path) -> tuple[bool, str]:
+    try:
+        st = os.lstat(path)
+    except OSError as exc:
+        return False, f"parent_stat_failed:{exc}"
+    if stat.S_ISLNK(st.st_mode):
+        return False, "parent_symlink"
+    if not stat.S_ISDIR(st.st_mode):
+        return False, "parent_not_directory"
+    if st.st_uid != _runtime_marker_dir_owner_uid():
+        return False, "parent_owner_not_root"
+    runtime_gid = _runtime_marker_group_gid()
+    if runtime_gid is None:
+        return False, "runtime_group_missing"
+    if st.st_gid != runtime_gid:
+        return False, "parent_group_not_runtime"
+    if st.st_mode & stat.S_IRWXO:
+        return False, "parent_world_bits"
+    if (st.st_mode & 0o7777) != RUNTIME_MARKER_DIR_MODE:
+        return False, "parent_mode_not_2770"
+    return True, "ok"
 
 
 def _path_is_safe_regular_file(path: Path) -> tuple[bool, str, os.stat_result | None]:
@@ -343,40 +512,44 @@ def _path_is_safe_regular_file(path: Path) -> tuple[bool, str, os.stat_result | 
         return False, "symlink", st
     if not stat.S_ISREG(st.st_mode):
         return False, "not_regular", st
-    if st.st_uid != 0:
-        return False, "file_not_root_owned", st
-    if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
-        return False, "file_group_or_world_writable", st
-    try:
-        pst = os.stat(path.parent)
-    except OSError as exc:
-        return False, f"parent_stat_failed:{exc}", st
-    if pst.st_uid != 0:
-        return False, "parent_not_root_owned", st
-    if pst.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
-        return False, "parent_group_or_world_writable", st
-    return True, "ok", st
+    parent_ok, parent_reason = _path_is_safe_runtime_dir(path.parent)
+    if not parent_ok:
+        return False, parent_reason, st
+    ok, reason = _stat_is_safe_runtime_file(st)
+    return ok, reason, st
 
 
-def _marker_payload(path: Path) -> tuple[dict | None, bool]:
-    ok, reason, _ = _path_is_safe_regular_file(path)
-    if not ok:
+def _marker_payload_with_stat(
+    path: Path,
+) -> tuple[dict | None, bool, os.stat_result | None]:
+    fd, reason, st = _open_existing_runtime_file(path, os.O_RDONLY)
+    if fd is None:
         if reason == "missing":
-            return None, False
-        print(f"  WARNUNG: VRAM-Marker {path} unsafe: {reason}")
-        return None, True
+            return None, False, None
+        _journal_log(JOURNAL_WARNING, f"VRAM-Marker {path} unsafe: {reason}")
+        return None, True, st
     try:
-        with path.open("r", encoding="utf-8") as fh:
+        with os.fdopen(fd, "r", encoding="utf-8") as fh:
+            fd = None
             data = json.load(fh)
     except (OSError, json.JSONDecodeError) as exc:
-        print(f"  WARNUNG: VRAM-Marker {path} korrupt ({exc}) — wird ueberschrieben")
-        return None, False
+        _journal_log(
+            JOURNAL_WARNING,
+            f"VRAM-Marker {path} korrupt ({exc}) — wird ueberschrieben",
+        )
+        return None, False, st
+    finally:
+        if fd is not None:
+            os.close(fd)
     if not isinstance(data, dict):
-        print(f"  WARNUNG: VRAM-Marker {path} korrupt (non-dict) — wird ueberschrieben")
-        return None, False
+        _journal_log(
+            JOURNAL_WARNING,
+            f"VRAM-Marker {path} korrupt (non-dict) — wird ueberschrieben",
+        )
+        return None, False, st
     deadline = data.get("deadline_monotonic")
     if isinstance(deadline, (int, float)) and not isinstance(deadline, bool):
-        return data, time.monotonic() < float(deadline)
+        return data, time.monotonic() < float(deadline), st
     created_wall = data.get("created_wall")
     ttl = data.get("ttl_s")
     if (
@@ -385,9 +558,20 @@ def _marker_payload(path: Path) -> tuple[dict | None, bool]:
         and isinstance(ttl, (int, float))
         and not isinstance(ttl, bool)
     ):
-        return data, time.time() < float(created_wall) + max(0.0, min(float(ttl), MARKER_TTL_S))
-    print(f"  WARNUNG: VRAM-Marker {path} ohne valide TTL-Felder — wird ueberschrieben")
-    return None, False
+        active = time.time() < (
+            float(created_wall) + max(0.0, min(float(ttl), MARKER_TTL_S))
+        )
+        return data, active, st
+    _journal_log(
+        JOURNAL_WARNING,
+        f"VRAM-Marker {path} ohne valide TTL-Felder — wird ueberschrieben",
+    )
+    return None, False, st
+
+
+def _marker_payload(path: Path) -> tuple[dict | None, bool]:
+    data, active, _ = _marker_payload_with_stat(path)
+    return data, active
 
 
 def _marker_active(path: Path) -> bool:
@@ -407,12 +591,61 @@ def _marker_lock_path(path: Path) -> Path:
     return path.with_name(f".{path.name}.lock")
 
 
+def _open_marker_lock(path: Path) -> int:
+    lock_path = _marker_lock_path(path)
+    lock_path.parent.mkdir(
+        parents=True,
+        mode=RUNTIME_MARKER_DIR_MODE,
+        exist_ok=True,
+    )
+    parent_ok, parent_reason = _path_is_safe_runtime_dir(lock_path.parent)
+    if not parent_ok:
+        raise VramGateError(
+            f"VRAM-Lock-Verzeichnis {lock_path.parent} unsafe: {parent_reason}"
+        )
+    flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+    created = False
+    for _ in range(2):
+        try:
+            lock_fd = os.open(
+                lock_path,
+                flags | os.O_CREAT | os.O_EXCL,
+                RUNTIME_MARKER_FILE_MODE,
+            )
+            created = True
+            break
+        except FileExistsError:
+            try:
+                lock_fd = os.open(lock_path, flags)
+                break
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                raise VramGateError(
+                    f"VRAM-Lock {lock_path} unsafe: {exc}"
+                ) from exc
+        except OSError as exc:
+            raise VramGateError(f"VRAM-Lock {lock_path} unsafe: {exc}") from exc
+    else:
+        raise VramGateError(f"VRAM-Lock {lock_path} unstable")
+    try:
+        if created:
+            os.fchmod(lock_fd, RUNTIME_MARKER_FILE_MODE)
+        ok, reason = _fd_is_safe_runtime_file(lock_fd)
+        if not ok:
+            raise VramGateError(f"VRAM-Lock {lock_path} unsafe: {reason}")
+    except Exception:
+        os.close(lock_fd)
+        raise
+    return lock_fd
+
+
 def _write_vram_marker(
     kind: str = "startup", ttl_s: float = MARKER_TTL_S, token: str | None = None,
 ) -> str:
     token = token or uuid.uuid4().hex
     path = _marker_path(kind)
-    path.parent.mkdir(parents=True, mode=0o755, exist_ok=True)
+    path.parent.mkdir(parents=True, mode=RUNTIME_MARKER_DIR_MODE, exist_ok=True)
     payload = {
         "token": token,
         "kind": kind,
@@ -421,7 +654,7 @@ def _write_vram_marker(
         "deadline_monotonic": time.monotonic() + ttl_s,
         "ttl_s": ttl_s,
     }
-    lock_fd = os.open(_marker_lock_path(path), os.O_WRONLY | os.O_CREAT, 0o600)
+    lock_fd = _open_marker_lock(path)
     try:
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
         current, active = _marker_payload(path)
@@ -430,18 +663,30 @@ def _write_vram_marker(
             if not isinstance(current_token, str) or current_token != token:
                 raise VramGateError(f"aktiver fremder {kind}-Marker")
         tmp = path.with_name(f".{path.name}.{token}.tmp")
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        fd: int | None = os.open(
+            tmp,
+            (
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_NOFOLLOW", 0)
+            ),
+            RUNTIME_MARKER_FILE_MODE,
+        )
         try:
+            os.fchmod(fd, RUNTIME_MARKER_FILE_MODE)
+            ok, reason = _fd_is_safe_runtime_file(fd)
+            if not ok:
+                raise VramGateError(f"VRAM-Marker {tmp} unsafe: {reason}")
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fd = None
                 json.dump(payload, fh, separators=(",", ":"))
                 fh.flush()
                 os.fsync(fh.fileno())
             os.replace(tmp, path)
-            try:
-                os.chmod(path, 0o600)
-            except OSError:
-                pass
         except Exception:
+            if fd is not None:
+                os.close(fd)
             try:
                 os.unlink(tmp)
             except OSError:
@@ -459,13 +704,33 @@ def _clear_vram_marker(kind: str = "startup", token: str | None = None) -> None:
     if token is None:
         return
     path = _marker_path(kind)
-    path.parent.mkdir(parents=True, mode=0o755, exist_ok=True)
-    lock_fd = os.open(_marker_lock_path(path), os.O_WRONLY | os.O_CREAT, 0o600)
+    path.parent.mkdir(parents=True, mode=RUNTIME_MARKER_DIR_MODE, exist_ok=True)
+    lock_fd = _open_marker_lock(path)
     try:
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
-        data, _ = _marker_payload(path)
+        data, active, marker_st = _marker_payload_with_stat(path)
+        if data is None and active:
+            return
         if data is not None and data.get("token") != token:
             return
+        if marker_st is not None:
+            try:
+                current_st = os.lstat(path)
+            except OSError:
+                return
+            if _runtime_file_identity(current_st) != _runtime_file_identity(marker_st):
+                _journal_log(
+                    JOURNAL_WARNING,
+                    f"VRAM-Marker {path} changed before clear",
+                )
+                return
+            ok, reason = _stat_is_safe_runtime_file(current_st)
+            if not ok:
+                _journal_log(
+                    JOURNAL_WARNING,
+                    f"VRAM-Marker {path} unsafe before clear: {reason}",
+                )
+                return
         try:
             path.unlink()
         except OSError:
@@ -644,8 +909,11 @@ def _gc_tasks_locked(now: float) -> None:
         entry = _tasks.pop(task_id, None)
         if entry is not None and not entry.terminal:
             age = now - entry.last_poll_monotonic
-            print("  WARNUNG: #564 Task GC-Evict trotz non-terminal "
-                  f"task_id={task_id} stale_age={age:.0f}s")
+            _journal_log(
+                JOURNAL_WARNING,
+                "#564 Task GC-Evict trotz non-terminal "
+                f"task_id={task_id} stale_age={age:.0f}s",
+            )
 
 
 async def _register_task_from_response(path: str, body_bytes: bytes, token: SlotToken | None = None) -> None:
@@ -841,7 +1109,10 @@ async def _drain_inflight_gpu_requests(guard=None) -> None:
             async with httpx.AsyncClient(
                 timeout=GPU_INFLIGHT_DRAIN_HTTP_TIMEOUT_S,
             ) as c:
-                resp = await c.get(KIRON_ACTIVE_REQUESTS_URL)
+                resp = await c.get(
+                    KIRON_ACTIVE_REQUESTS_URL,
+                    auth=(KIRON_DASHBOARD_USER, KIRON_DASHBOARD_PASSWORD),
+                )
             if resp.status_code != 200:
                 raise VramGateError(
                     "GPU-In-Flight Drain nicht verfuegbar: "
@@ -936,7 +1207,10 @@ async def _dirty_retry_loop() -> None:
         try:
             still = await _to_thread(_is_running_for_dirty)
         except Exception as e:
-            print(f"  WARNUNG: Dirty-Retry-Inspect Exception: {e}")
+            _journal_log(
+                JOURNAL_WARNING,
+                f"Dirty-Retry-Inspect Exception: {e}",
+            )
             still = True
         if not still:
             async with _state_lock:
@@ -948,15 +1222,21 @@ async def _dirty_retry_loop() -> None:
         try:
             stop_ok = await _run_stop_once()
         except Exception as e:
-            print(f"  WARNUNG: Dirty-Retry-Stop Exception: {e}")
+            _journal_log(
+                JOURNAL_WARNING,
+                f"Dirty-Retry-Stop Exception: {e}",
+            )
             stop_ok = False
         await _finalize_stop(stop_ok)
         async with _state_lock:
             if _state != State.STOPPED_DIRTY:
                 return
         if attempts >= _DIRTY_RETRY_MAX_ATTEMPTS:
-            print(f"  WARNUNG: Dirty-Retry MAX ({_DIRTY_RETRY_MAX_ATTEMPTS}) "
-                  f"erreicht — manueller Eingriff noetig")
+            _journal_log(
+                JOURNAL_CRIT,
+                f"Dirty-Retry MAX ({_DIRTY_RETRY_MAX_ATTEMPTS}) erreicht "
+                "— manueller Eingriff noetig",
+            )
             return
 
 
@@ -1079,13 +1359,22 @@ def _start() -> bool:
     laeuft (F66). Das deckt out-of-band Starts ueber /api/docling/start ab.
     """
     if not _has_expected_image():
-        print("  FEHLER: Docling-Container-Image konnte nicht validiert werden")
+        _journal_log(
+            JOURNAL_CRIT,
+            "Docling-Container-Image konnte nicht validiert werden",
+        )
         return False
     if not _remediate_restart_policy():
-        print("  FEHLER: unsichere RestartPolicy konnte nicht remediated werden")
+        _journal_log(
+            JOURNAL_CRIT,
+            "unsichere RestartPolicy konnte nicht remediated werden",
+        )
         return False
     if not _has_expected_port_binding():
-        print("  FEHLER: Docling-Container-PortBinding konnte nicht validiert werden")
+        _journal_log(
+            JOURNAL_CRIT,
+            "Docling-Container-PortBinding konnte nicht validiert werden",
+        )
         return False
     try:
         subprocess.run(
@@ -1098,7 +1387,7 @@ def _start() -> bool:
         if _is_running():
             print("  Hinweis: Container lief bereits (out-of-band start)")
             return True
-        print(f"  FEHLER: docker start fehlgeschlagen: {stderr}")
+        _journal_log(JOURNAL_ERR, f"docker start fehlgeschlagen: {stderr}")
         return False
     except subprocess.TimeoutExpired:
         # Daemon kann Start nach gekilltem CLI-Prozess noch vollenden —
@@ -1114,10 +1403,10 @@ def _start() -> bool:
             if time.monotonic() >= deadline:
                 break
             time.sleep(0.5)
-        print("  FEHLER: docker start Timeout")
+        _journal_log(JOURNAL_ERR, "docker start Timeout")
         return False
     except (FileNotFoundError, OSError) as e:
-        print(f"  FEHLER: docker start nicht ausfuehrbar: {e}")
+        _journal_log(JOURNAL_ERR, f"docker start nicht ausfuehrbar: {e}")
         return False
 
 
@@ -1129,14 +1418,17 @@ def _stop() -> bool:
         )
         if r.returncode != 0:
             stderr = (r.stderr or "").strip()[:200]
-            print(f"  WARNUNG: docker stop exit {r.returncode}: {stderr}")
+            _journal_log(
+                JOURNAL_WARNING,
+                f"docker stop exit {r.returncode}: {stderr}",
+            )
             return False
         return True
     except subprocess.TimeoutExpired:
-        print("  WARNUNG: docker stop Timeout")
+        _journal_log(JOURNAL_WARNING, "docker stop Timeout")
         return False
     except (FileNotFoundError, OSError) as e:
-        print(f"  WARNUNG: docker stop nicht ausfuehrbar: {e}")
+        _journal_log(JOURNAL_WARNING, f"docker stop nicht ausfuehrbar: {e}")
         return False
 
 
@@ -1170,12 +1462,18 @@ async def _wait_healthy(timeout: float | None = None) -> bool:
         try:
             still_running = await _to_thread(_is_running_for_dirty)
         except Exception as e:
-            print(f"  WARNUNG: _wait_healthy Inspect Exception: {e}")
+            _journal_log(
+                JOURNAL_WARNING,
+                f"_wait_healthy Inspect Exception: {e}",
+            )
             still_running = True
         if not still_running:
             elapsed = time.monotonic() - start
-            print(f"  FEHLER: {CONTAINER_NAME} nicht mehr running nach "
-                  f"{elapsed:.1f}s (Container-Crash erkannt)")
+            _journal_log(
+                JOURNAL_ERR,
+                f"{CONTAINER_NAME} nicht mehr running nach "
+                f"{elapsed:.1f}s (Container-Crash erkannt)",
+            )
             return False
         if time.monotonic() >= deadline:
             return False
@@ -1197,7 +1495,7 @@ async def _run_stop_once() -> bool:
         try:
             return await _to_thread(_stop)
         except Exception as e:
-            print(f"  WARNUNG: _stop() Exception: {e}")
+            _journal_log(JOURNAL_WARNING, f"_stop() Exception: {e}")
             return False
 
     task = _stop_task
@@ -1258,16 +1556,22 @@ async def _start_supervisor() -> bool:
         try:
             marker_token = _write_vram_marker("startup", ttl_s=MARKER_TTL_S)
         except Exception as e:
-            print(f"  FEHLER: VRAM-Startup-Marker konnte nicht gesetzt werden: {e}")
+            _journal_log(
+                JOURNAL_ERR,
+                f"VRAM-Startup-Marker konnte nicht gesetzt werden: {e}",
+            )
             return False
         try:
             await _call_prepare_vram_for_docling(None)
         except VramGateError as e:
-            print(f"  FEHLER: VRAM-Gate blockiert Docling-Start: {e}")
+            _journal_log(
+                JOURNAL_ERR,
+                f"VRAM-Gate blockiert Docling-Start: {e}",
+            )
             clear_startup_marker = not e.side_effects_started
             return False
         except Exception as e:
-            print(f"  FEHLER: VRAM-Gate unerwarteter Fehler: {e}")
+            _journal_log(JOURNAL_ERR, f"VRAM-Gate unerwarteter Fehler: {e}")
             return False
         vram_gate_passed = True
 
@@ -1275,33 +1579,42 @@ async def _start_supervisor() -> bool:
         try:
             started = await _to_thread(_start)
         except Exception as e:
-            print(f"  WARNUNG: _start Exception: {e}")
+            _journal_log(JOURNAL_WARNING, f"_start Exception: {e}")
             started = False
         had_started = started
         if started:
             try:
                 healthy = await _wait_healthy()
             except Exception as e:
-                print(f"  WARNUNG: _wait_healthy Exception: {e}")
+                _journal_log(JOURNAL_WARNING, f"_wait_healthy Exception: {e}")
                 healthy = False
             if healthy:
                 success = True
             else:
-                print(f"  FEHLER: {CONTAINER_NAME} nicht bereit nach "
-                      f"{HEALTH_CHECK_TIMEOUT_S}s")
+                _journal_log(
+                    JOURNAL_ERR,
+                    f"{CONTAINER_NAME} nicht bereit nach "
+                    f"{HEALTH_CHECK_TIMEOUT_S}s",
+                )
                 # Health-Failure-Cleanup: best-effort stoppen (F67)
                 try:
                     stop_ok = await _run_stop_once()
                 except Exception as e:
-                    print(f"  WARNUNG: Health-Failure-Stop Exception: {e}")
+                    _journal_log(
+                        JOURNAL_WARNING,
+                        f"Health-Failure-Stop Exception: {e}",
+                    )
                     stop_ok = False
                 if not stop_ok:
                     try:
                         target_dirty = await _to_thread(
                             _is_running_for_dirty)
                     except Exception as e:
-                        print(f"  WARNUNG: Health-Failure-Dirty-Inspect "
-                              f"Exception: {e}")
+                        _journal_log(
+                            JOURNAL_WARNING,
+                            "Health-Failure-Dirty-Inspect "
+                            f"Exception: {e}",
+                        )
                         target_dirty = True
     except BaseException:
         # Cleanup nur beobachten, danach re-raise (F95).
@@ -1313,7 +1626,10 @@ async def _start_supervisor() -> bool:
                 stop_ok = await asyncio.shield(_run_stop_once())
                 cleanup_completed = True
             except Exception as e:
-                print(f"  WARNUNG: Start-Abbruch-Cleanup Exception: {e}")
+                _journal_log(
+                    JOURNAL_WARNING,
+                    f"Start-Abbruch-Cleanup Exception: {e}",
+                )
                 cleanup_completed = True
             except BaseException:
                 # Cleanup selbst abgebrochen -> akzeptierter STOPPED-Fallback
@@ -1323,8 +1639,11 @@ async def _start_supervisor() -> bool:
                     target_dirty = await asyncio.shield(
                         _to_thread(_is_running_for_dirty))
                 except Exception as e:
-                    print(f"  WARNUNG: Start-Abbruch-Dirty-Inspect "
-                          f"Exception: {e}")
+                    _journal_log(
+                        JOURNAL_WARNING,
+                        "Start-Abbruch-Dirty-Inspect "
+                        f"Exception: {e}",
+                    )
                     target_dirty = True
                 except BaseException:
                     # Inspect selbst abgebrochen -> STOPPED-Fallback
@@ -1370,8 +1689,10 @@ async def _start_supervisor() -> bool:
                         token=marker_token,
                     )
                 except Exception as e:
-                    print(f"  WARNUNG: Startup-Marker-Refresh "
-                          f"fehlgeschlagen: {e}")
+                    _journal_log(
+                        JOURNAL_WARNING,
+                        f"Startup-Marker-Refresh fehlgeschlagen: {e}",
+                    )
                     _clear_vram_marker("startup", marker_token)
             elif clear_startup_marker:
                 _clear_vram_marker("startup", marker_token)
@@ -1401,7 +1722,7 @@ async def _finalize_stop(stop_ok: bool) -> None:
         try:
             still_running = await _to_thread(_is_running_for_dirty)
         except Exception as e:
-            print(f"  WARNUNG: Dirty-Inspect Exception: {e}")
+            _journal_log(JOURNAL_WARNING, f"Dirty-Inspect Exception: {e}")
             still_running = True
     async with _state_lock:
         if _state == State.SHUTDOWN:
@@ -1463,7 +1784,10 @@ async def ensure_running() -> SlotToken | None:
                 try:
                     drain_marker_token = _write_vram_marker("shutdown", ttl_s=MARKER_TTL_S)
                 except Exception as e:
-                    print(f"  WARNUNG: Drain-Stop Shutdown-Marker fehlgeschlagen: {e}")
+                    _journal_log(
+                        JOURNAL_WARNING,
+                        f"Drain-Stop Shutdown-Marker fehlgeschlagen: {e}",
+                    )
                     # #801: bei persistentem Marker-Failure (z.B. /run/kiron
                     # read-only) wuerde reines return None den State auf
                     # RUNNING+_backend_failed=True+_active_requests=0 stehen
@@ -1523,7 +1847,11 @@ async def ensure_running() -> SlotToken | None:
                         token=marker_token,
                     )
                 except Exception as e:
-                    print(f"  WARNUNG: Warm-Regate Startup-Marker-Refresh fehlgeschlagen: {e}")
+                    _journal_log(
+                        JOURNAL_WARNING,
+                        "Warm-Regate Startup-Marker-Refresh "
+                        f"fehlgeschlagen: {e}",
+                    )
                     async with _state_lock:
                         if regate_token == _slot_generation:
                             _active_requests = max(0, _active_requests - 1)
@@ -1537,7 +1865,10 @@ async def ensure_running() -> SlotToken | None:
                         ttl_s=GPU_SERVICE_MARKER_SHORT_TTL_S,
                     )
                 except Exception as e:
-                    print(f"  WARNUNG: Warm-Regate Startup-Marker fehlgeschlagen: {e}")
+                    _journal_log(
+                        JOURNAL_WARNING,
+                        f"Warm-Regate Startup-Marker fehlgeschlagen: {e}",
+                    )
                     async with _state_lock:
                         if regate_token == _slot_generation:
                             _active_requests = max(0, _active_requests - 1)
@@ -1574,26 +1905,30 @@ async def ensure_running() -> SlotToken | None:
                             token=marker_token,
                         )
                     except Exception as e:
-                        print(f"  WARNUNG: Warm-Regate Startup-Marker-Refresh fehlgeschlagen: {e}")
+                        _journal_log(
+                            JOURNAL_WARNING,
+                            "Warm-Regate Startup-Marker-Refresh "
+                            f"fehlgeschlagen: {e}",
+                        )
             except asyncio.CancelledError:
                 try:
                     await asyncio.shield(regate_task)
                 except VramGateError as e:
-                    print(f"  WARNUNG: Warm-Regate VramGateError: {e}")
+                    _journal_log(JOURNAL_WARNING, f"Warm-Regate VramGateError: {e}")
                 except Exception as e:
-                    print(f"  WARNUNG: Warm-Regate unerwartet: {e}")
+                    _journal_log(JOURNAL_WARNING, f"Warm-Regate unerwartet: {e}")
                 await _finish_regate(release_slot=True)
                 if marker_token is not None:
                     _clear_vram_marker("startup", marker_token)
                 raise
             except VramGateError as e:
-                print(f"  WARNUNG: Warm-Regate VramGateError: {e}")
+                _journal_log(JOURNAL_WARNING, f"Warm-Regate VramGateError: {e}")
                 await _finish_regate(release_slot=True)
                 if marker_token is not None and not e.side_effects_started:
                     _clear_vram_marker("startup", marker_token)
                 return None
             except Exception as e:
-                print(f"  WARNUNG: Warm-Regate unerwartet: {e}")
+                _journal_log(JOURNAL_WARNING, f"Warm-Regate unerwartet: {e}")
                 await _finish_regate(release_slot=True)
                 if marker_token is not None:
                     _clear_vram_marker("startup", marker_token)
@@ -1610,8 +1945,11 @@ async def ensure_running() -> SlotToken | None:
                     timeout=WARM_REGATE_WAIT_TIMEOUT_S,
                 )
             except asyncio.TimeoutError:
-                print("  WARNUNG: Warm-Regate-Wait Timeout "
-                      f"({WARM_REGATE_WAIT_TIMEOUT_S:.0f}s) — retry")
+                _journal_log(
+                    JOURNAL_WARNING,
+                    "Warm-Regate-Wait Timeout "
+                    f"({WARM_REGATE_WAIT_TIMEOUT_S:.0f}s) — retry",
+                )
             continue
 
         if drain_outside:
@@ -1620,7 +1958,7 @@ async def ensure_running() -> SlotToken | None:
                 try:
                     stop_ok = await _run_stop_once()
                 except Exception as e:
-                    print(f"  WARNUNG: Drain-Stop Exception: {e}")
+                    _journal_log(JOURNAL_WARNING, f"Drain-Stop Exception: {e}")
                     stop_ok = False
                 await _finalize_stop(stop_ok)
                 async with _state_lock:
@@ -1676,7 +2014,11 @@ async def _try_stop_if_idle() -> None:
             # (read-only/voll) unendlich im RUNNING-State und haelt VRAM,
             # weil idle_watcher alle 15s denselben Versuch wiederholt.
             # Trade-off: bis zu 2s GPU-Request-Fenster ohne Overlay (#771).
-            print(f"  WARNUNG: idle-Stop Shutdown-Marker fehlgeschlagen, fahre trotzdem fort: {e}")
+            _journal_log(
+                JOURNAL_WARNING,
+                "idle-Stop Shutdown-Marker fehlgeschlagen, "
+                f"fahre trotzdem fort: {e}",
+            )
         _state = State.STOPPING
         _state_changed.notify_all()
 
@@ -1685,7 +2027,7 @@ async def _try_stop_if_idle() -> None:
         try:
             stop_ok = await _run_stop_once()
         except Exception as e:
-            print(f"  WARNUNG: idle-Stop Exception: {e}")
+            _journal_log(JOURNAL_WARNING, f"idle-Stop Exception: {e}")
             stop_ok = False
 
         # Finalisierung via _finalize_stop: bei stop_ok=False + still_running
@@ -1709,7 +2051,10 @@ async def idle_watcher() -> None:
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            print(f"  WARNUNG: idle_watcher-Iteration fehlgeschlagen: {e}")
+            _journal_log(
+                JOURNAL_WARNING,
+                f"idle_watcher-Iteration fehlgeschlagen: {e}",
+            )
 
 
 # --- Proxy-Handler ---
@@ -1765,7 +2110,10 @@ async def _release_slot(
             try:
                 marker_token = _write_vram_marker("shutdown", ttl_s=MARKER_TTL_S)
             except Exception as e:
-                print(f"  WARNUNG: Drain-Stop Shutdown-Marker fehlgeschlagen: {e}")
+                _journal_log(
+                    JOURNAL_WARNING,
+                    f"Drain-Stop Shutdown-Marker fehlgeschlagen: {e}",
+                )
                 # #803: analog ensure_running #801 — reines return wuerde
                 # RUNNING+_backend_failed=True+_active_requests=0 stehen
                 # lassen, sodass idle_watcher und neue Requests denselben
@@ -1789,7 +2137,7 @@ async def _release_slot(
                 try:
                     stop_ok = await _run_stop_once()
                 except Exception as e:
-                    print(f"  WARNUNG: Drain-Stop Exception: {e}")
+                    _journal_log(JOURNAL_WARNING, f"Drain-Stop Exception: {e}")
                     stop_ok = False
                 await _finalize_stop(stop_ok)
                 async with _state_lock:
@@ -1859,7 +2207,7 @@ async def _response_iter(resp: httpx.Response, token: SlotToken | None = None):
         try:
             task.result()
         except Exception as e:
-            print(f"  WARNUNG: Slot-Release Exception: {e}")
+            _journal_log(JOURNAL_WARNING, f"Slot-Release Exception: {e}")
         except BaseException:
             pass
 
@@ -1880,14 +2228,14 @@ async def _response_iter(resp: httpx.Response, token: SlotToken | None = None):
             httpx.TimeoutException) as e:
         ok = False
         backend_failed = True
-        print(f"  WARNUNG: Stream-Backendfehler: {e}")
+        _journal_log(JOURNAL_WARNING, f"Stream-Backendfehler: {e}")
         raise
     except (asyncio.CancelledError, GeneratorExit):
         ok = False
         raise
     except Exception as e:
         ok = False
-        print(f"  WARNUNG: Stream-Exception: {e}")
+        _journal_log(JOURNAL_WARNING, f"Stream-Exception: {e}")
         raise
     finally:
         # Aeusseres try/finally garantiert Slot-Release auch bei BaseException
@@ -1899,12 +2247,15 @@ async def _response_iter(resp: httpx.Response, token: SlotToken | None = None):
             except (asyncio.CancelledError, GeneratorExit):
                 pass
             except Exception as e:
-                print(f"  WARNUNG: resp.aclose() fehlgeschlagen: {e}")
+                _journal_log(
+                    JOURNAL_WARNING,
+                    f"resp.aclose() fehlgeschlagen: {e}",
+                )
         finally:
             try:
                 await _shielded_release()
             except Exception as e:
-                print(f"  WARNUNG: Slot-Release Exception: {e}")
+                _journal_log(JOURNAL_WARNING, f"Slot-Release Exception: {e}")
 
 
 def _json_bytes(obj: dict) -> bytes:
@@ -1950,7 +2301,7 @@ async def proxy_handler(request: Request) -> Response:
             released = True
             return Response(status_code=499)
         except Exception as e:
-            print(f"  WARNUNG: Pre-send-Setup Fehler: {e}")
+            _journal_log(JOURNAL_WARNING, f"Pre-send-Setup Fehler: {e}")
             await _release_slot(token, ok=False, backend_failed=False)
             released = True
             return Response(
@@ -1963,7 +2314,7 @@ async def proxy_handler(request: Request) -> Response:
         try:
             resp = await http_client.send(req, stream=True)
         except httpx.ConnectError as e:
-            print(f"  WARNUNG: Backend ConnectError: {e}")
+            _journal_log(JOURNAL_WARNING, f"Backend ConnectError: {e}")
             await _release_slot(token, ok=False, backend_failed=True)
             released = True
             return Response(
@@ -1996,7 +2347,7 @@ async def proxy_handler(request: Request) -> Response:
             )
         except (httpx.RemoteProtocolError, httpx.ReadError,
                 httpx.WriteError) as e:
-            print(f"  WARNUNG: Backend Protokollfehler: {e}")
+            _journal_log(JOURNAL_WARNING, f"Backend Protokollfehler: {e}")
             await _release_slot(token, ok=False, backend_failed=True)
             released = True
             return Response(
@@ -2009,7 +2360,7 @@ async def proxy_handler(request: Request) -> Response:
             released = True
             return Response(status_code=499)
         except httpx.TransportError as e:
-            print(f"  WARNUNG: Backend Transportfehler: {e}")
+            _journal_log(JOURNAL_WARNING, f"Backend Transportfehler: {e}")
             await _release_slot(token, ok=False, backend_failed=True)
             released = True
             return Response(
@@ -2023,11 +2374,14 @@ async def proxy_handler(request: Request) -> Response:
             resp_headers = _filter_response_headers(resp)
             status = resp.status_code
         except Exception as e:
-            print(f"  WARNUNG: Response-Setup Fehler: {e}")
+            _journal_log(JOURNAL_WARNING, f"Response-Setup Fehler: {e}")
             try:
                 await resp.aclose()
             except Exception as ce:
-                print(f"  WARNUNG: resp.aclose() nach Setup-Fehler: {ce}")
+                _journal_log(
+                    JOURNAL_WARNING,
+                    f"resp.aclose() nach Setup-Fehler: {ce}",
+                )
             except (asyncio.CancelledError, GeneratorExit):
                 pass
             await _release_slot(token, ok=False, backend_failed=False)
@@ -2048,7 +2402,7 @@ async def proxy_handler(request: Request) -> Response:
             try:
                 await resp.aclose()
             except Exception as e:
-                print(f"  WARNUNG: HEAD resp.aclose() Fehler: {e}")
+                _journal_log(JOURNAL_WARNING, f"HEAD resp.aclose() Fehler: {e}")
             except (asyncio.CancelledError, GeneratorExit):
                 pass
             await _release_slot(token, ok=True, backend_failed=False)
@@ -2071,7 +2425,10 @@ async def proxy_handler(request: Request) -> Response:
                 try:
                     await resp.aclose()
                 except Exception as e:
-                    print(f"  WARNUNG: resp.aclose() nach Timeout: {e}")
+                    _journal_log(
+                        JOURNAL_WARNING,
+                        f"resp.aclose() nach Timeout: {e}",
+                    )
                 except (asyncio.CancelledError, GeneratorExit):
                     pass
                 await _release_slot(token, ok=False, backend_failed=True)
@@ -2082,11 +2439,14 @@ async def proxy_handler(request: Request) -> Response:
                     media_type="application/json",
                 )
             except (httpx.RemoteProtocolError, httpx.ReadError) as e:
-                print(f"  WARNUNG: Async-Task-Backendfehler: {e}")
+                _journal_log(JOURNAL_WARNING, f"Async-Task-Backendfehler: {e}")
                 try:
                     await resp.aclose()
                 except Exception as ce:
-                    print(f"  WARNUNG: resp.aclose() nach Async-Fehler: {ce}")
+                    _journal_log(
+                        JOURNAL_WARNING,
+                        f"resp.aclose() nach Async-Fehler: {ce}",
+                    )
                 except (asyncio.CancelledError, GeneratorExit):
                     pass
                 await _release_slot(token, ok=False, backend_failed=True)
@@ -2097,11 +2457,17 @@ async def proxy_handler(request: Request) -> Response:
                     media_type="application/json",
                 )
             except Exception as e:
-                print(f"  WARNUNG: Async-Task-Response-Read Fehler: {e}")
+                _journal_log(
+                    JOURNAL_WARNING,
+                    f"Async-Task-Response-Read Fehler: {e}",
+                )
                 try:
                     await resp.aclose()
                 except Exception as ce:
-                    print(f"  WARNUNG: resp.aclose() nach Async-Read-Fehler: {ce}")
+                    _journal_log(
+                        JOURNAL_WARNING,
+                        f"resp.aclose() nach Async-Read-Fehler: {ce}",
+                    )
                 except (asyncio.CancelledError, GeneratorExit):
                     pass
                 await _release_slot(token, ok=False, backend_failed=False)
@@ -2114,7 +2480,10 @@ async def proxy_handler(request: Request) -> Response:
             try:
                 await resp.aclose()
             except Exception as e:
-                print(f"  WARNUNG: Async-Task resp.aclose() Fehler: {e}")
+                _journal_log(
+                    JOURNAL_WARNING,
+                    f"Async-Task resp.aclose() Fehler: {e}",
+                )
             except (asyncio.CancelledError, GeneratorExit):
                 pass
 
@@ -2159,7 +2528,10 @@ async def proxy_handler(request: Request) -> Response:
                 await asyncio.shield(_release_slot(token, ok=False,
                                                    backend_failed=False))
             except Exception as e:
-                print(f"  WARNUNG: Emergency-Slot-Release Exception: {e}")
+                _journal_log(
+                    JOURNAL_WARNING,
+                    f"Emergency-Slot-Release Exception: {e}",
+                )
             except BaseException:
                 pass
         raise
@@ -2337,7 +2709,11 @@ async def stop_handler(request: Request) -> Response:
                     # haengen, sonst kann der Container nicht ueber Dashboard
                     # gestoppt werden, solange /run/kiron unbeschreibbar ist.
                     # Trade-off: bis zu 2s GPU-Request-Fenster ohne Overlay (#771).
-                    print(f"  WARNUNG: Control-Stop Shutdown-Marker fehlgeschlagen, fahre trotzdem fort: {e}")
+                    _journal_log(
+                        JOURNAL_WARNING,
+                        "Control-Stop Shutdown-Marker fehlgeschlagen, "
+                        f"fahre trotzdem fort: {e}",
+                    )
                 _invalidate_generation_locked()
                 _set_state(State.STOPPING)
                 _state_changed.notify_all()
@@ -2352,7 +2728,11 @@ async def stop_handler(request: Request) -> Response:
                     # haengen, sonst kann der Container nicht ueber Dashboard
                     # gestoppt werden, solange /run/kiron unbeschreibbar ist.
                     # Trade-off: bis zu 2s GPU-Request-Fenster ohne Overlay (#771).
-                    print(f"  WARNUNG: Control-Stop Shutdown-Marker fehlgeschlagen, fahre trotzdem fort: {e}")
+                    _journal_log(
+                        JOURNAL_WARNING,
+                        "Control-Stop Shutdown-Marker fehlgeschlagen, "
+                        f"fahre trotzdem fort: {e}",
+                    )
                 _invalidate_generation_locked()
                 _set_state(State.STOPPING)
                 _state_changed.notify_all()
@@ -2369,7 +2749,7 @@ async def stop_handler(request: Request) -> Response:
         try:
             stop_ok = await _run_stop_once()
         except Exception as e:
-            print(f"  WARNUNG: Control-Stop Exception: {e}")
+            _journal_log(JOURNAL_WARNING, f"Control-Stop Exception: {e}")
             stop_ok = False
         await _finalize_stop(stop_ok)
 
@@ -2420,35 +2800,51 @@ async def on_startup() -> None:
     try:
         marker_token = _write_vram_marker("startup", ttl_s=MARKER_TTL_S)
     except Exception as e:
-        print(f"  WARNUNG: Startup-Marker fehlgeschlagen; "
-              f"Takeover ohne VRAM-Gate: {e}")
+        _journal_log(
+            JOURNAL_WARNING,
+            f"Startup-Marker fehlgeschlagen; Takeover ohne VRAM-Gate: {e}",
+        )
     try:
         try:
             running = await _to_thread(_is_running)
         except Exception as e:
-            print(f"  WARNUNG: Startup-Inspect fehlgeschlagen: {e}")
+            _journal_log(JOURNAL_WARNING, f"Startup-Inspect fehlgeschlagen: {e}")
             running = False
 
         if running:
             image_ok = await _to_thread(_has_expected_image)
             if not image_ok:
-                print("  WARNUNG: Startup-Takeover: unerwartetes Image; stoppe Container")
+                _journal_log(
+                    JOURNAL_WARNING,
+                    "Startup-Takeover: unerwartetes Image; stoppe Container",
+                )
                 healthy = False
             else:
                 policy_ok = await _to_thread(_remediate_restart_policy)
                 if not policy_ok:
-                    print("  WARNUNG: Startup-Takeover: unsichere RestartPolicy; stoppe Container")
+                    _journal_log(
+                        JOURNAL_WARNING,
+                        "Startup-Takeover: unsichere RestartPolicy; "
+                        "stoppe Container",
+                    )
                     healthy = False
                 else:
                     port_ok = await _to_thread(_has_expected_port_binding)
                     if not port_ok:
-                        print("  WARNUNG: Startup-Takeover: unerwartetes PortBinding; stoppe Container")
+                        _journal_log(
+                            JOURNAL_WARNING,
+                            "Startup-Takeover: unerwartetes PortBinding; "
+                            "stoppe Container",
+                        )
                         healthy = False
                     else:
                         try:
                             healthy = await _wait_healthy(timeout=HEALTH_CHECK_TIMEOUT_S)
                         except Exception as e:
-                            print(f"  WARNUNG: Takeover-Health Exception: {e}")
+                            _journal_log(
+                                JOURNAL_WARNING,
+                                f"Takeover-Health Exception: {e}",
+                            )
                             healthy = False
             if healthy:
                 async with _state_lock:
@@ -2460,11 +2856,14 @@ async def on_startup() -> None:
                 try:
                     stop_ok = await _run_stop_once()
                 except Exception as e:
-                    print(f"  WARNUNG: Takeover-Stop Exception: {e}")
+                    _journal_log(JOURNAL_WARNING, f"Takeover-Stop Exception: {e}")
                     stop_ok = False
                 await _finalize_stop(stop_ok)
-                print(f"Bestehender Container {CONTAINER_NAME} nicht gesund, "
-                      f"Recovery ueber _finalize_stop")
+                _journal_log(
+                    JOURNAL_WARNING,
+                    f"Bestehender Container {CONTAINER_NAME} nicht gesund, "
+                    "Recovery ueber _finalize_stop",
+                )
     finally:
         _clear_vram_marker("startup", marker_token)
 
@@ -2491,7 +2890,10 @@ async def on_shutdown() -> None:
     try:
         marker_token = _write_vram_marker("shutdown", ttl_s=MARKER_TTL_S)
     except Exception as e:
-        print(f"  FEHLER: VRAM-Shutdown-Marker konnte nicht gesetzt werden: {e}")
+        _journal_log(
+            JOURNAL_ERR,
+            f"VRAM-Shutdown-Marker konnte nicht gesetzt werden: {e}",
+        )
         marker_token = None
     stop_clean = True
     try:
@@ -2508,7 +2910,7 @@ async def on_shutdown() -> None:
             except asyncio.CancelledError:
                 pass
             except Exception as e:
-                print(f"Shutdown: dirty_retry Fehler: {e}")
+                _journal_log(JOURNAL_WARNING, f"Shutdown: dirty_retry Fehler: {e}")
             _dirty_retry_task = None
             if stop_task is None:
                 stop_task = _stop_task
@@ -2520,7 +2922,7 @@ async def on_shutdown() -> None:
             except asyncio.CancelledError:
                 pass
             except Exception as e:
-                print(f"Shutdown: idle_watcher Fehler: {e}")
+                _journal_log(JOURNAL_WARNING, f"Shutdown: idle_watcher Fehler: {e}")
             _idle_watcher_task = None
 
         # Getrackten Stop-Task abwarten; falls keiner laeuft und Container noch,
@@ -2536,20 +2938,35 @@ async def on_shutdown() -> None:
                 stop_clean = stop_clean and bool(stop_ok)
             except asyncio.TimeoutError:
                 stop_clean = False
-                print("Shutdown: Stop-Task Timeout — Shutdown-Marker bleibt bis TTL")
+                _journal_log(
+                    JOURNAL_CRIT,
+                    "Shutdown: Stop-Task Timeout — Shutdown-Marker bleibt bis TTL",
+                )
             except Exception as e:
                 stop_clean = False
-                print(f"Shutdown: Stop-Task Fehler: {e} — Shutdown-Marker bleibt bis TTL")
+                _journal_log(
+                    JOURNAL_CRIT,
+                    f"Shutdown: Stop-Task Fehler: {e} — "
+                    "Shutdown-Marker bleibt bis TTL",
+                )
         elif stop_task is not None:
             if stop_task.cancelled():
                 stop_clean = False
-                print("Shutdown: Stop-Task cancelled — Shutdown-Marker bleibt bis TTL")
+                _journal_log(
+                    JOURNAL_CRIT,
+                    "Shutdown: Stop-Task cancelled — "
+                    "Shutdown-Marker bleibt bis TTL",
+                )
             else:
                 try:
                     stop_clean = stop_clean and bool(stop_task.result())
                 except Exception as e:
                     stop_clean = False
-                    print(f"Shutdown: Stop-Task Fehler: {e} — Shutdown-Marker bleibt bis TTL")
+                    _journal_log(
+                        JOURNAL_CRIT,
+                        f"Shutdown: Stop-Task Fehler: {e} — "
+                        "Shutdown-Marker bleibt bis TTL",
+                    )
 
         # Getrackten Start-Task bounded abwarten (F92/F99)
         start_task = _start_task
@@ -2559,10 +2976,18 @@ async def on_shutdown() -> None:
                                         timeout=SHUTDOWN_START_GRACE_S)
             except asyncio.TimeoutError:
                 stop_clean = False
-                print("Shutdown: Start-Task Timeout — Shutdown-Marker bleibt bis TTL")
+                _journal_log(
+                    JOURNAL_CRIT,
+                    "Shutdown: Start-Task Timeout — "
+                    "Shutdown-Marker bleibt bis TTL",
+                )
             except Exception as e:
                 stop_clean = False
-                print(f"Shutdown: Start-Task Fehler: {e} — Shutdown-Marker bleibt bis TTL")
+                _journal_log(
+                    JOURNAL_CRIT,
+                    f"Shutdown: Start-Task Fehler: {e} — "
+                    "Shutdown-Marker bleibt bis TTL",
+                )
 
         # Falls der Container durch den Start-Task nun laeuft: best-effort stoppen
         try:
@@ -2570,22 +2995,36 @@ async def on_shutdown() -> None:
         except Exception as e:
             still = True
             stop_clean = False
-            print(f"Shutdown: Dirty-Inspect Fehler: {e} — Shutdown-Marker bleibt bis TTL")
+            _journal_log(
+                JOURNAL_CRIT,
+                f"Shutdown: Dirty-Inspect Fehler: {e} — "
+                "Shutdown-Marker bleibt bis TTL",
+            )
         if still:
             try:
                 print(f"Shutdown: stoppe {CONTAINER_NAME}...")
                 stop_ok = await _run_stop_once()
                 if not stop_ok:
                     stop_clean = False
-                    print("Shutdown: docker stop nicht bestaetigt — Shutdown-Marker bleibt bis TTL")
+                    _journal_log(
+                        JOURNAL_CRIT,
+                        "Shutdown: docker stop nicht bestaetigt — "
+                        "Shutdown-Marker bleibt bis TTL",
+                    )
             except Exception as e:
                 stop_clean = False
-                print(f"Shutdown: docker stop fehlgeschlagen: {e}")
+                _journal_log(
+                    JOURNAL_CRIT,
+                    f"Shutdown: docker stop fehlgeschlagen: {e}",
+                )
 
         try:
             await http_client.aclose()
         except Exception as e:
-            print(f"Shutdown: http_client.aclose() Fehler: {e}")
+            _journal_log(
+                JOURNAL_WARNING,
+                f"Shutdown: http_client.aclose() Fehler: {e}",
+            )
     except BaseException:
         stop_clean = False
         raise
@@ -2594,8 +3033,11 @@ async def on_shutdown() -> None:
         if stop_clean and marker_token is not None:
             _clear_vram_marker("shutdown", marker_token)
         elif not stop_clean:
-            print("Shutdown: Container-Status unklar — Shutdown-Marker "
-                  f"bleibt bis TTL ({MARKER_TTL_S:.0f}s)")
+            _journal_log(
+                JOURNAL_CRIT,
+                "Shutdown: Container-Status unklar — Shutdown-Marker "
+                f"bleibt bis TTL ({MARKER_TTL_S:.0f}s)",
+            )
 
 
 app.add_event_handler("shutdown", on_shutdown)

@@ -1,0 +1,118 @@
+{
+  "schema_version": 1,
+  "canonical_model_id": "Org/Alpha:Q4",
+  "aliases": [
+    "Org/Alpha",
+    "alpha"
+  ],
+  "deployments": [
+    {
+      "id": "alpha.service",
+      "backend": {
+        "type": "kiron_embeddings",
+        "parameters": {
+          "queue": "serial"
+        }
+      },
+      "artifact": {
+        "type": "huggingface",
+        "repository": "org/alpha",
+        "revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "manifest_digest": null,
+        "trust_remote_code": false,
+        "weights": [
+          {
+            "path": "model.safetensors",
+            "sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+          }
+        ],
+        "auxiliary": [],
+        "metadata": {
+          "size_bytes": 123
+        }
+      },
+      "routes": [
+        {
+          "task": "embedding",
+          "endpoint": "/api/embed"
+        }
+      ],
+      "loader": {
+        "type": "sentence_transformers",
+        "parameters": {
+          "batch_size": 16,
+          "normalize": true,
+          "tags": [
+            "A",
+            "b"
+          ]
+        }
+      },
+      "metadata": {
+        "device_class": "cuda"
+      }
+    },
+    {
+      "id": "alpha.ollama",
+      "backend": {
+        "type": "ollama",
+        "parameters": {}
+      },
+      "artifact": {
+        "type": "ollama",
+        "repository": null,
+        "revision": null,
+        "manifest_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "trust_remote_code": false,
+        "weights": [
+          {
+            "path": "model",
+            "sha256": "3333333333333333333333333333333333333333333333333333333333333333"
+          }
+        ],
+        "auxiliary": [],
+        "metadata": {}
+      },
+      "routes": [
+        {
+          "task": "embedding",
+          "endpoint": "/api/embed"
+        }
+      ],
+      "loader": {
+        "type": "ollama",
+        "parameters": {}
+      },
+      "metadata": {}
+    }
+  ],
+  "profiles": [
+    {
+      "id": "alpha.service.dense",
+      "deployment_id": "alpha.service",
+      "task": "embedding",
+      "endpoint": "/api/embed",
+      "default_for_endpoint": true,
+      "metadata": {
+        "dimensions": 768,
+        "pipeline": {
+          "pooling": "mean"
+        }
+      }
+    },
+    {
+      "id": "alpha.ollama.dense",
+      "deployment_id": "alpha.ollama",
+      "task": "embedding",
+      "endpoint": "/api/embed",
+      "default_for_endpoint": false,
+      "metadata": {
+        "verification": "unverified"
+      }
+    }
+  ],
+  "request_defaults": [],
+  "metadata": {
+    "display_name": "Alpha"
+  }
+}

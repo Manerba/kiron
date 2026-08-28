@@ -1,0 +1,135 @@
+{
+  "schema_version": 1,
+  "canonical_model_id": "mankei-326m-embedder:latest",
+  "aliases": [
+    "mankei-326m-embedder"
+  ],
+  "deployments": [
+    {
+      "id": "kiron-mankei-dense-v1.deployment",
+      "backend": {
+        "type": "kiron_embeddings",
+        "parameters": {
+          "implementation": "kiron-transformers-last-token",
+          "implementation_revision": "v1",
+          "model_name": "mankei-326m-embedder"
+        }
+      },
+      "artifact": {
+        "type": "huggingface",
+        "repository": "keyvan-ai/Mankei-326M-Embedder",
+        "revision": "86f562cf94d5510175b546e6e9156f99bbd790b5",
+        "manifest_digest": null,
+        "trust_remote_code": false,
+        "weights": [
+          {
+            "path": "model.safetensors",
+            "sha256": "bbfe289c78cad5ef7d64b0dd5cc547380a274a82823207e7ee4fcf44f49264d8"
+          }
+        ],
+        "auxiliary": [],
+        "metadata": {}
+      },
+      "routes": [
+        {
+          "task": "embedding",
+          "endpoint": "/api/embed"
+        }
+      ],
+      "loader": {
+        "type": "transformers_last_token",
+        "parameters": {
+          "tokenizer_use_fast": true,
+          "torch_dtype": "bfloat16"
+        }
+      },
+      "metadata": {
+        "discovery": {
+          "family": "llama",
+          "format": "safetensors",
+          "parameter_size": "326M",
+          "precision": "BF16",
+          "size": 652884384
+        }
+      }
+    }
+  ],
+  "profiles": [
+    {
+      "id": "kiron-mankei-dense-v1",
+      "deployment_id": "kiron-mankei-dense-v1.deployment",
+      "task": "embedding",
+      "endpoint": "/api/embed",
+      "default_for_endpoint": true,
+      "metadata": {
+        "kind": "dense",
+        "dimensions": 960,
+        "max_input_tokens": {
+          "unit": "tokenizer_tokens",
+          "counting": "after_server_formatting_including_special_tokens",
+          "truncation": "right",
+          "overflow": "truncate",
+          "by_role": {
+            "search_document": 256,
+            "search_query": 256
+          }
+        },
+        "output_normalized": true,
+        "similarity": "cosine",
+        "input_type": {
+          "supported": [
+            "search_document",
+            "search_query"
+          ],
+          "additional_task_roles": [],
+          "aliases": [],
+          "role_sensitive": true,
+          "required": true,
+          "default": null,
+          "missing_role_behavior": "reject"
+        },
+        "formatting_owner": "server",
+        "pipeline": {
+          "tokenizer": {
+            "repository": "keyvan-ai/Mankei-326M-Embedder",
+            "revision": "86f562cf94d5510175b546e6e9156f99bbd790b5"
+          },
+          "formatting": {
+            "search_document": {
+              "template": "passage: {text}",
+              "parameters": {}
+            },
+            "search_query": {
+              "template": "query: {text}",
+              "parameters": {}
+            }
+          },
+          "pooling": {
+            "method": "last_token",
+            "parameters": {
+              "padding_side": "right",
+              "select": "last_non_padding_token"
+            }
+          },
+          "normalization": {
+            "method": "l2",
+            "dtype": "float32",
+            "scope": "vector"
+          },
+          "parameters": {}
+        },
+        "verification": {
+          "status": "verified",
+          "evidence": [
+            "hf-readme:keyvan-ai/Mankei-326M-Embedder@86f562cf94d5510175b546e6e9156f99bbd790b5",
+            "local-weight-sha256:bbfe289c78cad5ef7d64b0dd5cc547380a274a82823207e7ee4fcf44f49264d8",
+            "runtime-pipeline:kiron-mankei-bfloat16-last-token-fp32-l2"
+          ],
+          "blocking_reasons": []
+        }
+      }
+    }
+  ],
+  "request_defaults": [],
+  "metadata": {}
+}

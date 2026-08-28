@@ -2,8 +2,10 @@
 
 import os
 import contextlib
+import grp
 import importlib.util
 from pathlib import Path
+import pwd
 import sys
 import unittest
 from unittest import mock
@@ -38,7 +40,8 @@ TEST_RUNTIME_DIR = Path(os.environ.get(
 
 def _configure_runtime(vl):
     TEST_RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
-    for path in TEST_RUNTIME_DIR.glob("*"):
+    os.chmod(TEST_RUNTIME_DIR, 0o2770)
+    for path in TEST_RUNTIME_DIR.iterdir():
         if path.is_file():
             path.unlink()
     vl.RUNTIME_MARKER_DIR = TEST_RUNTIME_DIR
@@ -48,6 +51,11 @@ def _configure_runtime(vl):
     vl._lease_cache["active"] = False
     vl._lease_cache["ts"] = 0.0
     vl._shared_client = None
+    vl.RUNTIME_MARKER_GROUP = grp.getgrgid(os.getgid()).gr_name
+    vl.RUNTIME_MARKER_FILE_OWNER_NAMES = frozenset({
+        pwd.getpwuid(os.getuid()).pw_name,
+    })
+    vl._runtime_marker_dir_owner_uid = lambda: os.getuid()
 
 
 class _Store:
@@ -273,7 +281,7 @@ class LazyOverlayMarkerTests(unittest.IsolatedAsyncioTestCase):
             "gpu_service_loading marker leaked after no-start send ConnectError",
         )
 
-    async def test_embed_service_connect_fallback_clears_embed_marker(self):
+    async def test_embed_service_connect_fail_closed_clears_embed_marker(self):
         class _EmbedConnectOnSend(_BackendClient):
             async def send(self, request, stream=False):
                 self.sent.append(request)
@@ -300,15 +308,20 @@ class LazyOverlayMarkerTests(unittest.IsolatedAsyncioTestCase):
                 json={
                     "model": "mxbai-embed-large",
                     "input": "hi",
+                    "input_type": "search_document",
                 },
             )
 
-        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.status_code, 502)
         self.assertEqual(len(embed_client.sent), 1)
-        self.assertEqual(len(ollama_client.sent), 1)
+        self.assertEqual(ollama_client.sent, [])
+        self.assertEqual(
+            resp.json()["error"]["code"],
+            "embedding_backend_incompatible_or_unavailable",
+        )
         self.assertFalse(
             proxy.vram_lease.overlay_marker_active("gpu_service_loading"),
-            "embedding gpu_service_loading marker leaked before Ollama fallback",
+            "embedding gpu_service_loading marker leaked after fail-closed response",
         )
 
 

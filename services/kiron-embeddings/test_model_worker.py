@@ -18,6 +18,7 @@ if THIS_DIR not in sys.path:
 
 import model_worker as mw  # noqa: E402
 from model_worker import (  # noqa: E402
+    ColbertEmbedResult,
     EncodeResult,
     LateEmbedResult,
     ModelJob,
@@ -47,6 +48,7 @@ class FakeManager:
         self.encode_count = 0
         self.drop_count = 0
         self.late_embed_count = 0
+        self.colbert_embed_count = 0
 
         # Concurrency-Tracking fuer Serial-Garantie
         self._conc_lock = threading.Lock()
@@ -56,14 +58,18 @@ class FakeManager:
         self.peak_concurrent_encodes = 0
         self.active_late_embeds = 0
         self.peak_concurrent_late_embeds = 0
+        self.active_colbert_embeds = 0
+        self.peak_concurrent_colbert_embeds = 0
 
         # Blocker / Hooks
         self.load_blocker: threading.Event | None = None
         self.encode_blocker: threading.Event | None = None
         self.late_embed_blocker: threading.Event | None = None
+        self.colbert_embed_blocker: threading.Event | None = None
         self.load_started: threading.Event = threading.Event()
         self.encode_started: threading.Event = threading.Event()
         self.late_embed_started: threading.Event = threading.Event()
+        self.colbert_embed_started: threading.Event = threading.Event()
 
         # Crash-Modi
         self.load_raises: BaseException | None = None
@@ -77,6 +83,9 @@ class FakeManager:
         self.late_embed_result_override: LateEmbedResult | None = None
         self.late_embed_raises: BaseException | None = None
         self.late_embed_calls: list[tuple] = []
+        self.colbert_embed_result_override: ColbertEmbedResult | None = None
+        self.colbert_embed_raises: BaseException | None = None
+        self.colbert_embed_calls: list[tuple] = []
 
     def set_worker_thread(self) -> None:
         with self.state_lock:
@@ -185,6 +194,34 @@ class FakeManager:
         finally:
             with self._conc_lock:
                 self.active_late_embeds -= 1
+
+    def _colbert_embed_sync(
+        self, name: str, texts: list[str], input_type, language
+    ):
+        self.assert_worker_thread()
+        with self._conc_lock:
+            self.active_colbert_embeds += 1
+            self.peak_concurrent_colbert_embeds = max(
+                self.peak_concurrent_colbert_embeds, self.active_colbert_embeds
+            )
+        self.colbert_embed_started.set()
+        try:
+            if self.colbert_embed_blocker is not None:
+                self.colbert_embed_blocker.wait()
+            if self.colbert_embed_raises is not None:
+                raise self.colbert_embed_raises
+            self.colbert_embed_count += 1
+            self.colbert_embed_calls.append((name, list(texts), input_type, language))
+            if self.colbert_embed_result_override is not None:
+                return self.colbert_embed_result_override
+            return ColbertEmbedResult(
+                embeddings=[[[1.0, 0.0]]] * len(texts),
+                prompt_eval_count=len(texts),
+                load_duration_ns=0,
+            )
+        finally:
+            with self._conc_lock:
+                self.active_colbert_embeds -= 1
 
     def _drop_model_sync(self) -> None:
         self.assert_worker_thread()
@@ -563,6 +600,32 @@ class SerialModelWorkerTests(unittest.IsolatedAsyncioTestCase):
         snap_after = self.worker.snapshot()
         self.assertIsNone(snap_after["current_job"])
 
+    def test_state_is_cleared_before_encode_result_is_published(self):
+        """Die Callback-Publikation darf keinen laufenden Job mehr sehen."""
+
+        class RecordingLoop:
+            def __init__(_self):
+                _self.current_job_at_publish = "not-called"
+
+            def call_soon_threadsafe(_self, _callback, *_args):
+                _self.current_job_at_publish = self.worker.snapshot()["current_job"]
+
+        self.manager.set_worker_thread()
+        loop = RecordingLoop()
+        job = ModelJob(
+            kind="encode",
+            payload={"model_name": "a", "texts": ["text"], "input_type": None},
+            future=mock.Mock(),
+            loop=loop,
+            cancelled=threading.Event(),
+            job_id=1,
+        )
+
+        self.worker._dispatch_job(job)
+
+        self.assertIsNone(loop.current_job_at_publish)
+        self.assertIsNone(self.worker.snapshot()["current_job"])
+
     # ---- current_job-Tracking
 
     async def test_current_job_tracked_during_dispatch_and_cleared_after(self):
@@ -726,7 +789,7 @@ class SerialModelWorkerTests(unittest.IsolatedAsyncioTestCase):
                 with manager.state_lock:
                     snapshots.append((manager.model, manager.current_model_name))
 
-        with mock.patch.object(main_mod, "SentenceTransformer", return_value=new_obj), \
+        with mock.patch.object(manager, "_construct_model_cpu_sync", return_value=new_obj), \
              mock.patch.object(manager, "_detect_device", return_value="cpu"):
             t = threading.Thread(target=reader, daemon=True)
             t.start()
@@ -1045,6 +1108,49 @@ class SerialModelWorkerLateEmbedTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(worker._queue.qsize(), 0)
 
 
+class SerialModelWorkerColbertEmbedTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.manager = FakeManager()
+        self.worker = SerialModelWorker(self.manager, queue_max=8)
+
+    async def asyncTearDown(self):
+        if self.manager.colbert_embed_blocker is not None:
+            self.manager.colbert_embed_blocker.set()
+        if self.worker._thread is not None and self.worker._thread.is_alive():
+            await self.worker.stop(timeout=3.0)
+
+    async def test_colbert_embed_dispatch_payload(self):
+        self.worker.start()
+
+        result = await self.worker.colbert_embed(
+            "colbert-xm", ["abc"], "search_query", "de"
+        )
+
+        self.assertIsInstance(result, ColbertEmbedResult)
+        self.assertEqual(self.manager.colbert_embed_count, 1)
+        self.assertEqual(
+            self.manager.colbert_embed_calls,
+            [("colbert-xm", ["abc"], "search_query", "de")],
+        )
+
+    async def test_colbert_embed_serial_garantie(self):
+        self.manager.colbert_embed_blocker = threading.Event()
+        self.worker.start()
+
+        f1 = asyncio.create_task(
+            self.worker.colbert_embed("colbert-xm", ["a"], None, None)
+        )
+        f2 = asyncio.create_task(
+            self.worker.colbert_embed("colbert-xm", ["b"], None, None)
+        )
+        await asyncio.sleep(0.1)
+
+        self.assertEqual(self.manager.peak_concurrent_colbert_embeds, 1)
+        self.manager.colbert_embed_blocker.set()
+        await asyncio.wait_for(asyncio.gather(f1, f2), timeout=3.0)
+        self.assertEqual(self.manager.colbert_embed_count, 2)
+
+
 class ModelManagerOomCleanupTests(unittest.TestCase):
     def test_encode_oom_drops_loaded_model(self):
         import main as main_mod
@@ -1074,6 +1180,164 @@ class ModelManagerOomCleanupTests(unittest.TestCase):
 
         self.assertIsNone(manager.model)
         self.assertIsNone(manager.current_model_name)
+
+
+class ModelManagerSlotCacheTests(unittest.TestCase):
+    class _FakeLoadedModel:
+        def __init__(self, name):
+            self.name = name
+
+        def half(self):
+            return self
+
+        def to(self, device):
+            return self
+
+    class _CudaOomOnceModel(_FakeLoadedModel):
+        def __init__(self, name, main_mod, *, raise_oom):
+            super().__init__(name)
+            self.main_mod = main_mod
+            self.raise_oom = raise_oom
+
+        def to(self, device):
+            if self.raise_oom:
+                raise self.main_mod.torch.cuda.OutOfMemoryError("simulated transfer oom")
+            return self
+
+    def _make_manager(self, *, slots=2):
+        import main as main_mod
+
+        manager = main_mod.ModelManager(model_slots=slots)
+        manager.set_worker_thread()
+        manager.device = "cpu"
+        return main_mod, manager
+
+    def test_two_slots_keep_dense_and_colbert_models_resident(self):
+        main_mod, manager = self._make_manager(slots=2)
+        dense_model = self._FakeLoadedModel("nomic")
+        colbert_model = self._FakeLoadedModel("colbert")
+
+        with mock.patch.object(manager, "_detect_device", return_value="cpu"), \
+             mock.patch.object(
+                 manager,
+                 "_construct_model_cpu_sync",
+                 side_effect=[dense_model, colbert_model],
+             ):
+            self.assertIs(manager._load_model_sync("nomic-embed-text"), dense_model)
+            self.assertIs(manager._load_model_sync("colbert-xm"), colbert_model)
+
+            with mock.patch.object(
+                manager,
+                "_load_model_sync",
+                side_effect=AssertionError("cache miss"),
+            ):
+                model, load_ns = manager._ensure_model_sync("nomic-embed-text")
+
+        self.assertIs(model, dense_model)
+        self.assertEqual(load_ns, 0)
+        snap = manager.snapshot()
+        self.assertEqual(
+            snap["loaded_models"],
+            ["colbert-xm", "nomic-embed-text"],
+        )
+        self.assertEqual(snap["current_model"], "nomic-embed-text")
+        self.assertEqual(snap["model_slots"], 2)
+
+    def test_third_model_evicts_lru_slot(self):
+        main_mod, manager = self._make_manager(slots=2)
+        dense_models = [
+            self._FakeLoadedModel("nomic"),
+            self._FakeLoadedModel("mxbai"),
+        ]
+        colbert_model = self._FakeLoadedModel("colbert")
+
+        with mock.patch.object(manager, "_detect_device", return_value="cpu"), \
+             mock.patch.object(
+                 manager,
+                 "_construct_model_cpu_sync",
+                 side_effect=[dense_models[0], colbert_model, dense_models[1]],
+             ):
+            manager._load_model_sync("nomic-embed-text")
+            manager._load_model_sync("colbert-xm")
+            model, load_ns = manager._ensure_model_sync("nomic-embed-text")
+            self.assertIs(model, dense_models[0])
+            self.assertEqual(load_ns, 0)
+            manager._load_model_sync("mxbai-embed-large")
+
+        snap = manager.snapshot()
+        self.assertEqual(
+            snap["loaded_models"],
+            ["nomic-embed-text", "mxbai-embed-large"],
+        )
+        self.assertEqual(snap["current_model"], "mxbai-embed-large")
+        self.assertNotIn("colbert-xm", manager.models)
+
+    def test_one_slot_evicts_previous_model(self):
+        main_mod, manager = self._make_manager(slots=1)
+        dense_models = [
+            self._FakeLoadedModel("nomic"),
+            self._FakeLoadedModel("mxbai"),
+        ]
+
+        with mock.patch.object(manager, "_detect_device", return_value="cpu"), \
+             mock.patch.object(
+                 manager,
+                 "_construct_model_cpu_sync",
+                 side_effect=dense_models,
+             ):
+            manager._load_model_sync("nomic-embed-text")
+            manager._load_model_sync("mxbai-embed-large")
+
+        snap = manager.snapshot()
+        self.assertEqual(snap["loaded_models"], ["mxbai-embed-large"])
+        self.assertNotIn("nomic-embed-text", manager.models)
+
+    def test_cuda_transfer_oom_retries_after_dropping_resident_cache(self):
+        main_mod, manager = self._make_manager(slots=3)
+        manager.device = "cuda"
+        old_dense = self._FakeLoadedModel("nomic")
+        old_colbert = self._FakeLoadedModel("colbert")
+        first_candidate = self._CudaOomOnceModel(
+            "first-mxbai",
+            main_mod,
+            raise_oom=True,
+        )
+        retry_candidate = self._CudaOomOnceModel(
+            "retry-mxbai",
+            main_mod,
+            raise_oom=False,
+        )
+        with manager.state_lock:
+            manager.models["nomic-embed-text"] = old_dense
+            manager.models["colbert-xm"] = old_colbert
+            manager.model = old_colbert
+            manager.current_model_name = "colbert-xm"
+
+        with mock.patch.object(manager, "_detect_device", return_value="cuda"), \
+             mock.patch.object(
+                 manager,
+                 "_construct_model_cpu_sync",
+                 side_effect=[first_candidate, retry_candidate],
+             ), \
+             mock.patch.object(main_mod.torch.cuda, "empty_cache"):
+            loaded = manager._load_model_sync("mxbai-embed-large")
+
+        self.assertIs(loaded, retry_candidate)
+        snap = manager.snapshot()
+        self.assertEqual(snap["loaded_models"], ["mxbai-embed-large"])
+        self.assertEqual(snap["current_model"], "mxbai-embed-large")
+        self.assertNotIn("nomic-embed-text", manager.models)
+        self.assertNotIn("colbert-xm", manager.models)
+
+    def test_model_slots_coercion_rejects_bool_and_float(self):
+        import main as main_mod
+
+        self.assertEqual(main_mod._coerce_model_slots(True, default=2), 2)
+        self.assertEqual(main_mod._coerce_model_slots(False, default=2), 2)
+        self.assertEqual(main_mod._coerce_model_slots(2.9, default=2), 2)
+        self.assertEqual(main_mod._coerce_model_slots(3.5, default=1), 1)
+        self.assertEqual(main_mod._coerce_model_slots("3", default=2), 3)
+        self.assertEqual(main_mod._coerce_model_slots("3.5", default=2), 2)
 
 
 # --- #757 Regression --------------------------------------------------------

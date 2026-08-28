@@ -1,0 +1,16 @@
+fastapi>=0.115
+uvicorn>=0.34
+torch>=2.3
+transformers>=4.44
+datasets>=2.20
+peft>=0.12
+trl>=0.9
+accelerate>=0.33
+bitsandbytes>=0.43
+safetensors>=0.4
+tokenizers>=0.19
+gguf>=0.14
+sentencepiece>=0.2
+protobuf>=5.0
+
+cryptography>=43.0

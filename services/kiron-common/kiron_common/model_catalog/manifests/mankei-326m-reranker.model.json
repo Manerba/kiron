@@ -1,0 +1,91 @@
+{
+  "schema_version": 1,
+  "canonical_model_id": "mankei-326m-reranker",
+  "aliases": [
+    "keyvan-ai/Mankei-326M-Reranker"
+  ],
+  "deployments": [
+    {
+      "id": "kiron-deberta-mankei-326m-reranker-v1.deployment",
+      "backend": {
+        "type": "kiron_deberta",
+        "parameters": {
+          "implementation": "kiron-mankei-last-token",
+          "implementation_revision": "v1",
+          "model_name": "mankei-326m-reranker"
+        }
+      },
+      "artifact": {
+        "type": "huggingface",
+        "repository": "keyvan-ai/Mankei-326M-Reranker",
+        "revision": "e1219e343a9ebdcf2e381c058a480e34defbeb95",
+        "manifest_digest": null,
+        "trust_remote_code": false,
+        "weights": [
+          {
+            "path": "model.safetensors",
+            "sha256": "34566de5240d16995f2830c00ea5981d5f3013f165b2c75a440100b7c49375d8"
+          }
+        ],
+        "auxiliary": [
+          {
+            "path": "head.pt",
+            "sha256": "ce0cf93891cbee260a7acfb9c5d66bf3d9c13c68e81fd9eb5cac99838b543edf"
+          }
+        ],
+        "metadata": {}
+      },
+      "routes": [
+        {
+          "task": "rerank",
+          "endpoint": "/api/rerank"
+        },
+        {
+          "task": "nli",
+          "endpoint": "/api/score"
+        }
+      ],
+      "loader": {
+        "type": "mankei_last_token",
+        "parameters": {
+          "backbone_torch_dtype": "bfloat16",
+          "batch_size": 16,
+          "head_filename": "head.pt",
+          "head_torch_dtype": "float32",
+          "max_length": 192,
+          "padding_side": "right",
+          "pair_template": "Frage: {query}\nPassage: {passage}",
+          "tokenizer_use_fast": true
+        }
+      },
+      "metadata": {
+        "service": {
+          "display_order": 5,
+          "labels": null,
+          "rerank_label": null,
+          "size": 652890301
+        }
+      }
+    }
+  ],
+  "profiles": [
+    {
+      "id": "kiron-mankei-326m-reranker-rerank-v1",
+      "deployment_id": "kiron-deberta-mankei-326m-reranker-v1.deployment",
+      "task": "rerank",
+      "endpoint": "/api/rerank",
+      "default_for_endpoint": true,
+      "metadata": {}
+    },
+    {
+      "id": "kiron-mankei-326m-reranker-score-v1",
+      "deployment_id": "kiron-deberta-mankei-326m-reranker-v1.deployment",
+      "task": "nli",
+      "endpoint": "/api/score",
+      "default_for_endpoint": true,
+      "metadata": {}
+    }
+  ],
+  "request_defaults": [],
+  "metadata": {}
+}

@@ -2,8 +2,10 @@
 
 import os
 import contextlib
+import grp
 import importlib.util
 from pathlib import Path
+import pwd
 import subprocess
 import sys
 import unittest
@@ -42,7 +44,8 @@ TEST_RUNTIME_DIR = Path(os.environ.get(
 def _load_app():
     module = _load_local_app()
     TEST_RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
-    for path in TEST_RUNTIME_DIR.glob("*"):
+    os.chmod(TEST_RUNTIME_DIR, 0o2770)
+    for path in TEST_RUNTIME_DIR.iterdir():
         if path.is_file():
             path.unlink()
     module.vram_lease.RUNTIME_MARKER_DIR = TEST_RUNTIME_DIR
@@ -58,6 +61,11 @@ def _load_app():
     module.vram_lease._lease_cache["active"] = False
     module.vram_lease._lease_cache["ts"] = 0.0
     module.vram_lease._shared_client = None
+    module.vram_lease.RUNTIME_MARKER_GROUP = grp.getgrgid(os.getgid()).gr_name
+    module.vram_lease.RUNTIME_MARKER_FILE_OWNER_NAMES = frozenset({
+        pwd.getpwuid(os.getuid()).pw_name,
+    })
+    module.vram_lease._runtime_marker_dir_owner_uid = lambda: os.getuid()
     return module
 
 

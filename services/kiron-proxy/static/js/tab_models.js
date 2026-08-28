@@ -1,955 +1,965 @@
 /**
- * Ollama Monitor - Models Tab
- * Verwalten von Ollama-Sprachmodellen: Anzeigen, Laden, Entladen, Pullen, Loeschen.
+ * KIron Models: one Catalog and local-registration view.
  */
 
-// ========================================
-// State
-// ========================================
-
 let _modelsData = [];
-let _pullInProgress = false;
-let _expandedRegistryModel = null;
-let _benchmarksData = {};
+let _registrationCandidates = [];
+let registrationDialogReturnFocus = null;
+let _modelsTable = null;
+let _modelRowIdSequence = 0;
+const _modelRowIds = new Map();
 
-// ========================================
-// Init
-// ========================================
-
-// Sub-Tab "Installiert": lokal installierte Modelle. Wird vom Sub-Tab-System
-// (app_core.js SUBTABS) aufgerufen, nicht direkt.
-async function initModelsInstalled() {
+function initModelsTab() {
     const container = document.getElementById('contentContainer');
     if (!container) return;
 
-    // Installiert nutzt keine Filter-Bar
     const filterBar = document.getElementById('filterBar');
+    let openButton = null;
     if (filterBar) {
-        filterBar.style.display = 'none';
-        filterBar.innerHTML = '';
-    }
-
-    container.innerHTML = `
-        <div class="models-page">
-            <div id="modelsTableContainer">
-                <div class="table-loading"><div class="spinner"></div></div>
-            </div>
-        </div>
-    `;
-
-    loadLocalModels();
-
-    // Pruefen ob ein Download aktiv ist (ueberlebt Page-Reload)
-    checkActivePulls();
-}
-
-// Sub-Tab "Verfuegbar": Registry + manueller Pull.
-async function initModelsAvailable() {
-    const container = document.getElementById('contentContainer');
-    if (!container) return;
-
-    // Download-Funktion in die Filter-Bar
-    const filterBar = document.getElementById('filterBar');
-    if (filterBar) {
-        filterBar.innerHTML = `
-            <div class="models-pull-manual">
-                <input type="text" id="modelsPullInput" class="filter-input models-pull-input"
-                       placeholder="Modellname, z.B. mistral:7b" />
-                <button class="action-btn primary" id="modelsPullBtn" onclick="startPullModel()">
-                    Herunterladen
-                </button>
-                <a href="https://ollama.com/search" target="_blank" class="models-search-link">
-                    Modelle auf ollama.com suchen
-                </a>
-            </div>
-            <div id="modelsPullProgress" class="models-pull-progress" style="display:none;">
-                <div class="models-progress-bar-container">
-                    <div class="models-progress-bar" id="modelsPullBar"></div>
-                </div>
-                <div class="models-progress-text" id="modelsPullText">Starte...</div>
-            </div>
-        `;
+        filterBar.replaceChildren();
         filterBar.style.display = 'flex';
+        const controlGroup = document.createElement('div');
+        controlGroup.className = 'filter-group models-control-group';
+        openButton = document.createElement('button');
+        openButton.className = 'action-btn primary';
+        openButton.id = 'modelRegistrationOpen';
+        openButton.type = 'button';
+        openButton.textContent = '+ Modell registrieren';
+        controlGroup.appendChild(openButton);
+        filterBar.appendChild(controlGroup);
     }
 
     container.innerHTML = `
         <div class="models-page">
-            <div id="registryTableContainer" class="models-registry-section">
-                <div class="table-loading"><div class="spinner"></div></div>
+            <div class="models-table-viewport">
+                <div id="modelsTableContainer">
+                    <div class="table-loading"><div class="spinner"></div></div>
+                </div>
+            </div>
+            <div class="models-registration-overlay"
+                 id="modelRegistrationDialog" hidden>
+                <section class="models-registration-dialog"
+                         role="dialog" aria-modal="true" tabindex="-1"
+                         aria-labelledby="modelRegistrationTitle"
+                         aria-describedby="modelRegistrationHelp">
+                    <form id="modelRegistrationForm">
+                    <div class="models-dialog-header">
+                        <h2 id="modelRegistrationTitle">Lokales Modell registrieren</h2>
+                        <button class="models-dialog-close" id="modelRegistrationClose"
+                                type="button" aria-label="Dialog schließen">×</button>
+                    </div>
+                    <p id="modelRegistrationHelp" class="text-muted">
+                        Zur Auswahl stehen nur bereits vorhandene Modelle, die KIron
+                        noch nicht aus Catalog oder lokaler Registry kennt.
+                    </p>
+                    <label for="modelRegistrationProvider">Provider</label>
+                    <select id="modelRegistrationProvider" required>
+                        <option value="ollama">Ollama</option>
+                        <option value="huggingface">Hugging Face (lokales Verzeichnis)</option>
+                    </select>
+                    <label id="modelRegistrationReferenceLabel"
+                           for="modelRegistrationReference">Vorhandenes lokales Modell</label>
+                    <select id="modelRegistrationReference" required>
+                        <option value="">Modelle werden geladen…</option>
+                    </select>
+                    <p id="modelRegistrationCandidateStatus" class="text-muted"
+                       aria-live="polite"></p>
+                    <div class="models-loader-field" id="modelRegistrationLoaderField" hidden>
+                        <label for="modelRegistrationLoader">Loader</label>
+                        <select id="modelRegistrationLoader" disabled required>
+                            <option value="sentence_transformers">Sentence Transformers</option>
+                            <option value="transformers_last_token">Transformers Last Token</option>
+                            <option value="colbert_xmod">ColBERT XMOD</option>
+                            <option value="cross_encoder">Cross Encoder</option>
+                            <option value="mankei_last_token">Mankei Last Token</option>
+                        </select>
+                    </div>
+                    <p class="models-registration-error" id="modelRegistrationError"
+                       role="alert" aria-live="polite"></p>
+                    <div class="models-dialog-actions">
+                        <button class="action-btn" id="modelRegistrationCancel"
+                                type="button">Abbrechen</button>
+                        <button class="action-btn primary" id="modelRegistrationSubmit"
+                                type="submit">Registrieren</button>
+                    </div>
+                    </form>
+                </section>
             </div>
         </div>
     `;
 
-    // Benchmarks (Registry-Spalten) + lokale Modelle (Installiert-Check) vor dem
-    // Registry-Render bereitstellen.
-    await Promise.all([loadBenchmarks(), fetchLocalModels()]);
-    loadFeaturedModels();
+    const overlay = document.getElementById('modelRegistrationDialog');
+    const provider = document.getElementById('modelRegistrationProvider');
+    const form = document.getElementById('modelRegistrationForm');
+    const tableContainer = document.getElementById('modelsTableContainer');
 
-    // Pruefen ob ein Download aktiv ist (ueberlebt Page-Reload)
-    checkActivePulls();
+    if (openButton) {
+        openButton.addEventListener(
+            'click',
+            () => showRegistrationDialog(openButton)
+        );
+    }
+    tableContainer.addEventListener('click', handleModelsTableAction, true);
+    _modelsTable = createModelsTable();
+    tables.models = _modelsTable;
+    document.getElementById('modelRegistrationClose').addEventListener(
+        'click',
+        closeRegistrationOverlay
+    );
+    document.getElementById('modelRegistrationCancel').addEventListener(
+        'click',
+        closeRegistrationOverlay
+    );
+    provider.addEventListener('change', () => {
+        updateRegistrationFields();
+        renderRegistrationCandidates();
+    });
+    form.addEventListener('submit', submitModelRegistration);
+    overlay.addEventListener('click', event => {
+        if (event.target === overlay) closeRegistrationOverlay();
+    });
+    overlay.addEventListener('keydown', registrationOverlayKeydown);
+
+    updateRegistrationFields();
+    loadLocalModels();
 }
 
-// ========================================
-// Benchmarks laden
-// ========================================
+function showRegistrationDialog(trigger) {
+    const overlay = document.getElementById('modelRegistrationDialog');
+    const form = document.getElementById('modelRegistrationForm');
+    registrationDialogReturnFocus = trigger;
+    form.reset();
+    clearRegistrationError();
+    updateRegistrationFields();
+    overlay.hidden = false;
+    document.getElementById('modelRegistrationProvider').focus();
+    loadRegistrationCandidates();
+}
 
-async function loadBenchmarks() {
-    try {
-        const resp = await fetch('/api/benchmarks');
-        const data = await resp.json();
-        _benchmarksData = data.models || {};
-    } catch {
-        _benchmarksData = {};
+function closeRegistrationOverlay() {
+    const overlay = document.getElementById('modelRegistrationDialog');
+    if (!overlay || overlay.hidden) return;
+    overlay.hidden = true;
+    clearRegistrationError();
+    if (
+        registrationDialogReturnFocus
+        && document.contains(registrationDialogReturnFocus)
+    ) {
+        registrationDialogReturnFocus.focus();
+    }
+    registrationDialogReturnFocus = null;
+}
+
+function registrationOverlayKeydown(event) {
+    const overlay = event.currentTarget;
+    if (event.key === 'Escape') {
+        event.preventDefault();
+        closeRegistrationOverlay();
+        return;
+    }
+    if (event.key !== 'Tab') return;
+
+    const focusable = Array.from(overlay.querySelectorAll(
+        'button:not([disabled]), select:not([disabled]), '
+        + '[href], [tabindex]:not([tabindex="-1"])'
+    )).filter(node => !node.hidden && node.offsetParent !== null);
+    if (!focusable.length) {
+        event.preventDefault();
+        overlay.querySelector('[role="dialog"]')?.focus();
+        return;
+    }
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
     }
 }
 
-function getBenchmark(modelName, field) {
-    const base = modelName.split(':')[0];
-    const entry = _benchmarksData[base];
-    if (!entry) return null;
-    const val = entry[field];
-    if (val === null || val === undefined) return null;
-    return val;
+function clearRegistrationError() {
+    const errorNode = document.getElementById('modelRegistrationError');
+    if (errorNode) errorNode.textContent = '';
 }
 
-function formatBenchmark(val) {
-    if (val === null || val === undefined) return '<span class="text-muted">-</span>';
-    return typeof val === 'number' ? val.toFixed(1) : escapeHtml(String(val));
+function updateRegistrationFields() {
+    const provider = document.getElementById('modelRegistrationProvider');
+    const loader = document.getElementById('modelRegistrationLoader');
+    const loaderField = document.getElementById('modelRegistrationLoaderField');
+    const referenceLabel = document.getElementById(
+        'modelRegistrationReferenceLabel'
+    );
+    if (!provider || !loader || !loaderField || !referenceLabel) return;
+    const huggingface = provider.value === 'huggingface';
+    loader.disabled = !huggingface;
+    loaderField.hidden = !huggingface;
+    referenceLabel.textContent = huggingface
+        ? 'Vorhandene Hugging-Face-Modellwurzel'
+        : 'Vorhandenes Ollama-Modell';
 }
 
-function isKnownNumber(val) {
-    return typeof val === 'number' && Number.isFinite(val);
+function renderRegistrationCandidates() {
+    const provider = document.getElementById('modelRegistrationProvider');
+    const reference = document.getElementById('modelRegistrationReference');
+    const status = document.getElementById('modelRegistrationCandidateStatus');
+    const submit = document.getElementById('modelRegistrationSubmit');
+    if (!provider || !reference || !status || !submit) return;
+
+    const matching = _registrationCandidates.filter(
+        candidate => candidate.provider === provider.value
+    );
+    reference.replaceChildren();
+    const placeholder = document.createElement('option');
+    placeholder.value = '';
+    placeholder.selected = true;
+    placeholder.disabled = true;
+    placeholder.textContent = matching.length
+        ? 'Modell auswählen…'
+        : 'Keine unregistrierten lokalen Modelle gefunden';
+    reference.appendChild(placeholder);
+
+    for (const candidate of matching) {
+        const option = document.createElement('option');
+        option.value = candidate.reference;
+        option.textContent = candidate.provider === 'huggingface'
+            ? `${candidate.display_name} — ${candidate.reference}`
+            : candidate.display_name;
+        reference.appendChild(option);
+    }
+    reference.disabled = matching.length === 0;
+    submit.disabled = matching.length === 0;
+    status.textContent = matching.length
+        ? `${matching.length} unregistrierte lokale Modelle gefunden.`
+        : 'Keine unregistrierten lokalen Modelle gefunden.';
 }
 
-function formatGbValue(val) {
-    return isKnownNumber(val) ? val + ' GB' : '<span class="text-muted">Unbekannt</span>';
-}
-
-// ========================================
-// Lokale Modelle laden und rendern
-// ========================================
-
-// Holt lokale Modelle in _modelsData (container-unabhaengig, auch fuer den
-// Verfuegbar-Sub-Tab). Gibt bei Fehler einen Meldungstext zurueck, sonst null.
-async function fetchLocalModels() {
+async function loadRegistrationCandidates() {
+    const reference = document.getElementById('modelRegistrationReference');
+    const status = document.getElementById('modelRegistrationCandidateStatus');
+    const submit = document.getElementById('modelRegistrationSubmit');
+    if (!reference || !status || !submit) return;
+    reference.disabled = true;
+    submit.disabled = true;
+    status.textContent = 'Lokale Modelle werden gelesen…';
     try {
-        const resp = await fetch('/api/models/local');
-        if (!resp.ok) {
-            const err = await resp.json().catch(() => ({}));
-            return `Fehler: ${escapeHtml(err.error || resp.statusText)}`;
+        const response = await fetch('/api/models/registration-candidates');
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+            throw new Error(data?.error?.message || response.statusText);
         }
-        const data = await resp.json();
-        _modelsData = data.models || [];
-        return null;
-    } catch (e) {
-        return 'Ollama nicht erreichbar';
+        _registrationCandidates = Array.isArray(data.candidates)
+            ? data.candidates.filter(candidate => (
+                candidate
+                && (candidate.provider === 'ollama'
+                    || candidate.provider === 'huggingface')
+                && typeof candidate.reference === 'string'
+                && typeof candidate.display_name === 'string'
+            ))
+            : [];
+        renderRegistrationCandidates();
+    } catch (error) {
+        _registrationCandidates = [];
+        reference.replaceChildren();
+        const option = document.createElement('option');
+        option.value = '';
+        option.textContent = 'Lokale Modelle konnten nicht gelesen werden';
+        reference.appendChild(option);
+        status.textContent = `Kandidaten konnten nicht geladen werden: ${error.message}`;
+        reference.disabled = true;
+        submit.disabled = true;
     }
+}
+
+async function submitModelRegistration(event) {
+    event.preventDefault();
+    const providerNode = document.getElementById('modelRegistrationProvider');
+    const referenceNode = document.getElementById('modelRegistrationReference');
+    const loaderNode = document.getElementById('modelRegistrationLoader');
+    const submitButton = document.getElementById('modelRegistrationSubmit');
+    const errorNode = document.getElementById('modelRegistrationError');
+    const payload = {
+        provider: providerNode.value,
+        reference: referenceNode.value,
+    };
+    if (providerNode.value === 'huggingface') {
+        payload.loader = loaderNode.value;
+    }
+
+    submitButton.disabled = true;
+    errorNode.textContent = '';
+    try {
+        const response = await fetch('/api/models/register', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(payload),
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+            const code = data?.error?.code || 'registration_failed';
+            const message = data?.error?.message || response.statusText;
+            errorNode.textContent = `${code}: ${message}`;
+            return;
+        }
+        await loadLocalModels();
+        closeRegistrationOverlay();
+        showNotification('Modell lokal registriert', 'success');
+    } catch (error) {
+        errorNode.textContent = `registration_failed: ${error.message}`;
+    } finally {
+        submitButton.disabled = !referenceNode.value;
+    }
+}
+
+async function fetchLocalModels() {
+    const response = await fetch('/api/models/local');
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+        throw new Error(data.error || data?.error?.message || response.statusText);
+    }
+    _modelsData = Array.isArray(data.models) ? data.models : [];
 }
 
 async function loadLocalModels() {
     const tableContainer = document.getElementById('modelsTableContainer');
     if (!tableContainer) return;
-
-    const error = await fetchLocalModels();
-    if (error) {
-        tableContainer.innerHTML = `<div class="no-data">${error}</div>`;
-        return;
+    try {
+        await fetchLocalModels();
+        renderModelsTable();
+    } catch (error) {
+        const message = document.createElement('div');
+        message.className = 'no-data';
+        message.textContent = `Modelle konnten nicht geladen werden: ${error.message}`;
+        tableContainer.replaceChildren(message);
     }
-    renderModelsTable();
+}
+
+function modelTypeLabel(value) {
+    const labels = {
+        llm: 'LLM',
+        vlm: 'VLM',
+        embedding: 'Embedding',
+        colbert: 'ColBERT',
+        rerank: 'Rerank',
+    };
+    return labels[value] || String(value || '—');
+}
+
+function statusLabel(model) {
+    if (model.load_state === 'unknown') return 'Load-Status unbekannt';
+    if (model.embedding_loading || model.loading) return 'Wird geladen';
+    if (model.loaded && model.managed_service) return 'Geladen (Service)';
+    if (model.configured && !model.installed) {
+        return 'Konfiguriert, nicht installiert';
+    }
+    if (model.loaded) return 'Geladen';
+    return model.installed
+        ? 'Installiert, nicht geladen'
+        : 'Nicht installiert';
+}
+
+function memoryLabel(model) {
+    if (model.load_state === 'unknown') return 'Unbekannt';
+    const parts = [];
+    if (typeof model.vram_gb === 'number' && Number.isFinite(model.vram_gb)) {
+        parts.push(`VRAM ${model.vram_gb.toFixed(2)} GB`);
+    }
+    if (typeof model.ram_gb === 'number' && Number.isFinite(model.ram_gb)) {
+        parts.push(`RAM ${model.ram_gb.toFixed(2)} GB`);
+    }
+    return parts.length ? parts.join(' / ') : '—';
+}
+
+function sizeLabel(value) {
+    return typeof value === 'number' && Number.isFinite(value)
+        ? `${value.toFixed(2)} GB`
+        : 'Unbekannt';
+}
+
+function modelIdentityKey(model) {
+    return [
+        model.backend || '',
+        model.canonical_model_id || '',
+        model.registry_id || '',
+        model.reference || '',
+        model.name || '',
+    ].join('\u001f');
+}
+
+function modelRowId(model) {
+    const identity = modelIdentityKey(model);
+    if (!_modelRowIds.has(identity)) {
+        _modelRowIdSequence += 1;
+        _modelRowIds.set(identity, `model-row-${_modelRowIdSequence}`);
+    }
+    return _modelRowIds.get(identity);
+}
+
+function modelOriginLabel(model) {
+    const origins = [];
+    if (model.catalog_managed) origins.push('Catalog');
+    if (model.locally_registered) origins.push('Lokal registriert');
+    return origins.length ? origins.join(' + ') : '—';
+}
+
+function modelListLabel(value) {
+    return Array.isArray(value) && value.length ? value.join(', ') : '—';
+}
+
+function tokenCountLabel(value, fallback = 'Nicht ermittelt') {
+    return Number.isInteger(value) && value > 0
+        ? `${value.toLocaleString('de-DE')} Token`
+        : fallback;
+}
+
+function dateTimeLabel(value) {
+    if (!value) return '—';
+    const parsed = new Date(value);
+    return Number.isNaN(parsed.getTime())
+        ? String(value)
+        : parsed.toLocaleString('de-DE');
+}
+
+function yesNoLabel(value) {
+    return value === true ? 'Ja' : value === false ? 'Nein' : 'Unbekannt';
+}
+
+function modelBadgeHtml(table, label, className) {
+    return `<span class="models-badge ${className}">`
+        + `${table.escapeHtml(label)}</span>`;
+}
+
+function renderModelOrigin(table, model) {
+    const badges = [];
+    if (model.catalog_managed) {
+        badges.push(modelBadgeHtml(table, 'Catalog', 'models-badge-catalog'));
+    }
+    if (model.locally_registered) {
+        badges.push(
+            modelBadgeHtml(table, 'Lokal registriert', 'models-badge-local')
+        );
+    }
+    return badges.length ? badges.join(' ') : '—';
+}
+
+function modelActionButtonHtml(table, row, action, label, className, title, disabled = false) {
+    const classes = `action-btn ${className || ''}`.trim();
+    const disabledAttribute = disabled ? ' disabled' : '';
+    const actionAttribute = action
+        ? ` data-model-action="${table.escapeHtml(action)}"`
+        : '';
+    return `<button type="button" class="${table.escapeHtml(classes)}"`
+        + `${actionAttribute} data-model-row="${table.escapeHtml(row.id)}"`
+        + ` title="${table.escapeHtml(title)}"${disabledAttribute}>`
+        + `${table.escapeHtml(label)}</button>`;
+}
+
+function renderModelActions(table, row) {
+    const model = row._model;
+    const actions = [];
+
+    if (
+        model.backend === 'kiron_embeddings'
+        && model.installed
+        && model.embedding_loading
+    ) {
+        actions.push(modelActionButtonHtml(
+            table,
+            row,
+            '',
+            model.embedding_kind === 'colbert' ? 'ColBERT lädt…' : 'Lädt…',
+            'models-btn-embed',
+            'Embedding-Ladevorgang läuft',
+            true
+        ));
+    } else if (
+        model.backend === 'kiron_embeddings'
+        && model.installed
+        && !model.embedding_active
+    ) {
+        actions.push(modelActionButtonHtml(
+            table,
+            row,
+            'load-embedding',
+            model.embedding_kind === 'colbert' ? 'ColBERT laden' : 'Embedding',
+            'models-btn-embed',
+            'Im Embedding-Service laden'
+        ));
+    } else if (model.embedding_kind === 'colbert') {
+        actions.push(modelActionButtonHtml(
+            table,
+            row,
+            'warmup-colbert',
+            'Warmup',
+            'models-btn-embed',
+            'ColBERT-Warmup ausführen'
+        ));
+    }
+
+    if (model.backend === 'ollama' && model.installed) {
+        if (model.loaded) {
+            actions.push(modelActionButtonHtml(
+                table, row, 'unload', 'Entladen', '',
+                'Aus dem Speicher entladen'
+            ));
+        } else {
+            actions.push(modelActionButtonHtml(
+                table, row, 'load-gpu', 'Laden', 'primary', 'Mit GPU laden'
+            ));
+            actions.push(modelActionButtonHtml(
+                table, row, 'load-cpu', 'CPU', '', 'Ohne GPU laden'
+            ));
+        }
+        actions.push(modelActionButtonHtml(
+            table, row, 'delete', 'Löschen', 'danger',
+            'Lokales Ollama-Modell löschen'
+        ));
+    }
+
+    return actions.length
+        ? `<span class="models-actions">${actions.join('')}</span>`
+        : '—';
+}
+
+function modelDetailItem(table, label, value, code = false) {
+    const rendered = value === null || value === undefined || value === ''
+        ? '—'
+        : String(value);
+    const valueClass = code ? ' models-detail-code' : '';
+    return '<div class="models-detail-item">'
+        + `<dt>${table.escapeHtml(label)}</dt>`
+        + `<dd class="${valueClass.trim()}">${table.escapeHtml(rendered)}</dd>`
+        + '</div>';
+}
+
+function renderCatalogTokenLimits(table, model) {
+    const limits = Array.isArray(model.catalog_token_limits)
+        ? model.catalog_token_limits
+        : [];
+    if (!limits.length) {
+        return '<p class="models-detail-empty">'
+            + (model.catalog_managed
+                ? 'Keine profilbezogenen Token-Limits deklariert.'
+                : 'Nicht im Catalog verwaltet.')
+            + '</p>';
+    }
+
+    return '<div class="models-token-limits">' + limits.map(limit => {
+        const roles = limit.by_role && typeof limit.by_role === 'object'
+            ? Object.entries(limit.by_role)
+            : [];
+        const renderedRoles = roles.map(([role, value]) => {
+            const labels = {
+                search_query: 'Suchanfrage',
+                search_document: 'Dokument',
+            };
+            return '<span class="models-token-role">'
+                + `<span>${table.escapeHtml(labels[role] || role)}</span>`
+                + `<strong>${table.escapeHtml(tokenCountLabel(value, 'Unbekannt'))}</strong>`
+                + '</span>';
+        }).join('');
+        const policy = [
+            limit.unit,
+            limit.counting,
+            `Truncation: ${limit.truncation || 'unbekannt'}`,
+            `Overflow: ${limit.overflow || 'unbekannt'}`,
+        ].filter(Boolean).join(' · ');
+        return '<article class="models-token-profile">'
+            + `<h4>${table.escapeHtml(limit.profile_id || 'Profil')}</h4>`
+            + `<div class="models-token-roles">${renderedRoles || '—'}</div>`
+            + `<p>${table.escapeHtml(policy)}</p>`
+            + '</article>';
+    }).join('') + '</div>';
+}
+
+function renderModelDetail(table, model) {
+    const ollamaModel = model.backend === 'ollama';
+    const nativeContext = ollamaModel
+        ? tokenCountLabel(model.native_context_length)
+        : 'Nicht über Ollama bereitgestellt';
+    const runtimeContext = !ollamaModel
+        ? 'Nicht zutreffend'
+        : model.loaded
+            ? tokenCountLabel(model.runtime_context_length)
+            : model.load_state === 'unknown'
+                ? 'Load-Status unbekannt'
+                : 'Nicht geladen';
+    const catalogContext = model.catalog_managed
+        ? tokenCountLabel(model.catalog_context_length, 'Nicht deklariert')
+        : 'Nicht im Catalog verwaltet';
+    const memoryVram = typeof model.vram_gb === 'number'
+        ? `${model.vram_gb.toFixed(2)} GB`
+        : '—';
+    const memoryRam = typeof model.ram_gb === 'number'
+        ? `${model.ram_gb.toFixed(2)} GB`
+        : '—';
+
+    return '<div class="detail-content models-detail-content">'
+        + '<section class="models-detail-block">'
+        + '<h3>Token &amp; Kontext</h3>'
+        + '<dl class="models-detail-grid">'
+        + modelDetailItem(
+            table,
+            'Native Modellgrenze',
+            nativeContext
+        )
+        + modelDetailItem(table, 'Aktiver Ollama-Runner', runtimeContext)
+        + modelDetailItem(table, 'Catalog-Kontextwert (aggregiert)', catalogContext)
+        + '</dl>'
+        + '<p class="models-context-note">Der Runner-Wert gilt für die aktuelle '
+        + 'Ollama-Ladung. Ein Request mit abweichendem num_ctx kann den Runner neu laden.</p>'
+        + '<div class="models-detail-subheading">Catalog-Limits je Profil/Rolle</div>'
+        + renderCatalogTokenLimits(table, model)
+        + '</section>'
+        + '<section class="models-detail-block">'
+        + '<h3>Identität</h3>'
+        + '<dl class="models-detail-grid">'
+        + modelDetailItem(table, 'Modellname', model.name, true)
+        + modelDetailItem(table, 'Canonical-ID', model.canonical_model_id, true)
+        + modelDetailItem(table, 'Aliase', modelListLabel(model.aliases), true)
+        + modelDetailItem(table, 'Herkunft', modelOriginLabel(model))
+        + modelDetailItem(table, 'Backend', model.backend, true)
+        + modelDetailItem(table, 'Provider', model.provider, true)
+        + modelDetailItem(table, 'Lokale Referenz', model.reference, true)
+        + modelDetailItem(table, 'Loader', model.loader, true)
+        + modelDetailItem(table, 'Registry-ID', model.registry_id, true)
+        + modelDetailItem(table, 'Catalog-Digest', model.catalog_digest, true)
+        + '</dl>'
+        + '</section>'
+        + '<section class="models-detail-block">'
+        + '<h3>Runtime</h3>'
+        + '<dl class="models-detail-grid">'
+        + modelDetailItem(table, 'Status', statusLabel(model))
+        + modelDetailItem(table, 'Konfiguriert', yesNoLabel(model.configured))
+        + modelDetailItem(table, 'Installiert', yesNoLabel(model.installed))
+        + modelDetailItem(table, 'Typ', modelTypeLabel(model.model_type))
+        + modelDetailItem(table, 'Familie', model.family)
+        + modelDetailItem(table, 'Format', model.format)
+        + modelDetailItem(table, 'Parameter', model.parameter_size)
+        + modelDetailItem(table, 'Quantisierung', model.quantization_level)
+        + modelDetailItem(table, 'Modellgröße', sizeLabel(model.size_gb))
+        + modelDetailItem(table, 'VRAM', memoryVram)
+        + modelDetailItem(table, 'RAM', memoryRam)
+        + modelDetailItem(table, 'Geladen bis', dateTimeLabel(model.expires_at))
+        + modelDetailItem(table, 'Tasks', modelListLabel(model.tasks), true)
+        + modelDetailItem(table, 'Endpoints', modelListLabel(model.endpoints), true)
+        + modelDetailItem(table, 'Profile', modelListLabel(model.profile_ids), true)
+        + modelDetailItem(
+            table,
+            'Deployments',
+            modelListLabel(model.deployment_ids),
+            true
+        )
+        + '</dl>'
+        + '</section>'
+        + '</div>';
+}
+
+function createModelsTable() {
+    const table = new ExpandableTable({
+        id: 'models',
+        showHeader: true,
+        expandable: true,
+        gridTemplate: '30px minmax(180px, 1.6fr) 140px 90px '
+            + 'minmax(100px, 1fr) 95px 85px 90px minmax(155px, 1.1fr) '
+            + 'minmax(170px, 1.2fr) minmax(205px, auto)',
+        defaultSort: {field: 'name', direction: 'asc'},
+        columns: [
+            {field: 'name', label: 'Modell', sortable: true, align: 'left', renderer: 'modelName'},
+            {field: 'source', label: 'Herkunft', sortable: false, align: 'left', renderer: 'modelOrigin'},
+            {field: 'model_type', label: 'Typ', sortable: true, align: 'left', renderer: 'modelType'},
+            {field: 'family', label: 'Familie', sortable: true, align: 'left'},
+            {field: 'parameter_size', label: 'Parameter', sortable: true, align: 'left'},
+            {field: 'quantization_level', label: 'Quant.', sortable: true, align: 'left'},
+            {field: 'size_gb', label: 'Größe', sortable: true, align: 'right', renderer: 'modelSize'},
+            {field: 'load_state', label: 'Status', sortable: true, align: 'left', renderer: 'modelStatus'},
+            {field: 'vram_gb', label: 'Speicher', sortable: true, align: 'left', renderer: 'modelMemory'},
+            {field: 'name', label: 'Aktionen', sortable: false, align: 'right', renderer: 'modelActions'},
+        ],
+        detailFields: [],
+    }, 'modelsTableContainer');
+
+    table.renderers.modelName = (value) => (
+        `<span class="models-name">${table.escapeHtml(value || '—')}</span>`
+    );
+    table.renderers.modelOrigin = (_value, _column, row) => (
+        renderModelOrigin(table, row._model)
+    );
+    table.renderers.modelType = (value) => table.escapeHtml(modelTypeLabel(value));
+    table.renderers.modelSize = (value) => table.escapeHtml(sizeLabel(value));
+    table.renderers.modelStatus = (_value, _column, row) => modelBadgeHtml(
+        table,
+        statusLabel(row._model),
+        row._model.loaded ? 'models-badge-loaded' : 'models-badge-unloaded'
+    );
+    table.renderers.modelMemory = (_value, _column, row) => (
+        table.escapeHtml(memoryLabel(row._model))
+    );
+    table.renderers.modelActions = (_value, _column, row) => (
+        renderModelActions(table, row)
+    );
+    table.renderDetail = row => renderModelDetail(table, row._model);
+    return table;
+}
+
+function handleModelsTableAction(event) {
+    const button = event.target.closest('[data-model-action]');
+    if (!button || !_modelsTable) return;
+    event.preventDefault();
+    event.stopPropagation();
+
+    const row = _modelsTable.getAllData().find(
+        item => item.id === button.dataset.modelRow
+    );
+    if (!row) return;
+    const model = row._model;
+    const name = String(model.name || '');
+    const action = button.dataset.modelAction;
+
+    if (action === 'load-embedding') {
+        button.disabled = true;
+        button.textContent = 'Lädt…';
+        void loadEmbeddingModel(name);
+    } else if (action === 'warmup-colbert') {
+        void warmupColbertModel(name, button);
+    } else if (action === 'load-gpu') {
+        void loadModel(name, true, button);
+    } else if (action === 'load-cpu') {
+        void loadModel(name, false, button);
+    } else if (action === 'unload') {
+        void unloadModel(name, button);
+    } else if (action === 'delete') {
+        void deleteModel(name, Boolean(model.loaded));
+    }
 }
 
 function renderModelsTable() {
     const tableContainer = document.getElementById('modelsTableContainer');
-    if (!tableContainer) return;
+    if (!tableContainer || !_modelsTable) return;
+    const expanded = new Set(
+        Array.from(tableContainer.querySelectorAll('.table-row-wrapper.expanded'))
+            .map(node => node.dataset.rowId)
+    );
 
     if (_modelsData.length === 0) {
-        tableContainer.innerHTML = `
-            <div class="no-data">
-                Keine Modelle installiert.<br>
-                <span class="text-muted">Verwende den Download-Bereich oben, um ein Modell herunterzuladen.</span>
-            </div>
-        `;
+        const empty = document.createElement('div');
+        empty.className = 'no-data';
+        empty.textContent = 'Keine Catalog- oder lokalen Registryeinträge vorhanden.';
+        tableContainer.replaceChildren(empty);
+        _modelsTable.data = [];
+        _modelsTable.filteredData = [];
         return;
     }
 
-    // Sortierung: Aktive/Geladene zuerst, laufende Embedding-Loads danach
-    const sorted = [..._modelsData].sort((a, b) => {
-        const aActive = a.load_state === 'loaded' || a.embedding_active || a.embedding_loading;
-        const bActive = b.load_state === 'loaded' || b.embedding_active || b.embedding_loading;
-        if (aActive && !bActive) return -1;
-        if (!aActive && bActive) return 1;
-        if (a.embedding_loading && !b.embedding_loading) return -1;
-        if (!a.embedding_loading && b.embedding_loading) return 1;
-        return a.name.localeCompare(b.name);
-    });
+    _modelsTable.data = _modelsData.map(model => ({
+        ...model,
+        id: modelRowId(model),
+        _model: model,
+    }));
+    _modelsTable.applyFiltersAndRender();
 
-    let html = `<table class="models-table">
-        <thead>
-            <tr>
-                <th>Modell</th>
-                <th>Typ</th>
-                <th>Familie</th>
-                <th>Parameter</th>
-                <th>Quant.</th>
-                <th>Groesse</th>
-                <th>Status</th>
-                <th>Speicher (VRAM / RAM)</th>
-                <th>Aktionen</th>
-            </tr>
-        </thead>
-        <tbody>`;
-
-    for (const m of sorted) {
-        const statusBadge = getStatusBadge(m);
-        const memBar = getMemoryBar(m);
-        const typeBadge = getTypeBadge(m.model_type);
-        const expiresInfo = m.expires_at ? `<div class="models-expires">Entladen: ${formatExpires(m.expires_at)}</div>` : '';
-        const ctxInfo = m.context_length ? `<div class="models-ctx">Ctx: ${m.context_length.toLocaleString()}</div>` : '';
-
-        // Ollama Laden/Entladen Buttons
-        let ollamaActions = '';
-        if (m.loaded) {
-            ollamaActions = `<button class="action-btn" onclick="unloadModel('${escapeHtml(m.name)}')" title="Entladen">Entladen</button>`;
-        } else {
-            ollamaActions = `<div class="models-load-group">
-                <button class="action-btn primary" onclick="loadModel('${escapeHtml(m.name)}', true)" title="Laden (GPU)">Laden</button>
-                <button class="action-btn" onclick="loadModel('${escapeHtml(m.name)}', false)" title="Ohne GPU laden">CPU</button>
-            </div>`;
-        }
-
-        // Embedding-Service Button (nur bei embedding-faehigen Modellen)
-        let embedAction = '';
-        if (m.embedding_capable && m.embedding_loading) {
-            embedAction = `<button class="action-btn models-btn-embed" disabled title="Embedding-Load laeuft">Lade...</button>`;
-        } else if (m.embedding_capable && !m.embedding_active) {
-            embedAction = `<button class="action-btn models-btn-embed" onclick="loadEmbeddingModel('${escapeHtml(m.name)}')" title="Im Embedding-Service laden">Embedding</button>`;
-        }
-
-        html += `<tr data-model="${escapeHtml(m.name)}">
-            <td class="font-bold">${escapeHtml(m.name)}</td>
-            <td>${typeBadge}</td>
-            <td>${escapeHtml(m.family)}</td>
-            <td>${escapeHtml(m.parameter_size)}</td>
-            <td>${escapeHtml(m.quantization_level)}</td>
-            <td>${formatGbValue(m.size_gb)}</td>
-            <td>${statusBadge}${ctxInfo}${expiresInfo}</td>
-            <td>${memBar}</td>
-            <td class="models-actions">
-                ${embedAction}
-                ${ollamaActions}
-                <button class="action-btn danger" onclick="deleteModel('${escapeHtml(m.name)}', ${m.loaded})" title="Loeschen">Loeschen</button>
-            </td>
-        </tr>`;
-    }
-
-    html += '</tbody></table>';
-    tableContainer.innerHTML = html;
-}
-
-function getStatusBadge(model) {
-    if (model.load_state === 'unknown') {
-        return '<span class="models-badge models-badge-unloaded">Load-Status unbekannt</span>';
-    }
-    // Embedding-Service aktiv: blauer Badge
-    if (model.embedding_loading) {
-        return '<span class="models-badge models-badge-mixed">Embedding laedt</span>';
-    }
-    if (model.embedding_active) {
-        if (model.loaded) {
-            // Sowohl in Ollama als auch im Embedding-Service geladen
-            return '<span class="models-badge models-badge-embed-active">Aktiv (Embedding + Ollama)</span>';
-        }
-        return '<span class="models-badge models-badge-embed-active">Aktiv (Embedding)</span>';
-    }
-    if (!model.loaded) {
-        return '<span class="models-badge models-badge-unloaded">Nicht geladen</span>';
-    }
-    if (model.ram_gb <= 0.01) {
-        return '<span class="models-badge models-badge-vram">Geladen (VRAM)</span>';
-    }
-    if (model.vram_gb <= 0.01) {
-        return '<span class="models-badge models-badge-ram">Geladen (RAM)</span>';
-    }
-    return '<span class="models-badge models-badge-mixed">Geladen (VRAM+RAM)</span>';
-}
-
-function getTypeBadge(modelType) {
-    switch (modelType) {
-        case 'embedding':
-            return '<span class="models-badge models-badge-type-embed">Embedding</span>';
-        case 'vlm':
-            return '<span class="models-badge models-badge-type-vlm">VLM</span>';
-        default:
-            return '<span class="models-badge models-badge-type-llm">LLM</span>';
+    for (const rowId of expanded) {
+        const wrapper = tableContainer.querySelector(`[data-row-id="${rowId}"]`);
+        if (wrapper) wrapper.classList.add('expanded');
     }
 }
 
-function getMemoryBar(model) {
-    if (model.load_state === 'unknown') {
-        return '<span class="text-muted">Unbekannt</span>';
-    }
-    if (!model.loaded) {
-        return '<span class="text-muted">-</span>';
-    }
-
-    if (!isKnownNumber(model.vram_gb) || !isKnownNumber(model.ram_gb)) {
-        return '<span class="text-muted">Unbekannt</span>';
-    }
-
-    const total = model.vram_gb + model.ram_gb;
-    if (total <= 0) return '<span class="text-muted">-</span>';
-
-    const vramPct = (model.vram_gb / total * 100).toFixed(1);
-    const ramPct = (model.ram_gb / total * 100).toFixed(1);
-
-    return `
-        <div class="models-mem-bar-wrapper">
-            <div class="models-mem-bar">
-                <div class="models-mem-vram" style="width:${vramPct}%" title="VRAM: ${model.vram_gb} GB"></div>
-                <div class="models-mem-ram" style="width:${ramPct}%" title="RAM: ${model.ram_gb} GB"></div>
-            </div>
-            <div class="models-mem-labels">
-                <span class="models-mem-label-vram">${model.vram_gb} GB VRAM</span>
-                ${model.ram_gb > 0.01 ? `<span class="models-mem-label-ram">${model.ram_gb} GB RAM</span>` : ''}
-            </div>
-        </div>
-    `;
+async function responseData(response) {
+    return response.json().catch(() => ({}));
 }
 
-function formatExpires(isoStr) {
+async function loadModel(name, gpu, button) {
+    button.disabled = true;
+    button.textContent = 'Lädt…';
     try {
-        const d = new Date(isoStr);
-        const now = new Date();
-        const diffMs = d - now;
-        if (diffMs <= 0) return 'bald';
-        const mins = Math.round(diffMs / 60000);
-        if (mins < 60) return `in ${mins} Min`;
-        const hours = Math.round(mins / 60);
-        return `in ${hours} Std`;
-    } catch {
-        return isoStr;
-    }
-}
-
-// ========================================
-// Featured-Modelle: Tabelle mit aufklappbaren Tags
-// ========================================
-
-async function loadFeaturedModels() {
-    const container = document.getElementById('registryTableContainer');
-    if (!container) return;
-
-    try {
-        const resp = await fetch('/api/models/available');
-        const data = await resp.json();
-        const models = data.models || [];
-
-        if (models.length === 0) {
-            container.innerHTML = data.error
-                ? `<div class="no-data text-muted">${escapeHtml(data.error)}</div>`
-                : '';
-            return;
-        }
-
-        // Sortieren: nicht-installierte zuerst, dann source "ollama" vor "other", dann alphabetisch
-        models.sort((a, b) => {
-            if (a.installed && !b.installed) return 1;
-            if (!a.installed && b.installed) return -1;
-            if (a.source === 'ollama' && b.source !== 'ollama') return -1;
-            if (a.source !== 'ollama' && b.source === 'ollama') return 1;
-            return a.name.localeCompare(b.name);
-        });
-
-        const hasBench = Object.keys(_benchmarksData).length > 0;
-
-        let html = `<table class="models-table models-registry-table">
-            <thead>
-                <tr>
-                    <th></th>
-                    <th>Modell</th>
-                    <th>Quelle</th>
-                    <th>Groesse</th>
-                    <th>Status</th>
-                    ${hasBench ? `
-                    <th class="models-bench-col" title="MMLU-PRO (Open LLM Leaderboard)">MMLU-PRO</th>
-                    <th class="models-bench-col" title="HumanEval (EvalPlus)">HumanEval</th>
-                    <th class="models-bench-col" title="GPQA (Open LLM Leaderboard)">GPQA</th>
-                    <th class="models-bench-col" title="BBH (Open LLM Leaderboard)">BBH</th>
-                    <th class="models-bench-col" title="IFEval (Open LLM Leaderboard)">IFEval</th>
-                    ` : ''}
-                    <th>Aktion</th>
-                </tr>
-            </thead>
-            <tbody>`;
-
-        const colCount = hasBench ? 11 : 6;
-
-        for (const m of models) {
-            const baseName = m.name.split(':')[0];
-            const sizeStr = m.size_gb ? `${m.size_gb} GB` : '-';
-            const installedBadge = m.installed
-                ? '<span class="models-badge models-badge-vram">Installiert</span>'
-                : '<span class="models-badge models-badge-unloaded">Nicht installiert</span>';
-            const sourceBadge = m.source === 'ollama'
-                ? '<span class="models-badge models-badge-ollama">ollama</span>'
-                : '<span class="models-badge models-badge-other">other</span>';
-            const isOllama = m.source === 'ollama';
-
-            html += `<tr class="models-registry-row" data-registry-model="${escapeHtml(m.name)}">
-                <td class="models-expand-cell">
-                    ${isOllama ? `<button class="models-expand-btn" onclick="toggleRegistryTags('${escapeHtml(baseName)}', this)"
-                            title="Varianten anzeigen">&#9654;</button>` : ''}
-                </td>
-                <td>
-                    <span class="font-bold">${escapeHtml(m.name)}</span>
-                </td>
-                <td>${sourceBadge}</td>
-                <td>${sizeStr}</td>
-                <td>${installedBadge}</td>
-                ${hasBench ? `
-                <td class="models-bench-col">${formatBenchmark(getBenchmark(m.name, 'mmlu_pro'))}</td>
-                <td class="models-bench-col">${formatBenchmark(getBenchmark(m.name, 'humaneval'))}</td>
-                <td class="models-bench-col">${formatBenchmark(getBenchmark(m.name, 'gpqa'))}</td>
-                <td class="models-bench-col">${formatBenchmark(getBenchmark(m.name, 'bbh'))}</td>
-                <td class="models-bench-col">${formatBenchmark(getBenchmark(m.name, 'ifeval'))}</td>
-                ` : ''}
-                <td>
-                    ${isOllama && !m.installed
-                        ? `<button class="action-btn primary" onclick="pullFromRegistry('${escapeHtml(m.name)}')">Pull</button>`
-                        : ''
-                    }
-                </td>
-            </tr>
-            ${isOllama ? `
-            <tr class="models-tags-row" id="tags-row-${escapeHtml(baseName)}" style="display:none;">
-                <td colspan="${colCount}">
-                    <div class="models-tags-container" id="tags-container-${escapeHtml(baseName)}">
-                        <div class="table-loading"><div class="spinner"></div></div>
-                    </div>
-                </td>
-            </tr>` : ''}`;
-        }
-
-        html += '</tbody></table>';
-        container.innerHTML = html;
-
-    } catch {
-        container.innerHTML = '<div class="no-data text-muted">Registry nicht erreichbar</div>';
-    }
-}
-
-async function toggleRegistryTags(baseName, btn) {
-    const tagsRow = document.getElementById('tags-row-' + baseName);
-    if (!tagsRow) return;
-
-    if (tagsRow.style.display !== 'none') {
-        // Zuklappen
-        tagsRow.style.display = 'none';
-        btn.innerHTML = '&#9654;';
-        btn.classList.remove('expanded');
-        _expandedRegistryModel = null;
-        return;
-    }
-
-    // Aufklappen
-    tagsRow.style.display = '';
-    btn.innerHTML = '&#9660;';
-    btn.classList.add('expanded');
-    _expandedRegistryModel = baseName;
-
-    const container = document.getElementById('tags-container-' + baseName);
-    if (!container) return;
-    container.innerHTML = '<div class="table-loading"><div class="spinner"></div></div>';
-
-    try {
-        const resp = await fetch(`/api/models/registry/${encodeURIComponent(baseName)}/tags`);
-        const data = await resp.json();
-
-        if (data.error) {
-            container.innerHTML = `<div class="text-muted" style="padding:8px;">Fehler: ${escapeHtml(data.error)}</div>`;
-            return;
-        }
-
-        const tags = data.tags || [];
-
-        if (tags.length === 0) {
-            container.innerHTML = '<div class="text-muted" style="padding:8px;">Keine Varianten gefunden</div>';
-            return;
-        }
-
-        // Lokale Modelle fuer installed-Check
-        const localNames = new Set(_modelsData.map(m => m.name));
-
-        const hasBench = Object.keys(_benchmarksData).length > 0;
-
-        let html = `<table class="models-tags-table">
-            <thead>
-                <tr>
-                    <th>Tag</th>
-                    <th>Groesse</th>
-                    <th>Context</th>
-                    <th>Input</th>
-                    ${hasBench ? `
-                    <th class="models-bench-col">MMLU-PRO</th>
-                    <th class="models-bench-col">HumanEval</th>
-                    <th class="models-bench-col">GPQA</th>
-                    <th class="models-bench-col">BBH</th>
-                    <th class="models-bench-col">IFEval</th>
-                    ` : ''}
-                    <th>Aktion</th>
-                </tr>
-            </thead>
-            <tbody>`;
-
-        for (const t of tags) {
-            const isInstalled = localNames.has(t.tag);
-            const sizeStr = t.size || '-';
-            const ctxStr = t.context || '-';
-            const inputStr = t.input_type || 'Text';
-
-            html += `<tr>
-                <td class="font-bold">${escapeHtml(t.tag)}</td>
-                <td>${escapeHtml(sizeStr)}</td>
-                <td>${escapeHtml(ctxStr)}</td>
-                <td>${escapeHtml(inputStr)}</td>
-                ${hasBench ? `
-                <td class="models-bench-col">${formatBenchmark(getBenchmark(t.tag, 'mmlu_pro'))}</td>
-                <td class="models-bench-col">${formatBenchmark(getBenchmark(t.tag, 'humaneval'))}</td>
-                <td class="models-bench-col">${formatBenchmark(getBenchmark(t.tag, 'gpqa'))}</td>
-                <td class="models-bench-col">${formatBenchmark(getBenchmark(t.tag, 'bbh'))}</td>
-                <td class="models-bench-col">${formatBenchmark(getBenchmark(t.tag, 'ifeval'))}</td>
-                ` : ''}
-                <td>
-                    <button class="action-btn primary" onclick="pullFromRegistry('${escapeHtml(t.tag)}')"
-                            ${isInstalled ? 'disabled title="Bereits installiert"' : ''}>
-                        ${isInstalled ? 'Installiert' : 'Pull'}
-                    </button>
-                </td>
-            </tr>`;
-        }
-
-        html += '</tbody></table>';
-        container.innerHTML = html;
-
-    } catch (e) {
-        container.innerHTML = '<div class="text-muted" style="padding:8px;">Fehler beim Laden der Varianten</div>';
-    }
-}
-
-function pullFromRegistry(tagName) {
-    const input = document.getElementById('modelsPullInput');
-    if (input) {
-        input.value = tagName;
-    }
-    startPullModel();
-}
-
-// ========================================
-// Modell-Aktionen
-// ========================================
-
-async function loadModel(name, gpu = true) {
-    const btn = event.target;
-    btn.disabled = true;
-    btn.textContent = 'Lade...';
-
-    try {
-        const resp = await fetch('/api/models/load', {
+        const response = await fetch('/api/models/load', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({name, gpu}),
         });
-        const data = await resp.json();
-
-        if (resp.ok) {
-            const label = gpu ? 'geladen' : 'geladen (CPU)';
-            showNotification(`${name} ${label}`, 'success');
+        const data = await responseData(response);
+        if (response.ok) {
+            showNotification(
+                gpu ? `${name} geladen` : `${name} auf CPU geladen`,
+                'success'
+            );
         } else {
-            showNotification(`Fehler: ${data.error || resp.statusText}`, 'error');
+            showNotification(`Fehler: ${data.error || response.statusText}`, 'error');
         }
-    } catch (e) {
-        showNotification('Fehler beim Laden: ' + e.message, 'error');
+    } catch (error) {
+        showNotification(`Fehler beim Laden: ${error.message}`, 'error');
     }
-
     await loadLocalModels();
 }
 
-async function unloadModel(name) {
-    const btn = event.target;
-    btn.disabled = true;
-    btn.textContent = 'Entlade...';
-
+async function unloadModel(name, button) {
+    button.disabled = true;
+    button.textContent = 'Entlädt…';
     try {
-        const resp = await fetch('/api/models/unload', {
+        const response = await fetch('/api/models/unload', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({name}),
         });
-        const data = await resp.json();
-
-        if (resp.ok) {
+        const data = await responseData(response);
+        if (response.ok) {
             showNotification(`${name} entladen`, 'success');
         } else {
-            showNotification(`Fehler: ${data.error || resp.statusText}`, 'error');
+            showNotification(`Fehler: ${data.error || response.statusText}`, 'error');
         }
-    } catch (e) {
-        showNotification('Fehler beim Entladen: ' + e.message, 'error');
+    } catch (error) {
+        showNotification(`Fehler beim Entladen: ${error.message}`, 'error');
     }
-
     await loadLocalModels();
 }
 
 async function deleteModel(name, isLoaded) {
-    if (isLoaded) {
-        if (!confirm(`"${name}" ist noch geladen. Trotzdem loeschen?`)) return;
-        await doDeleteModel(name, true);
-    } else {
-        if (!confirm(`"${name}" wirklich loeschen?`)) return;
-        await doDeleteModel(name, false);
-    }
+    const question = isLoaded
+        ? `"${name}" ist geladen. Trotzdem löschen?`
+        : `"${name}" wirklich löschen?`;
+    if (!confirm(question)) return;
+    await doDeleteModel(name, isLoaded);
 }
 
 async function doDeleteModel(name, force) {
     try {
-        const resp = await fetch('/api/models/delete', {
+        const response = await fetch('/api/models/delete', {
             method: 'DELETE',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({name, force}),
         });
-        const data = await resp.json();
-
-        if (resp.ok) {
-            showNotification(`${name} geloescht`, 'success');
-        } else if (resp.status === 409) {
-            if (confirm(`${data.error}. Trotzdem loeschen?`)) {
+        const data = await responseData(response);
+        if (response.ok) {
+            showNotification(`${name} gelöscht`, 'success');
+        } else if (response.status === 409 && !force) {
+            if (confirm(`${data.error}. Trotzdem löschen?`)) {
                 await doDeleteModel(name, true);
                 return;
             }
         } else {
-            showNotification(`Fehler: ${data.error || resp.statusText}`, 'error');
+            showNotification(`Fehler: ${data.error || response.statusText}`, 'error');
         }
-    } catch (e) {
-        showNotification('Fehler beim Loeschen: ' + e.message, 'error');
+    } catch (error) {
+        showNotification(`Fehler beim Löschen: ${error.message}`, 'error');
     }
-
     await loadLocalModels();
 }
-
-// ========================================
-// Pull / Download
-// ========================================
-
-async function startPullModel() {
-    if (_pullInProgress) return;
-
-    const input = document.getElementById('modelsPullInput');
-    const modelName = (input ? input.value.trim() : '');
-
-    if (!modelName) {
-        showNotification('Bitte Modellname eingeben', 'error');
-        return;
-    }
-
-    _pullInProgress = true;
-    const pullBtn = document.getElementById('modelsPullBtn');
-    if (pullBtn) {
-        pullBtn.disabled = true;
-        pullBtn.textContent = 'Download laeuft...';
-    }
-
-    const progressDiv = document.getElementById('modelsPullProgress');
-    const progressBar = document.getElementById('modelsPullBar');
-    const progressText = document.getElementById('modelsPullText');
-    if (progressDiv) progressDiv.style.display = 'block';
-    if (progressBar) progressBar.style.width = '0%';
-    if (progressText) progressText.textContent = 'Starte...';
-
-    try {
-        const response = await fetch('/api/models/pull', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({name: modelName}),
-        });
-
-        if (!response.ok) {
-            showNotification('Pull fehlgeschlagen: ' + response.statusText, 'error');
-            resetPullUI();
-            return;
-        }
-
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder();
-        let buffer = '';
-
-        while (true) {
-            const {done, value} = await reader.read();
-            if (done) break;
-            buffer += decoder.decode(value, {stream: true});
-            const lines = buffer.split('\n');
-            buffer = lines.pop();
-
-            for (const line of lines) {
-                if (line.trim()) {
-                    try {
-                        const data = JSON.parse(line);
-                        if (data.error) {
-                            let msg = data.error;
-                            if (msg.includes('412') || msg.includes('newer version')) {
-                                msg = 'Ollama-Update erforderlich! Dieses Modell braucht eine neuere Ollama-Version.';
-                            }
-                            showNotification('Pull-Fehler: ' + msg, 'error');
-                            resetPullUI();
-                            return;
-                        }
-                        updatePullProgress(data, progressBar, progressText);
-                    } catch (e) {
-                        console.error('NDJSON Parse-Fehler:', e, line);
-                    }
-                }
-            }
-        }
-
-        showNotification(`${modelName} erfolgreich heruntergeladen`, 'success');
-        if (input) input.value = '';
-        await Promise.all([loadLocalModels(), loadFeaturedModels()]);
-    } catch (e) {
-        showNotification('Download-Fehler: ' + e.message, 'error');
-    }
-
-    resetPullUI();
-    const pDiv = document.getElementById('modelsPullProgress');
-    if (pDiv) setTimeout(() => { pDiv.style.display = 'none'; }, 3000);
-}
-
-function updatePullProgress(data, bar, text) {
-    if (!bar || !text) return;
-
-    const status = data.status || '';
-
-    if (data.total && data.completed !== undefined) {
-        const pct = Math.round((data.completed / data.total) * 100);
-        bar.style.width = pct + '%';
-        const completedMB = (data.completed / (1024 * 1024)).toFixed(0);
-        const totalMB = (data.total / (1024 * 1024)).toFixed(0);
-        text.textContent = `${status} — ${completedMB} / ${totalMB} MB (${pct}%)`;
-    } else if (status === 'success') {
-        bar.style.width = '100%';
-        text.textContent = 'Fertig!';
-    } else {
-        text.textContent = status;
-    }
-}
-
-function resetPullUI() {
-    _pullInProgress = false;
-    const pullBtn = document.getElementById('modelsPullBtn');
-    if (pullBtn) {
-        pullBtn.disabled = false;
-        pullBtn.textContent = 'Herunterladen';
-    }
-}
-
-async function checkActivePulls() {
-    try {
-        const resp = await fetch('/api/models/pull/status');
-        const data = await resp.json();
-        const active = data.active_pulls || {};
-        const names = Object.keys(active);
-
-        if (names.length === 0) return;
-
-        // Ersten aktiven Pull anzeigen
-        const pull = active[names[0]];
-        if (pull.status === 'success' || pull.status === 'error') return;
-
-        _pullInProgress = true;
-        const pullBtn = document.getElementById('modelsPullBtn');
-        if (pullBtn) {
-            pullBtn.disabled = true;
-            pullBtn.textContent = 'Download laeuft...';
-        }
-        const input = document.getElementById('modelsPullInput');
-        if (input) input.value = pull.model;
-
-        const progressDiv = document.getElementById('modelsPullProgress');
-        if (progressDiv) progressDiv.style.display = 'block';
-
-        // Die Pull-UI gibt es nur im Verfuegbar-Sub-Tab. Sind wir woanders,
-        // dorthin wechseln — switchSubTab re-initialisiert Verfuegbar und ruft
-        // checkActivePulls erneut (dann existiert die UI und das Polling startet).
-        if (!document.getElementById('modelsPullBtn')) {
-            if (typeof switchSubTab === 'function') switchSubTab('available');
-            return;
-        }
-
-        // Polling starten
-        pollPullStatus(pull.model);
-    } catch {
-        // Kein aktiver Pull oder Fehler — ignorieren
-    }
-}
-
-async function pollPullStatus(modelName) {
-    const progressBar = document.getElementById('modelsPullBar');
-    const progressText = document.getElementById('modelsPullText');
-
-    while (true) {
-        try {
-            const resp = await fetch('/api/models/pull/status');
-            const data = await resp.json();
-            const pull = (data.active_pulls || {})[modelName];
-
-            if (!pull) {
-                // Pull nicht mehr aktiv (aufgeraeumt)
-                showNotification(`${modelName} Download abgeschlossen`, 'success');
-                break;
-            }
-
-            updatePullProgress(pull, progressBar, progressText);
-
-            if (pull.status === 'success') {
-                showNotification(`${modelName} erfolgreich heruntergeladen`, 'success');
-                await Promise.all([loadLocalModels(), loadFeaturedModels()]);
-                break;
-            }
-            if (pull.status === 'error') {
-                let msg = pull.error || 'Unbekannter Fehler';
-                if (msg.includes('412') || msg.includes('newer version')) {
-                    msg = 'Ollama-Update erforderlich! Dieses Modell braucht eine neuere Ollama-Version.';
-                }
-                showNotification('Pull-Fehler: ' + msg, 'error');
-                break;
-            }
-        } catch {
-            // Netzwerkfehler — weiter versuchen
-        }
-
-        await new Promise(r => setTimeout(r, 500));
-    }
-
-    resetPullUI();
-    const progressDiv = document.getElementById('modelsPullProgress');
-    if (progressDiv) {
-        // Progress-Anzeige nach 3s ausblenden
-        setTimeout(() => { progressDiv.style.display = 'none'; }, 3000);
-    }
-}
-
-// ========================================
-// Embedding-Service Modell laden
-// ========================================
 
 async function loadEmbeddingModel(name) {
-    const btn = event.target;
-    btn.disabled = true;
-    btn.textContent = 'Lade...';
-
-    // Basename extrahieren (ohne :tag)
-    const basename = name.split(':')[0].split('/').pop();
-
     try {
-        const resp = await fetch('/api/embedding/load', {
+        const response = await fetch('/api/embedding/load', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({model: basename}),
+            body: JSON.stringify({model: name}),
         });
-        const data = await resp.json();
-
-        if (resp.ok) {
-            showNotification(`Embedding-Modell ${basename} geladen`, 'success');
+        const data = await responseData(response);
+        if (response.ok) {
+            showNotification(`Embedding-Modell ${name} geladen`, 'success');
         } else {
-            showNotification(`Fehler: ${data.error || resp.statusText}`, 'error');
+            showNotification(`Fehler: ${data.error || response.statusText}`, 'error');
         }
-    } catch (e) {
-        showNotification('Fehler beim Laden: ' + e.message, 'error');
+    } catch (error) {
+        showNotification(`Fehler beim Laden: ${error.message}`, 'error');
     }
-
     await loadLocalModels();
 }
 
-// ========================================
-// WebSocket Live-Update
-// ========================================
+async function warmupColbertModel(name, button) {
+    button.disabled = true;
+    button.textContent = 'Warmup…';
+    try {
+        const response = await fetch('/api/embedding/colbert/warmup', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({model: name}),
+        });
+        const data = await responseData(response);
+        if (response.ok) {
+            showNotification(`ColBERT-Warmup ${name} erfolgreich`, 'success');
+        } else {
+            showNotification(`Fehler: ${data.error || response.statusText}`, 'error');
+        }
+    } catch (error) {
+        showNotification(`Fehler beim ColBERT-Warmup: ${error.message}`, 'error');
+    }
+    await loadLocalModels();
+}
 
 function updateModelsFromWS(data) {
-    let needsRerender = false;
-
-    // Ollama-Modelle aktualisieren
     const ollamaData = data?.system?.ollama;
-    if (ollamaData && ollamaData.models_loaded) {
-        const loadedModels = ollamaData.models_loaded;
-        const loadedStateKnown = ollamaData.models_loaded_state !== 'unknown';
-        const loadedMap = {};
-        for (const lm of loadedModels) {
-            loadedMap[lm.name] = lm;
-        }
-
+    if (ollamaData && Array.isArray(ollamaData.models_loaded)) {
+        const known = ollamaData.models_loaded_state !== 'unknown';
+        const loadedMap = new Map(
+            ollamaData.models_loaded
+                .filter(item => item && typeof item.name === 'string')
+                .map(item => [item.name, item])
+        );
         for (const m of _modelsData) {
-            const wasLoaded = m.loaded;
-            const wasLoadState = m.load_state;
-            const lm = loadedMap[m.name];
-
-            if (!loadedStateKnown) {
-                m.loaded = false;
-                m.load_state = 'unknown';
-                m.vram_gb = null;
-                m.ram_gb = null;
-                m.context_length = null;
-                m.expires_at = null;
-            } else if (lm) {
-                m.loaded = true;
-                m.load_state = 'loaded';
-                m.vram_gb = isKnownNumber(lm.vram_gb) ? lm.vram_gb : null;
-                m.ram_gb = (isKnownNumber(lm.size_gb) && isKnownNumber(lm.vram_gb))
-                    ? Math.max(0, lm.size_gb - lm.vram_gb)
-                    : null;
-            } else {
-                m.loaded = false;
-                m.load_state = 'unloaded';
-                m.vram_gb = 0;
-                m.ram_gb = 0;
-                m.context_length = null;
-                m.expires_at = null;
-            }
-
-            if (wasLoaded !== m.loaded || wasLoadState !== m.load_state) {
-                needsRerender = true;
-            }
+            if (m.backend !== 'ollama') continue;
+            const runtime = loadedMap.get(m.name);
+            m.loaded = known && Boolean(runtime);
+            m.loading = false;
+            m.load_state = known
+                ? (runtime ? 'loaded' : 'unloaded')
+                : 'unknown';
+            m.runtime_state = m.load_state;
+            m.vram_gb = runtime?.vram_gb ?? (known ? 0 : null);
+            m.ram_gb = runtime
+                && typeof runtime.size_gb === 'number'
+                && typeof runtime.vram_gb === 'number'
+                ? Math.max(0, runtime.size_gb - runtime.vram_gb)
+                : (known ? 0 : null);
+            m.runtime_context_length = runtime?.context_length ?? null;
+            m.expires_at = runtime?.expires_at ?? null;
         }
     }
 
-    // Embedding-Status aktualisieren
     const embedData = data?.system?.embedding;
     if (embedData) {
-        const embedModel = embedData.model || null;
+        const embedRunning = embedData.running === true;
         const embedLoading = embedData.loading_model || null;
-        const embedRunning = embedData.running || false;
-
+        const embedActiveModels = new Set(
+            Array.isArray(embedData.loaded_models)
+                ? embedData.loaded_models.filter(item => typeof item === 'string')
+                : []
+        );
         for (const m of _modelsData) {
-            const basename = m.name.split(':')[0].split('/').pop();
-            const wasActive = m.embedding_active;
-            const wasLoading = m.embedding_loading;
-            m.embedding_active = embedRunning && basename === embedModel;
-            m.embedding_loading = embedRunning && basename === embedLoading;
-            if (wasActive !== m.embedding_active || wasLoading !== m.embedding_loading) {
-                needsRerender = true;
-            }
+            if (m.backend !== 'kiron_embeddings') continue;
+            m.embedding_active = embedRunning && embedActiveModels.has(m.name);
+            m.embedding_loading = embedRunning && m.name === embedLoading;
+            m.loaded = m.embedding_active;
+            m.loading = m.embedding_loading;
+            m.load_state = !embedRunning
+                ? 'unknown'
+                : m.loading ? 'loading' : m.loaded ? 'loaded' : 'unloaded';
+            m.runtime_state = m.load_state;
         }
     }
 
-    if (needsRerender) {
+    const debertaData = data?.system?.deberta;
+    if (debertaData) {
+        const serviceRunning = debertaData.running === true;
+        const loadingModel = debertaData.loading_model || null;
+        const loadedModels = new Set(
+            Array.isArray(debertaData.loaded_models)
+                ? debertaData.loaded_models.filter(
+                    item => typeof item === 'string'
+                )
+                : []
+        );
+        for (const m of _modelsData) {
+            if (m.backend !== 'kiron_deberta') continue;
+            m.loaded = serviceRunning && loadedModels.has(m.name);
+            m.loading = serviceRunning && loadingModel === m.name;
+            m.load_state = !serviceRunning
+                ? 'unknown'
+                : m.loading ? 'loading' : m.loaded ? 'loaded' : 'unloaded';
+            m.runtime_state = m.load_state;
+        }
+    }
+
+    if (typeof currentTab === 'string' && currentTab === 'models') {
         renderModelsTable();
-        return;
-    }
-
-    // Nur Zellen aktualisieren wenn kein Rerender noetig
-    for (const m of _modelsData) {
-        const row = document.querySelector(`tr[data-model="${CSS.escape(m.name)}"]`);
-        if (row) {
-            const statusCell = row.cells[6];
-            const memCell = row.cells[7];
-            if (statusCell) statusCell.innerHTML = getStatusBadge(m);
-            if (memCell) memCell.innerHTML = getMemoryBar(m);
-        }
     }
 }

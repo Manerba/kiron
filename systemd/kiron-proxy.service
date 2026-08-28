@@ -7,12 +7,27 @@ StartLimitIntervalSec=300
 
 [Service]
 Type=simple
-User=root
+User=kiron-proxy
+Group=kiron-proxy
+SupplementaryGroups=docker kiron-runtime kiron-common
 WorkingDirectory=/usr/lib/kiron/services/kiron-proxy
 ExecStart=/usr/lib/kiron/services/kiron-proxy/venv/bin/python main.py
 Restart=on-failure
 RestartSec=5
 Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-/etc/kiron/dashboard.env
+Environment=KIRON_RUNTIME_DIR=/run/kiron/vram
+UMask=0027
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/usr/lib/kiron/data/kiron-proxy /usr/lib/kiron/data/shared /run/kiron/vram /run/xtables.lock -/run/docker.sock -/var/run/docker.sock
+RestrictSUIDSGID=true
+LockPersonality=true
+NoNewPrivileges=false
+PrivateDevices=false
+CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_AUDIT_WRITE CAP_NET_ADMIN
+AmbientCapabilities=
 
 [Install]
 WantedBy=multi-user.target

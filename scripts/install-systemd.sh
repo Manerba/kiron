@@ -2,10 +2,9 @@
 set -e
 
 echo "Installiere Kiron systemd-Units..."
-cp /opt/kiron/systemd/kiron-proxy.service /etc/systemd/system/
-cp /opt/kiron/systemd/kiron-docling.service /etc/systemd/system/
-cp /opt/kiron/systemd/kiron-embeddings.service /etc/systemd/system/
-cp /opt/kiron/systemd/kiron-deberta.service /etc/systemd/system/
+for unit in /opt/kiron/systemd/*.service; do
+    cp "$unit" /etc/systemd/system/
+done
 systemctl daemon-reload
 
 # #509: Drift-Check — warnen wenn alte kiron-*.service Dateien im
@@ -14,7 +13,7 @@ systemctl daemon-reload
 # automatisches rm wegen Risiko bei Fehl-Match; Cleanup ist Operator-
 # Entscheidung.
 drift=0
-for installed in /etc/systemd/system/kiron-*.service; do
+for installed in /etc/systemd/system/kiron-*.service /etc/systemd/system/kitt-worker.service; do
     [ -e "$installed" ] || continue
     name=$(basename "$installed")
     if [ ! -f "/opt/kiron/systemd/$name" ]; then
@@ -28,3 +27,4 @@ fi
 
 echo "Systemd-Units installiert. Aktivieren mit:"
 echo "  systemctl enable --now kiron-proxy kiron-docling kiron-embeddings kiron-deberta"
+echo "  systemctl enable --now kitt-worker   # erst nach Operatorfreigabe"

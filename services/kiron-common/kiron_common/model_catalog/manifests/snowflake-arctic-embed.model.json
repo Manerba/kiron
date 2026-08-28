@@ -1,0 +1,250 @@
+{
+  "schema_version": 1,
+  "canonical_model_id": "snowflake-arctic-embed:l",
+  "aliases": [
+    "snowflake-arctic-embed"
+  ],
+  "deployments": [
+    {
+      "id": "kiron-snowflake-dense-v1.deployment",
+      "backend": {
+        "type": "kiron_embeddings",
+        "parameters": {
+          "implementation": "sentence-transformers",
+          "implementation_revision": "5.6.0",
+          "model_name": "snowflake-arctic-embed"
+        }
+      },
+      "artifact": {
+        "type": "huggingface",
+        "repository": "Snowflake/snowflake-arctic-embed-l",
+        "revision": "d8fb21ca8d905d2832ee8b96c894d3298964346b",
+        "manifest_digest": null,
+        "trust_remote_code": false,
+        "weights": [
+          {
+            "path": "model.safetensors",
+            "sha256": "46e36bf399c152c51818e1d0423bfe628d79fc9536dbf9d4fcc93078827d6c99"
+          }
+        ],
+        "auxiliary": [],
+        "metadata": {}
+      },
+      "routes": [
+        {
+          "task": "embedding",
+          "endpoint": "/api/embed"
+        }
+      ],
+      "loader": {
+        "type": "sentence_transformers",
+        "parameters": {
+          "additional_role_template": null
+        }
+      },
+      "metadata": {
+        "discovery": {
+          "family": "bert",
+          "format": "safetensors",
+          "parameter_size": "335M",
+          "precision": null,
+          "size": 670000000
+        }
+      }
+    },
+    {
+      "id": "ollama-snowflake-dense-v1.deployment",
+      "backend": {
+        "type": "ollama",
+        "parameters": {
+          "implementation": "ollama",
+          "implementation_revision": "0.18.0",
+          "model_name": "snowflake-arctic-embed:l"
+        }
+      },
+      "artifact": {
+        "type": "ollama",
+        "repository": null,
+        "revision": null,
+        "manifest_digest": "sha256:21ab8b9b0545e26a78164a910691440a3f1de1bfa41c3953d7451d52036c581a",
+        "trust_remote_code": false,
+        "weights": [
+          {
+            "path": "model",
+            "sha256": "fb3b66c7bdf6dabbb2edbc22627f4cb2df021c9e9545b54feafd8a7c09fe8ec5"
+          }
+        ],
+        "auxiliary": [],
+        "metadata": {}
+      },
+      "routes": [
+        {
+          "task": "embedding",
+          "endpoint": "/api/embed"
+        }
+      ],
+      "loader": {
+        "type": "ollama",
+        "parameters": {}
+      },
+      "metadata": {}
+    }
+  ],
+  "profiles": [
+    {
+      "id": "kiron-snowflake-dense-v1",
+      "deployment_id": "kiron-snowflake-dense-v1.deployment",
+      "task": "embedding",
+      "endpoint": "/api/embed",
+      "default_for_endpoint": true,
+      "metadata": {
+        "kind": "dense",
+        "dimensions": 1024,
+        "max_input_tokens": {
+          "unit": "tokenizer_tokens",
+          "counting": "after_server_formatting_including_special_tokens",
+          "truncation": "right",
+          "overflow": "truncate",
+          "by_role": {
+            "search_document": 512,
+            "search_query": 512
+          }
+        },
+        "output_normalized": true,
+        "similarity": "cosine",
+        "input_type": {
+          "supported": [
+            "search_document",
+            "search_query"
+          ],
+          "additional_task_roles": [],
+          "aliases": [],
+          "role_sensitive": true,
+          "required": true,
+          "default": null,
+          "missing_role_behavior": "reject"
+        },
+        "formatting_owner": "server",
+        "pipeline": {
+          "tokenizer": {
+            "repository": "Snowflake/snowflake-arctic-embed-l",
+            "revision": "d8fb21ca8d905d2832ee8b96c894d3298964346b"
+          },
+          "formatting": {
+            "search_document": {
+              "template": "{text}",
+              "parameters": {}
+            },
+            "search_query": {
+              "template": "{text}",
+              "parameters": {}
+            }
+          },
+          "pooling": {
+            "method": "cls",
+            "parameters": {
+              "pooling_mode_cls_token": true
+            }
+          },
+          "normalization": {
+            "method": "l2",
+            "dtype": "float32",
+            "scope": "vector"
+          },
+          "parameters": {}
+        },
+        "verification": {
+          "status": "unverified",
+          "evidence": [
+            "hf-readme:Snowflake/snowflake-arctic-embed-l@d8fb21ca8d905d2832ee8b96c894d3298964346b",
+            "local-weight-sha256:46e36bf399c152c51818e1d0423bfe628d79fc9536dbf9d4fcc93078827d6c99",
+            "runtime-pipeline:kiron-embeddings-unprefixed-cls-fp32-l2"
+          ],
+          "blocking_reasons": [
+            "required_retrieval_query_prefix_missing_from_executed_pipeline"
+          ]
+        }
+      }
+    },
+    {
+      "id": "ollama-snowflake-dense-v1",
+      "deployment_id": "ollama-snowflake-dense-v1.deployment",
+      "task": "embedding",
+      "endpoint": "/api/embed",
+      "default_for_endpoint": false,
+      "metadata": {
+        "kind": "dense",
+        "dimensions": 1024,
+        "max_input_tokens": {
+          "unit": "tokenizer_tokens",
+          "counting": "after_server_formatting_including_special_tokens",
+          "truncation": "unknown",
+          "overflow": "unknown",
+          "by_role": {
+            "search_document": null,
+            "search_query": null
+          }
+        },
+        "output_normalized": null,
+        "similarity": "unknown",
+        "input_type": {
+          "supported": [
+            "search_document",
+            "search_query"
+          ],
+          "additional_task_roles": [],
+          "aliases": [],
+          "role_sensitive": null,
+          "required": false,
+          "default": null,
+          "missing_role_behavior": "unknown"
+        },
+        "formatting_owner": "server",
+        "pipeline": {
+          "tokenizer": {
+            "repository": null,
+            "revision": null
+          },
+          "formatting": {
+            "search_document": {
+              "template": null,
+              "parameters": {}
+            },
+            "search_query": {
+              "template": null,
+              "parameters": {}
+            }
+          },
+          "pooling": {
+            "method": "unknown",
+            "parameters": {
+              "observed_gguf_pooling_type": 2
+            }
+          },
+          "normalization": {
+            "method": "unknown",
+            "dtype": "unknown",
+            "scope": "unknown"
+          },
+          "parameters": {
+            "observed_context_length": 512
+          }
+        },
+        "verification": {
+          "status": "unverified",
+          "evidence": [
+            "local-ollama-manifest-sha256:21ab8b9b0545e26a78164a910691440a3f1de1bfa41c3953d7451d52036c581a",
+            "local-ollama-model-blob-sha256:fb3b66c7bdf6dabbb2edbc22627f4cb2df021c9e9545b54feafd8a7c09fe8ec5",
+            "ollama-api-version:0.18.0"
+          ],
+          "blocking_reasons": [
+            "missing_exact_upstream_revision_and_conversion_provenance",
+            "missing_query_pooling_normalization_reference_witness"
+          ]
+        }
+      }
+    }
+  ],
+  "request_defaults": [],
+  "metadata": {}
+}

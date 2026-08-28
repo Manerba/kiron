@@ -18,15 +18,28 @@ async def _direct_to_thread(func, /, *args, **kwargs):
     return func(*args, **kwargs)
 
 
-class _NoLocalModelsClient:
+class _FakeResponse:
+    status_code = 200
+
+    def json(self):
+        return {"models": copy.deepcopy(_LocalModelsClient.models)}
+
+
+class _LocalModelsClient:
+    models = []
+
     def __init__(self, *args, **kwargs):
         pass
 
     async def __aenter__(self):
-        raise RuntimeError("local ollama disabled in test")
+        return self
 
     async def __aexit__(self, exc_type, exc, tb):
         return False
+
+    async def get(self, path):
+        assert path == "/api/tags"
+        return _FakeResponse()
 
 
 def _hf_result(name="unitmodel"):
@@ -55,15 +68,9 @@ def _evalplus_result(name="unitmodel", score=0.3):
 
 class BenchmarkPartialTimestampTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        self._old_registry_cache = dict(app_module._registry_cache)
         self._patchers = [
             mock.patch.object(app_module, "_to_thread", new=_direct_to_thread),
-            mock.patch.object(app_module.httpx, "AsyncClient", _NoLocalModelsClient),
-            mock.patch.object(
-                app_module,
-                "_load_registry_disk_cache",
-                return_value={"registry": {"data": [], "timestamp": 0}, "tags": {}},
-            ),
+            mock.patch.object(app_module.httpx, "AsyncClient", _LocalModelsClient),
         ]
         for patcher in self._patchers:
             patcher.start()
@@ -71,10 +78,8 @@ class BenchmarkPartialTimestampTests(unittest.IsolatedAsyncioTestCase):
     def tearDown(self):
         for patcher in reversed(self._patchers):
             patcher.stop()
-        app_module._registry_cache.clear()
-        app_module._registry_cache.update(self._old_registry_cache)
 
-    async def _refresh(self, *, cache, registry, hf_result, evalplus_result):
+    async def _refresh(self, *, cache, local_models, hf_result, evalplus_result):
         saved = {}
 
         def save_cache(value):
@@ -82,9 +87,7 @@ class BenchmarkPartialTimestampTests(unittest.IsolatedAsyncioTestCase):
             saved.update(copy.deepcopy(value))
             return True
 
-        app_module._registry_cache["data"] = registry
-        app_module._registry_cache["timestamp"] = time.time()
-        app_module._registry_cache["monotonic_timestamp"] = time.monotonic()
+        _LocalModelsClient.models = copy.deepcopy(local_models)
 
         with mock.patch.object(
             app_module, "_load_benchmarks_cache", return_value=copy.deepcopy(cache)
@@ -102,7 +105,7 @@ class BenchmarkPartialTimestampTests(unittest.IsolatedAsyncioTestCase):
         before = time.time() - 1.0
         _, saved, hf_mock, ep_mock = await self._refresh(
             cache={"models": {}, "last_refresh": None, "sources": {}},
-            registry=[{"name": "unitmodel:7b"}],
+            local_models=[{"name": "unitmodel:7b"}],
             hf_result=_hf_result(),
             evalplus_result=_evalplus_result(),
         )
@@ -142,7 +145,7 @@ class BenchmarkPartialTimestampTests(unittest.IsolatedAsyncioTestCase):
 
         _, saved1, _, ep_mock1 = await self._refresh(
             cache=cache,
-            registry=[{"name": "unitmodel:7b"}],
+            local_models=[{"name": "unitmodel:7b"}],
             hf_result=None,
             evalplus_result=_evalplus_result(score=0.5),
         )
@@ -160,8 +163,7 @@ class BenchmarkPartialTimestampTests(unittest.IsolatedAsyncioTestCase):
             saved2.update(copy.deepcopy(value))
             return True
 
-        app_module._registry_cache["data"] = [{"name": "unitmodel:7b"}]
-        app_module._registry_cache["monotonic_timestamp"] = time.monotonic()
+        _LocalModelsClient.models = [{"name": "unitmodel:7b"}]
         with mock.patch.object(
             app_module, "_load_benchmarks_cache", return_value=copy.deepcopy(saved1)
         ), mock.patch.object(
@@ -203,7 +205,7 @@ class BenchmarkPartialTimestampTests(unittest.IsolatedAsyncioTestCase):
 
         _, saved, hf_mock, ep_mock = await self._refresh(
             cache=cache,
-            registry=[{"name": "unitmodel:7b"}, {"name": "newmodel:7b"}],
+            local_models=[{"name": "unitmodel:7b"}, {"name": "newmodel:7b"}],
             hf_result=None,
             evalplus_result=None,
         )

@@ -1,0 +1,89 @@
+{
+  "schema_version": 1,
+  "canonical_model_id": "ms-marco-MiniLM-L-6-v2",
+  "aliases": [
+    "cross-encoder/ms-marco-MiniLM-L-6-v2"
+  ],
+  "deployments": [
+    {
+      "id": "kiron-deberta-ms-marco-minilm-l-6-v2-v1.deployment",
+      "backend": {
+        "type": "kiron_deberta",
+        "parameters": {
+          "implementation": "sentence-transformers-cross-encoder",
+          "implementation_revision": "5.6.0",
+          "model_name": "ms-marco-MiniLM-L-6-v2"
+        }
+      },
+      "artifact": {
+        "type": "huggingface",
+        "repository": "cross-encoder/ms-marco-MiniLM-L-6-v2",
+        "revision": "c5ee24cb16019beea0893ab7796b1df96625c6b8",
+        "manifest_digest": null,
+        "trust_remote_code": false,
+        "weights": [
+          {
+            "path": "model.safetensors",
+            "sha256": "821d1aa69520101d6e0737f78a042ae25b19e5cb9160701909d10434f4aeb0ae"
+          }
+        ],
+        "auxiliary": [],
+        "metadata": {}
+      },
+      "routes": [
+        {
+          "task": "rerank",
+          "endpoint": "/api/rerank"
+        },
+        {
+          "task": "nli",
+          "endpoint": "/api/score"
+        }
+      ],
+      "loader": {
+        "type": "cross_encoder",
+        "parameters": {
+          "max_length": 512,
+          "torch_dtype": "float16"
+        }
+      },
+      "metadata": {
+        "service": {
+          "display_order": 2,
+          "labels": null,
+          "rerank_label": null,
+          "size": 91816134
+        }
+      }
+    }
+  ],
+  "profiles": [
+    {
+      "id": "kiron-ms-marco-minilm-l-6-v2-rerank-v1",
+      "deployment_id": "kiron-deberta-ms-marco-minilm-l-6-v2-v1.deployment",
+      "task": "rerank",
+      "endpoint": "/api/rerank",
+      "default_for_endpoint": true,
+      "metadata": {}
+    },
+    {
+      "id": "kiron-ms-marco-minilm-l-6-v2-score-v1",
+      "deployment_id": "kiron-deberta-ms-marco-minilm-l-6-v2-v1.deployment",
+      "task": "nli",
+      "endpoint": "/api/score",
+      "default_for_endpoint": true,
+      "metadata": {}
+    }
+  ],
+  "request_defaults": [
+    {
+      "endpoint": "/api/rerank",
+      "profile_id": "kiron-ms-marco-minilm-l-6-v2-rerank-v1"
+    },
+    {
+      "endpoint": "/api/score",
+      "profile_id": "kiron-ms-marco-minilm-l-6-v2-score-v1"
+    }
+  ],
+  "metadata": {}
+}

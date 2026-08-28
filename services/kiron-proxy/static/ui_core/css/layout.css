@@ -83,59 +83,6 @@ a.tab:focus-visible {
     box-shadow: var(--shadow-focus);
 }
 
-/* ── Sub-Tabs (zweite Ebene, analog kiara) ──────────────────────── */
-
-.is-hidden {
-    display: none !important;
-}
-
-.sub-tabs {
-    display: flex;
-    align-items: stretch;
-    gap: 0;
-    padding: 0 20px;
-    background: var(--bg-subtabs) linear-gradient(to top, var(--border-color) 1px, transparent 1px);
-    position: sticky;
-    top: calc(var(--header-height) + 28px);
-    z-index: 94;
-    overflow-x: auto;
-    overflow-y: hidden;
-    transition: background-color var(--transition-speed);
-}
-
-.sub-tabs .tab {
-    flex: 0 0 auto;
-    font-size: 12px;
-    padding: 3px 12px;
-    color: var(--text-tabs);
-    text-decoration: none;
-    white-space: nowrap;
-}
-
-.sub-tabs .tab:hover {
-    color: var(--text-primary);
-}
-
-.sub-tabs .tab.active {
-    color: var(--text-subtab-active);
-    border-color: var(--border-color);
-    border-bottom-color: transparent;
-    background-color: var(--bg-subtab-active);
-}
-
-.sub-tabs .tab.active::before {
-    background: radial-gradient(circle at 0 0, transparent 5.5px, var(--border-color) 6px, var(--border-color) 7px, var(--bg-subtab-active) 7.5px);
-}
-
-.sub-tabs .tab.active::after {
-    background: radial-gradient(circle at 100% 0, transparent 5.5px, var(--border-color) 6px, var(--border-color) 7px, var(--bg-subtab-active) 7.5px);
-}
-
-[data-theme="kontrast"] .sub-tabs .tab:hover {
-    color: #ffffff;
-    background: rgba(255, 255, 255, 0.1);
-}
-
 /* ── Filter-Bar ─────────────────────────────────────────────────── */
 
 .filter-bar {
@@ -149,11 +96,6 @@ a.tab:focus-visible {
     position: sticky;
     top: calc(var(--header-height) + 28px);
     z-index: 90;
-}
-
-/* Bei aktiven Sub-Tabs rueckt die Filter-Bar unter die Sub-Tab-Leiste. */
-.main-tabs.has-subtabs ~ .filter-bar {
-    top: calc(var(--header-height) + 56px);
 }
 
 /* ── Container ──────────────────────────────────────────────────── */

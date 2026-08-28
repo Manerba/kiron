@@ -8,12 +8,27 @@ StartLimitIntervalSec=300
 
 [Service]
 Type=simple
-User=root
+User=kiron-docling
+Group=kiron-docling
+SupplementaryGroups=docker kiron-runtime kiron-common
 WorkingDirectory=/usr/lib/kiron/services/kiron-docling
 ExecStart=/usr/lib/kiron/services/kiron-docling/venv/bin/python proxy.py
 Restart=on-failure
 RestartSec=5
 Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-/etc/kiron/dashboard.env
+Environment=KIRON_RUNTIME_DIR=/run/kiron/vram
+UMask=0027
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/run/kiron/vram -/run/docker.sock -/var/run/docker.sock
+RestrictSUIDSGID=true
+LockPersonality=true
+NoNewPrivileges=true
+PrivateDevices=false
+CapabilityBoundingSet=
+AmbientCapabilities=
 
 [Install]
 WantedBy=multi-user.target

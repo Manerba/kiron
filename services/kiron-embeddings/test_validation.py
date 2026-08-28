@@ -1,17 +1,33 @@
 """Validation- und Endpoint-Tests fuer den Embedding-Service."""
 
 import asyncio
+import copy
 import hashlib
 import inspect
 import json
 import os
 import sys
 import unittest
+from dataclasses import FrozenInstanceError
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import main  # noqa: E402
+import loaders  # noqa: E402
+from catalog_view import (  # noqa: E402
+    EmbeddingServiceCatalogError,
+    SentenceTransformersLoaderParameters,
+    build_embedding_service_view,
+)
+from kiron_common.model_catalog import (  # noqa: E402
+    BackendType,
+    CatalogValidationError,
+    LoaderType,
+    ModelCatalog,
+    ModelEndpoint,
+)
 from model_worker import (  # noqa: E402
+    ColbertEmbedResult,
     CudaRuntimeError,
     EncodeResult,
     LateEmbedResult,
@@ -19,6 +35,211 @@ from model_worker import (  # noqa: E402
     WorkerQueueFullError,
     WorkerStoppedError,
 )
+
+
+def _temporary_standard_manifest() -> dict:
+    manifest = copy.deepcopy(
+        main.MODEL_CATALOG.require("bge-m3:latest").to_manifest_dict(
+            schema_version=1
+        )
+    )
+    deployment = next(
+        item
+        for item in manifest["deployments"]
+        if item["backend"]["type"] == BackendType.KIRON_EMBEDDINGS.value
+    )
+    profile = next(
+        item
+        for item in manifest["profiles"]
+        if item["deployment_id"] == deployment["id"]
+    )
+    manifest["canonical_model_id"] = "test-standard-embed:latest"
+    manifest["aliases"] = ["test-standard-embed"]
+    deployment["id"] = "test-standard-embed.deployment"
+    deployment["backend"]["parameters"]["model_name"] = "test-standard-embed"
+    deployment["artifact"]["repository"] = "example/test-standard-embed"
+    deployment["artifact"]["revision"] = "a" * 40
+    deployment["artifact"]["weights"] = [
+        {"path": "model.safetensors", "sha256": "b" * 64}
+    ]
+    profile["id"] = "test-standard-embed.profile"
+    profile["deployment_id"] = deployment["id"]
+    profile["metadata"]["pipeline"]["tokenizer"] = {
+        "repository": deployment["artifact"]["repository"],
+        "revision": deployment["artifact"]["revision"],
+    }
+    manifest["deployments"] = [deployment]
+    manifest["profiles"] = [profile]
+    manifest["request_defaults"] = []
+    return manifest
+
+
+class CatalogServiceViewTests(unittest.TestCase):
+    def test_loader_registry_is_explicit_and_keyed_only_by_loader_type(self):
+        self.assertEqual(
+            set(loaders.LOADER_REGISTRY),
+            {
+                LoaderType.SENTENCE_TRANSFORMERS,
+                LoaderType.TRANSFORMERS_LAST_TOKEN,
+                LoaderType.COLBERT_XMOD,
+            },
+        )
+        self.assertTrue(all(callable(item) for item in loaders.LOADER_REGISTRY.values()))
+
+    def test_temporary_standard_manifest_is_discovered_and_loader_bound(self):
+        catalog = ModelCatalog.from_manifests([_temporary_standard_manifest()])
+        view = build_embedding_service_view(
+            catalog,
+            loaders.LOADER_REGISTRY,
+        )
+
+        model = view.resolve("test-standard-embed:latest", ModelEndpoint.EMBED)
+        self.assertIsNotNone(model)
+        assert model is not None
+        self.assertEqual(model.model_name, "test-standard-embed")
+        self.assertIs(
+            view.resolve("test-standard-embed", ModelEndpoint.EMBED),
+            model,
+        )
+        self.assertIsNone(view.resolve("TEST-STANDARD-EMBED"))
+        self.assertIsNone(view.resolve("vendor/test-standard-embed:latest"))
+        self.assertEqual(
+            view.available_model_names(ModelEndpoint.EMBED),
+            ("test-standard-embed",),
+        )
+        self.assertIsInstance(
+            model.loader_parameters,
+            SentenceTransformersLoaderParameters,
+        )
+        self.assertIs(
+            view.loader_for(model),
+            loaders.load_sentence_transformers_cpu,
+        )
+        constructed = object()
+        with mock.patch.object(
+            loaders,
+            "SentenceTransformer",
+            return_value=constructed,
+        ) as constructor:
+            loaded = view.loader_for(model)(model)
+        self.assertIs(loaded, constructed)
+        constructor.assert_called_once_with(
+            "example/test-standard-embed",
+            cache_folder=mock.ANY,
+            device="cpu",
+            trust_remote_code=False,
+            revision="a" * 40,
+            local_files_only=True,
+        )
+
+    def test_service_view_is_deeply_immutable(self):
+        catalog = ModelCatalog.from_manifests([_temporary_standard_manifest()])
+        view = build_embedding_service_view(
+            catalog,
+            {LoaderType.SENTENCE_TRANSFORMERS: mock.Mock()},
+        )
+        model = view.models[0]
+        with self.assertRaises(FrozenInstanceError):
+            model.model_name = "changed"
+        with self.assertRaises(TypeError):
+            view._names["changed"] = model
+
+    def test_unknown_loader_type_is_rejected_by_catalog(self):
+        manifest = _temporary_standard_manifest()
+        manifest["deployments"][0]["loader"]["type"] = "unknown_loader"
+        with self.assertRaisesRegex(
+            CatalogValidationError,
+            r"loader/type.*unknown_loader",
+        ):
+            ModelCatalog.from_manifests([manifest])
+
+    def test_backend_foreign_loader_fails_fast(self):
+        manifest = _temporary_standard_manifest()
+        manifest["deployments"][0]["loader"]["type"] = (
+            LoaderType.CROSS_ENCODER.value
+        )
+        catalog = ModelCatalog.from_manifests([manifest])
+        with self.assertRaisesRegex(
+            EmbeddingServiceCatalogError,
+            r"cross_encoder.*not allowed.*kiron_embeddings",
+        ):
+            build_embedding_service_view(
+                catalog,
+                {LoaderType.CROSS_ENCODER: mock.Mock()},
+            )
+
+    def test_wrong_backend_type_is_explicitly_filtered_out(self):
+        manifest = _temporary_standard_manifest()
+        manifest["deployments"][0]["backend"]["type"] = (
+            BackendType.KIRON_DEBERTA.value
+        )
+        catalog = ModelCatalog.from_manifests([manifest])
+        view = build_embedding_service_view(
+            catalog,
+            {LoaderType.SENTENCE_TRANSFORMERS: mock.Mock()},
+        )
+        self.assertEqual(view.models, ())
+        self.assertIsNone(view.resolve("test-standard-embed"))
+
+    def test_configured_loader_must_exist_in_registry(self):
+        catalog = ModelCatalog.from_manifests([_temporary_standard_manifest()])
+        with self.assertRaisesRegex(
+            EmbeddingServiceCatalogError,
+            r"sentence_transformers.*not registered",
+        ):
+            build_embedding_service_view(catalog, {})
+
+    def test_missing_loader_and_discovery_fields_fail_fast(self):
+        missing_loader = _temporary_standard_manifest()
+        del missing_loader["deployments"][0]["loader"]["parameters"][
+            "additional_role_template"
+        ]
+        with self.assertRaisesRegex(
+            EmbeddingServiceCatalogError,
+            r"loader/parameters.*missing required fields",
+        ):
+            build_embedding_service_view(
+                ModelCatalog.from_manifests([missing_loader]),
+                {LoaderType.SENTENCE_TRANSFORMERS: mock.Mock()},
+            )
+
+        missing_discovery = _temporary_standard_manifest()
+        del missing_discovery["deployments"][0]["metadata"]["discovery"][
+            "size"
+        ]
+        with self.assertRaisesRegex(
+            EmbeddingServiceCatalogError,
+            r"metadata/discovery.*missing required fields",
+        ):
+            build_embedding_service_view(
+                ModelCatalog.from_manifests([missing_discovery]),
+                {LoaderType.SENTENCE_TRANSFORMERS: mock.Mock()},
+            )
+
+    def test_conflicting_deployments_for_one_service_identity_fail_fast(self):
+        manifest = _temporary_standard_manifest()
+        second_deployment = copy.deepcopy(manifest["deployments"][0])
+        second_deployment["id"] = "test-standard-embed-late.deployment"
+        second_deployment["routes"] = [
+            {"task": "embedding", "endpoint": "/api/embed_late"}
+        ]
+        second_deployment["metadata"]["discovery"]["size"] += 1
+        second_profile = copy.deepcopy(manifest["profiles"][0])
+        second_profile["id"] = "test-standard-embed-late.profile"
+        second_profile["deployment_id"] = second_deployment["id"]
+        second_profile["endpoint"] = "/api/embed_late"
+        second_profile["metadata"]["kind"] = "late_chunking"
+        manifest["deployments"].append(second_deployment)
+        manifest["profiles"].append(second_profile)
+
+        with self.assertRaisesRegex(
+            EmbeddingServiceCatalogError,
+            r"conflicting deployment data.*metadata\.discovery",
+        ):
+            build_embedding_service_view(
+                ModelCatalog.from_manifests([manifest]),
+                {LoaderType.SENTENCE_TRANSFORMERS: mock.Mock()},
+            )
 
 
 class FakeWorker:
@@ -33,6 +254,8 @@ class FakeWorker:
         late_embed_result: LateEmbedResult | None = None,
         late_embed_exc: BaseException | None = None,
         late_embed_result_factory=None,
+        colbert_embed_result: ColbertEmbedResult | None = None,
+        colbert_embed_exc: BaseException | None = None,
     ):
         self._snapshot = snapshot or {
             "current_model": None,
@@ -50,6 +273,7 @@ class FakeWorker:
         self.load_calls: list[str] = []
         self.encode_calls: list[tuple] = []
         self.late_embed_calls: list[tuple] = []
+        self.colbert_embed_calls: list[tuple] = []
         self._encode_result = encode_result or EncodeResult(
             embeddings=[[1.0, 0.0]],
             prompt_eval_count=1,
@@ -60,6 +284,12 @@ class FakeWorker:
         self._late_embed_result = late_embed_result
         self._late_embed_exc = late_embed_exc
         self._late_embed_result_factory = late_embed_result_factory
+        self._colbert_embed_result = colbert_embed_result or ColbertEmbedResult(
+            embeddings=[[[1.0, 0.0]]],
+            prompt_eval_count=1,
+            load_duration_ns=0,
+        )
+        self._colbert_embed_exc = colbert_embed_exc
 
     def start(self) -> None:
         self.started = True
@@ -100,6 +330,14 @@ class FakeWorker:
             fallback_count=0,
         )
 
+    async def colbert_embed(
+        self, name: str, texts: list, input_type, language
+    ) -> ColbertEmbedResult:
+        self.colbert_embed_calls.append((name, list(texts), input_type, language))
+        if self._colbert_embed_exc is not None:
+            raise self._colbert_embed_exc
+        return self._colbert_embed_result
+
 
 def _swap_worker(new_worker):
     """Context-Helper: tauscht main.model_worker zeitweise aus."""
@@ -112,13 +350,49 @@ def _swap_worker(new_worker):
 
 
 class EmbeddingValidationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_missing_role_is_rejected_for_every_role_sensitive_dense_profile(self):
+        fake = FakeWorker()
+        old = _swap_worker(fake)
+        try:
+            for model in (
+                "nomic-embed-text",
+                "mankei-326m-embedder",
+                "mxbai-embed-large",
+                "snowflake-arctic-embed",
+            ):
+                with self.subTest(model=model):
+                    response = await main.embed(
+                        main.EmbedRequest(model=model, input="contract witness")
+                    )
+                    self.assertEqual(response.status_code, 400)
+                    payload = json.loads(bytes(response.body))
+                    self.assertEqual(
+                        payload["error"]["code"], "missing_required_input_type"
+                    )
+                    self.assertEqual(payload["error"]["field_path"], "/input_type")
+                    self.assertTrue(payload["error"]["profile_id"])
+                    self.assertEqual(
+                        payload["error"]["supported"],
+                        ["search_document", "search_query"],
+                    )
+        finally:
+            main.model_worker = old
+        self.assertEqual(fake.encode_calls, [])
+        self.assertEqual(fake.load_calls, [])
+
     async def test_scalar_empty_string_is_rejected(self):
-        req = main.EmbedRequest(model="mxbai-embed-large", input="")
+        req = main.EmbedRequest(
+            model="mxbai-embed-large", input="", input_type="search_document"
+        )
         resp = await main.embed(req)
         self.assertEqual(resp.status_code, 400)
 
     async def test_whitespace_list_item_is_rejected(self):
-        req = main.EmbedRequest(model="mxbai-embed-large", input=["valid", " \t\n"])
+        req = main.EmbedRequest(
+            model="mxbai-embed-large",
+            input=["valid", " \t\n"],
+            input_type="search_document",
+        )
         resp = await main.embed(req)
         self.assertEqual(resp.status_code, 400)
 
@@ -136,7 +410,8 @@ class EmbeddingValidationTests(unittest.IsolatedAsyncioTestCase):
         resp = await main.embed(req)
         self.assertEqual(resp.status_code, 400)
         body = json.loads(bytes(resp.body).decode())
-        self.assertIn("input_type", body["error"])
+        self.assertEqual(body["error"]["code"], "unsupported_input_type")
+        self.assertEqual(body["error"]["field_path"], "/input_type")
 
     async def test_empty_list_with_valid_input_type_returns_200(self):
         # #905: Gueltiger input_type + leere Liste -> 200 mit embeddings=[]
@@ -148,12 +423,18 @@ class EmbeddingValidationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resp["embeddings"], [])
         self.assertEqual(resp["prompt_eval_count"], 0)
 
-    async def test_empty_list_without_input_type_returns_200(self):
-        # Regression: input=[] ohne input_type bleibt 200 mit embeddings=[].
-        req = main.EmbedRequest(model="mxbai-embed-large", input=[])
+    async def test_role_independent_empty_list_without_input_type_returns_200(self):
+        req = main.EmbedRequest(model="bge-m3", input=[])
         resp = await main.embed(req)
         self.assertEqual(resp["embeddings"], [])
         self.assertEqual(resp["prompt_eval_count"], 0)
+
+    async def test_role_sensitive_empty_list_without_input_type_returns_400(self):
+        req = main.EmbedRequest(model="nomic-embed-text", input=[])
+        resp = await main.embed(req)
+        self.assertEqual(resp.status_code, 400)
+        body = json.loads(bytes(resp.body).decode())
+        self.assertEqual(body["error"]["code"], "missing_required_input_type")
 
 
 # --- Endpoint /api/embed ----------------------------------------------------
@@ -170,7 +451,11 @@ class EmbedEndpointTests(unittest.IsolatedAsyncioTestCase):
         )
         old = _swap_worker(fake)
         try:
-            req = main.EmbedRequest(model="mxbai-embed-large", input="hello")
+            req = main.EmbedRequest(
+                model="mxbai-embed-large",
+                input="hello",
+                input_type="search_document",
+            )
             resp = await main.embed(req)
         finally:
             main.model_worker = old
@@ -180,14 +465,61 @@ class EmbedEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resp["prompt_eval_count"], 3)
         self.assertEqual(resp["load_duration"], 12345)
         self.assertGreaterEqual(resp["total_duration"], 0)
-        self.assertEqual(fake.encode_calls, [("mxbai-embed-large", ["hello"], None)])
+        self.assertEqual(
+            fake.encode_calls,
+            [("mxbai-embed-large", ["hello"], "search_document")],
+        )
+
+    async def test_explicit_canonical_and_additional_roles_reach_worker_unchanged(self):
+        fake = FakeWorker()
+        old = _swap_worker(fake)
+        try:
+            cases = (
+                ("nomic-embed-text", "search_document"),
+                ("nomic-embed-text", "search_query"),
+                ("nomic-embed-text", "classification"),
+                ("nomic-embed-text", "clustering"),
+                ("mankei-326m-embedder", "search_document"),
+                ("mankei-326m-embedder", "search_query"),
+            )
+            for model, role in cases:
+                response = await main.embed(
+                    main.EmbedRequest(
+                        model=model,
+                        input="contract witness",
+                        input_type=role,
+                    )
+                )
+                self.assertIsInstance(response, dict)
+        finally:
+            main.model_worker = old
+
+        self.assertEqual(
+            [(model, role) for model, _texts, role in fake.encode_calls],
+            list(cases),
+        )
+
+    async def test_role_independent_profile_without_role_reaches_worker(self):
+        fake = FakeWorker()
+        old = _swap_worker(fake)
+        try:
+            response = await main.embed(
+                main.EmbedRequest(model="bge-m3", input="contract witness")
+            )
+        finally:
+            main.model_worker = old
+
+        self.assertIsInstance(response, dict)
+        self.assertEqual(fake.encode_calls, [("bge-m3", ["contract witness"], None)])
 
     async def test_non_finite_embeddings_return_503(self):
         fake = FakeWorker(encode_exc=NonFiniteEmbeddingError([0, 1]))
         old = _swap_worker(fake)
         try:
             req = main.EmbedRequest(
-                model="mxbai-embed-large", input=["bad nan", "bad inf"]
+                model="mxbai-embed-large",
+                input=["bad nan", "bad inf"],
+                input_type="search_document",
             )
             resp = await main.embed(req)
         finally:
@@ -207,7 +539,11 @@ class EmbedEndpointTests(unittest.IsolatedAsyncioTestCase):
         )
         old = _swap_worker(fake)
         try:
-            req = main.EmbedRequest(model="mxbai-embed-large", input="zero")
+            req = main.EmbedRequest(
+                model="mxbai-embed-large",
+                input="zero",
+                input_type="search_document",
+            )
             resp = await main.embed(req)
         finally:
             main.model_worker = old
@@ -225,7 +561,11 @@ class EmbedEndpointTests(unittest.IsolatedAsyncioTestCase):
         )
         old = _swap_worker(fake)
         try:
-            req = main.EmbedRequest(model="mxbai-embed-large", input="abcdef")
+            req = main.EmbedRequest(
+                model="mxbai-embed-large",
+                input="abcdef",
+                input_type="search_document",
+            )
             resp = await main.embed(req)
         finally:
             main.model_worker = old
@@ -236,7 +576,11 @@ class EmbedEndpointTests(unittest.IsolatedAsyncioTestCase):
         fake = FakeWorker(encode_exc=WorkerQueueFullError("voll"))
         old = _swap_worker(fake)
         try:
-            req = main.EmbedRequest(model="mxbai-embed-large", input="hello")
+            req = main.EmbedRequest(
+                model="mxbai-embed-large",
+                input="hello",
+                input_type="search_document",
+            )
             resp = await main.embed(req)
         finally:
             main.model_worker = old
@@ -248,7 +592,11 @@ class EmbedEndpointTests(unittest.IsolatedAsyncioTestCase):
         fake = FakeWorker(encode_exc=WorkerStoppedError("stoppt"))
         old = _swap_worker(fake)
         try:
-            req = main.EmbedRequest(model="mxbai-embed-large", input="hello")
+            req = main.EmbedRequest(
+                model="mxbai-embed-large",
+                input="hello",
+                input_type="search_document",
+            )
             resp = await main.embed(req)
         finally:
             main.model_worker = old
@@ -260,7 +608,11 @@ class EmbedEndpointTests(unittest.IsolatedAsyncioTestCase):
         fake = FakeWorker(encode_exc=CudaRuntimeError(original))
         old = _swap_worker(fake)
         try:
-            req = main.EmbedRequest(model="mxbai-embed-large", input="hello")
+            req = main.EmbedRequest(
+                model="mxbai-embed-large",
+                input="hello",
+                input_type="search_document",
+            )
             resp = await main.embed(req)
         finally:
             main.model_worker = old
@@ -268,6 +620,132 @@ class EmbedEndpointTests(unittest.IsolatedAsyncioTestCase):
         body = json.loads(bytes(resp.body).decode())
         self.assertIn("CUDA-Fehler", body["error"])
         self.assertIn("illegal memory access", body["detail"])
+
+
+# --- Endpoint /api/embed_colbert -------------------------------------------
+
+
+class ColbertEndpointTests(unittest.IsolatedAsyncioTestCase):
+    async def test_colbert_missing_role_is_rejected_before_worker(self):
+        fake = FakeWorker()
+        old = _swap_worker(fake)
+        try:
+            response = await main.embed_colbert(
+                main.ColBERTRequest(model="colbert-xm", input="hello")
+            )
+        finally:
+            main.model_worker = old
+
+        self.assertEqual(response.status_code, 400)
+        payload = json.loads(bytes(response.body))
+        self.assertEqual(payload["error"]["code"], "missing_required_input_type")
+        self.assertEqual(
+            payload["error"]["profile_id"],
+            "kiron-colbert-xm-multivector-v1",
+        )
+        self.assertEqual(fake.colbert_embed_calls, [])
+
+    async def test_colbert_declared_aliases_are_canonicalized(self):
+        fake = FakeWorker()
+        old = _swap_worker(fake)
+        try:
+            for alias in ("document", "query"):
+                response = await main.embed_colbert(
+                    main.ColBERTRequest(
+                        model="colbert-xm", input="hello", input_type=alias
+                    )
+                )
+                self.assertIsInstance(response, dict)
+        finally:
+            main.model_worker = old
+
+        self.assertEqual(
+            [call[2] for call in fake.colbert_embed_calls],
+            ["search_document", "search_query"],
+        )
+
+    async def test_colbert_uses_worker_and_returns_response_shape(self):
+        fake = FakeWorker(
+            colbert_embed_result=ColbertEmbedResult(
+                embeddings=[[[0.1, 0.2], [0.3, 0.4]]],
+                prompt_eval_count=2,
+                load_duration_ns=123,
+            )
+        )
+        old = _swap_worker(fake)
+        try:
+            req = main.ColBERTRequest(
+                model="colbert-xm",
+                input="hello",
+                input_type="search_query",
+                language="de",
+            )
+            resp = await main.embed_colbert(req)
+        finally:
+            main.model_worker = old
+
+        self.assertEqual(resp["model"], "colbert-xm")
+        self.assertEqual(resp["embeddings"], [[[0.1, 0.2], [0.3, 0.4]]])
+        self.assertEqual(resp["prompt_eval_count"], 2)
+        self.assertEqual(resp["load_duration"], 123)
+        self.assertEqual(
+            fake.colbert_embed_calls,
+            [("colbert-xm", ["hello"], "search_query", "de")],
+        )
+
+    async def test_colbert_unknown_model_returns_400(self):
+        req = main.ColBERTRequest(model="nomic-embed-text", input="hello")
+        resp = await main.embed_colbert(req)
+        self.assertEqual(resp.status_code, 400)
+        body = json.loads(bytes(resp.body).decode())
+        self.assertEqual(body["available_models"], ["colbert-xm"])
+
+    async def test_colbert_empty_text_rejected(self):
+        req = main.ColBERTRequest(
+            model="colbert-xm", input=["ok", " "], input_type="search_document"
+        )
+        resp = await main.embed_colbert(req)
+        self.assertEqual(resp.status_code, 400)
+
+    async def test_colbert_invalid_input_type_rejected(self):
+        req = main.ColBERTRequest(
+            model="colbert-xm", input="hello", input_type="classification"
+        )
+        resp = await main.embed_colbert(req)
+        self.assertEqual(resp.status_code, 400)
+        body = json.loads(bytes(resp.body).decode())
+        self.assertEqual(body["error"]["code"], "unsupported_input_type")
+        self.assertEqual(body["error"]["field_path"], "/input_type")
+
+    async def test_colbert_empty_list_returns_200_without_worker(self):
+        fake = FakeWorker()
+        old = _swap_worker(fake)
+        try:
+            req = main.ColBERTRequest(
+                model="colbert-xm", input=[], input_type="search_query"
+            )
+            resp = await main.embed_colbert(req)
+        finally:
+            main.model_worker = old
+
+        self.assertEqual(resp["model"], "colbert-xm")
+        self.assertEqual(resp["embeddings"], [])
+        self.assertEqual(resp["prompt_eval_count"], 0)
+        self.assertEqual(fake.colbert_embed_calls, [])
+
+    async def test_colbert_non_finite_returns_503(self):
+        fake = FakeWorker(colbert_embed_exc=NonFiniteEmbeddingError([0]))
+        old = _swap_worker(fake)
+        try:
+            req = main.ColBERTRequest(
+                model="colbert-xm", input="bad", input_type="search_document"
+            )
+            resp = await main.embed_colbert(req)
+        finally:
+            main.model_worker = old
+        self.assertEqual(resp.status_code, 503)
+        body = json.loads(bytes(resp.body).decode())
+        self.assertEqual(body["non_finite_indices"], [0])
 
 
 # --- Endpoint /api/load -----------------------------------------------------
@@ -341,7 +819,12 @@ class HealthEndpointTests(unittest.TestCase):
         fake = FakeWorker(snapshot=snapshot)
         old = _swap_worker(fake)
         try:
-            return main.health()
+            with mock.patch.object(
+                main,
+                "_local_model_inventory",
+                return_value=main.LocalModelInventory(),
+            ):
+                return main.health()
         finally:
             main.model_worker = old
 
@@ -358,6 +841,10 @@ class HealthEndpointTests(unittest.TestCase):
         self.assertEqual(resp.status_code, 503)
         body = json.loads(bytes(resp.body).decode())
         self.assertEqual(body["status"], "no_model")
+        self.assertEqual(
+            body["catalog_digest"],
+            "sha256:c91229d7ea472b49d87f6344dbfb640fc760f43e8cace398421d5b364452e6f6",
+        )
         self.assertTrue(body["worker_thread_alive"])
         self.assertEqual(body["queue_depth"], 0)
 
@@ -379,6 +866,8 @@ class HealthEndpointTests(unittest.TestCase):
     def test_health_ok_during_encode(self):
         resp = self._health_with_snapshot({
             "current_model": "mxbai-embed-large",
+            "loaded_models": ["nomic-embed-text", "mxbai-embed-large"],
+            "model_slots": 2,
             "loading_model": None,
             "device": "cuda",
             "queue_depth": 0,
@@ -391,6 +880,11 @@ class HealthEndpointTests(unittest.TestCase):
         self.assertEqual(body["status"], "ok")
         self.assertTrue(body["worker_busy"])
         self.assertEqual(body["current_job"], "encode")
+        self.assertEqual(
+            body["loaded_models"],
+            ["nomic-embed-text", "mxbai-embed-large"],
+        )
+        self.assertEqual(body["model_slots"], 2)
 
     def test_health_stopping_when_thread_dead(self):
         resp = self._health_with_snapshot({
@@ -428,9 +922,9 @@ class HealthEndpointTests(unittest.TestCase):
 
 class TagsEndpointTests(unittest.TestCase):
     def test_all_models_are_revision_pinned(self):
-        for name, cfg in main.OLLAMA_TO_HF.items():
-            with self.subTest(model=name):
-                revision = cfg.get("revision")
+        for config in main.EMBEDDING_SERVICE_VIEW.models:
+            with self.subTest(model=config.model_name):
+                revision = config.artifact.revision
                 self.assertIsInstance(revision, str)
                 self.assertRegex(revision, r"^[0-9a-f]{40}$")
 
@@ -454,9 +948,10 @@ class TagsEndpointTests(unittest.TestCase):
         self.assertEqual(fake.load_calls, [])
         self.assertEqual(fake.encode_calls, [])
         self.assertIn("models", resp)
-        # quantization F16 wegen device=cuda
+        # Service-Default F16; Mankei bleibt modellbedingt BF16.
         for m in resp["models"]:
-            self.assertEqual(m["details"]["quantization_level"], "F16")
+            expected = "BF16" if m["name"] == "mankei-326m-embedder" else "F16"
+            self.assertEqual(m["details"]["quantization_level"], expected)
 
     def test_tags_cpu_device_uses_F32(self):
         fake = FakeWorker(snapshot={
@@ -475,7 +970,8 @@ class TagsEndpointTests(unittest.TestCase):
             main.model_worker = old
 
         for m in resp["models"]:
-            self.assertEqual(m["details"]["quantization_level"], "F32")
+            expected = "BF16" if m["name"] == "mankei-326m-embedder" else "F32"
+            self.assertEqual(m["details"]["quantization_level"], expected)
 
     def test_tags_digest_uses_pinned_revision(self):
         fake = FakeWorker(snapshot={
@@ -494,11 +990,11 @@ class TagsEndpointTests(unittest.TestCase):
             main.model_worker = old
 
         by_name = {item["name"]: item for item in resp["models"]}
-        for name, cfg in main.OLLAMA_TO_HF.items():
+        for config in main.EMBEDDING_SERVICE_VIEW.models:
             expected = hashlib.sha256(
-                f"{cfg['hf']}@{cfg['revision']}".encode()
+                f"{config.artifact.repository}@{config.artifact.revision}".encode()
             ).hexdigest()
-            self.assertEqual(by_name[name]["digest"], expected)
+            self.assertEqual(by_name[config.model_name]["digest"], expected)
 
     def test_tags_modified_at_is_deterministic_per_revision(self):
         # /api/tags darf modified_at nicht aus der Service-Startzeit ableiten —
@@ -528,10 +1024,10 @@ class TagsEndpointTests(unittest.TestCase):
         for value in first_by_name.values():
             _dt.fromisoformat(value)
         # Pro Revision ein eigener Wert; gleiche Revision -> gleicher Timestamp.
-        for name, cfg in main.OLLAMA_TO_HF.items():
+        for config in main.EMBEDDING_SERVICE_VIEW.models:
             self.assertEqual(
-                first_by_name[name],
-                main._model_modified_at(cfg),
+                first_by_name[config.model_name],
+                main._model_modified_at(config),
             )
 
 
@@ -619,6 +1115,7 @@ class EmbedLateEndpointTests(unittest.IsolatedAsyncioTestCase):
             "model": "nomic-embed-text",
             "document": "hello world",
             "chunks": [{"text": "hello", "char_start": 0, "char_end": 5}],
+            "input_type": "search_document",
         }
         defaults.update(kwargs)
         return main.LateBatchRequest(**defaults)
@@ -834,22 +1331,23 @@ class EmbedLateEndpointTests(unittest.IsolatedAsyncioTestCase):
             main.model_worker = old
         self.assertEqual(resp.status_code, 400)
         body = json.loads(bytes(resp.body).decode())
-        self.assertIn("input_type", body["error"])
+        self.assertEqual(body["error"]["code"], "unsupported_input_type")
+        self.assertEqual(body["error"]["field_path"], "/input_type")
         self.assertIn("search_document", body["valid_input_types"])
 
-    async def test_late_default_input_type_neutral_for_nomic(self):
-        # F0.2 Default-Pfad: input_type=None -> Worker erhaelt None.
+    async def test_late_missing_input_type_is_rejected_before_worker(self):
         fake = FakeWorker()
         old = _swap_worker(fake)
         try:
-            req = self._make_request()  # input_type unset
+            req = self._make_request(input_type=None)
             resp = await main.embed_late(req)
         finally:
             main.model_worker = old
-        self.assertEqual(resp["model"], "nomic-embed-text")
-        self.assertEqual(len(fake.late_embed_calls), 1)
-        _, _, _, recorded_input_type = fake.late_embed_calls[0]
-        self.assertIsNone(recorded_input_type)
+        self.assertEqual(resp.status_code, 400)
+        payload = json.loads(bytes(resp.body))
+        self.assertEqual(payload["error"]["code"], "missing_required_input_type")
+        self.assertEqual(payload["error"]["profile_id"], "kiron-nomic-late-v1")
+        self.assertEqual(fake.late_embed_calls, [])
 
     async def test_late_input_type_search_document_applies(self):
         # F0.2 Live-Pfad: input_type="search_document" -> Worker erhaelt's exakt.
@@ -863,6 +1361,17 @@ class EmbedLateEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resp["model"], "nomic-embed-text")
         _, _, _, recorded_input_type = fake.late_embed_calls[0]
         self.assertEqual(recorded_input_type, "search_document")
+
+    async def test_late_additional_declared_role_applies(self):
+        fake = FakeWorker()
+        old = _swap_worker(fake)
+        try:
+            req = self._make_request(input_type="classification")
+            resp = await main.embed_late(req)
+        finally:
+            main.model_worker = old
+        self.assertEqual(resp["model"], "nomic-embed-text")
+        self.assertEqual(fake.late_embed_calls[0][3], "classification")
 
     async def test_late_response_schema_invariant(self):
         # D13: Mismatch zwischen result.embeddings-Length und chunks-Length -> 500.
@@ -975,18 +1484,20 @@ class EmbedLateEndpointTests(unittest.IsolatedAsyncioTestCase):
 
 class MainSourceStaticChecks(unittest.TestCase):
     def test_main_has_no_request_path_to_thread_load_or_encode(self):
-        """In den Funktions-Bodies von embed, load_model_endpoint und embed_late:
+        """In den Funktions-Bodies der HTTP-Endpoints:
         - kein asyncio.to_thread(
         - kein direkter Aufruf von _load_model_sync / _encode_sync /
-          _drop_model_sync / _late_embed_sync (Modelloperationen MUESSEN ueber
-          model_worker laufen).
+          _drop_model_sync / _late_embed_sync / _colbert_embed_sync
+          (Modelloperationen MUESSEN ueber model_worker laufen).
         """
         embed_src = inspect.getsource(main.embed)
+        colbert_src = inspect.getsource(main.embed_colbert)
         load_src = inspect.getsource(main.load_model_endpoint)
         late_src = inspect.getsource(main.embed_late)
 
         for name, src in (
             ("embed", embed_src),
+            ("embed_colbert", colbert_src),
             ("load_model_endpoint", load_src),
             ("embed_late", late_src),
         ):
@@ -1000,6 +1511,7 @@ class MainSourceStaticChecks(unittest.TestCase):
                 "_encode_sync",
                 "_drop_model_sync",
                 "_late_embed_sync",
+                "_colbert_embed_sync",
             ):
                 self.assertNotIn(
                     forbidden,

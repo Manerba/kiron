@@ -36,8 +36,15 @@ class LateEmbedResult:
 
 
 @dataclass(slots=True)
+class ColbertEmbedResult:
+    embeddings: list[list[list[float]]]
+    prompt_eval_count: int
+    load_duration_ns: int
+
+
+@dataclass(slots=True)
 class ModelJob:
-    kind: Literal["load", "encode", "drop", "late_embed"]
+    kind: Literal["load", "encode", "drop", "late_embed", "colbert_embed"]
     payload: dict[str, object]
     future: asyncio.Future
     loop: asyncio.AbstractEventLoop
@@ -242,6 +249,24 @@ class SerialModelWorker:
         )
         return await self._await_with_cancel(future, job)
 
+    async def colbert_embed(
+        self,
+        model_name: str,
+        texts: list[str],
+        input_type: str | None,
+        language: str | None,
+    ) -> ColbertEmbedResult:
+        future, job = self._submit(
+            "colbert_embed",
+            {
+                "model_name": model_name,
+                "texts": texts,
+                "input_type": input_type,
+                "language": language,
+            },
+        )
+        return await self._await_with_cancel(future, job)
+
     async def _drop_for_test(self) -> None:
         """Test-Helper: queued einen Drop-Job. In Production wird drop nur
         inline waehrend stop() aufgerufen."""
@@ -360,23 +385,20 @@ class SerialModelWorker:
         if job.cancelled.is_set():
             return
 
+        completion: tuple[object, object] | None = None
         self._set_current_job(job.kind)
         try:
             try:
                 if job.kind == "load":
                     name = job.payload["model_name"]
                     self._manager._ensure_model_sync(name)
-                    job.loop.call_soon_threadsafe(
-                        _complete_future_with_result, job.future, job, name
-                    )
+                    completion = (_complete_future_with_result, name)
                 elif job.kind == "encode":
                     name = job.payload["model_name"]
                     texts = job.payload["texts"]
                     input_type = job.payload["input_type"]
                     result = self._manager._encode_sync(name, texts, input_type)
-                    job.loop.call_soon_threadsafe(
-                        _complete_future_with_result, job.future, job, result
-                    )
+                    completion = (_complete_future_with_result, result)
                 elif job.kind == "late_embed":
                     result = self._manager._late_embed_sync(
                         job.payload["model_name"],
@@ -384,14 +406,18 @@ class SerialModelWorker:
                         job.payload["chunks"],
                         job.payload["input_type"],
                     )
-                    job.loop.call_soon_threadsafe(
-                        _complete_future_with_result, job.future, job, result
+                    completion = (_complete_future_with_result, result)
+                elif job.kind == "colbert_embed":
+                    result = self._manager._colbert_embed_sync(
+                        job.payload["model_name"],
+                        job.payload["texts"],
+                        job.payload["input_type"],
+                        job.payload["language"],
                     )
+                    completion = (_complete_future_with_result, result)
                 elif job.kind == "drop":
                     self._manager._drop_model_sync()
-                    job.loop.call_soon_threadsafe(
-                        _complete_future_with_result, job.future, job, None
-                    )
+                    completion = (_complete_future_with_result, None)
                 else:
                     raise RuntimeError(f"unknown job kind: {job.kind!r}")
             except Exception as exc:
@@ -399,13 +425,16 @@ class SerialModelWorker:
                 # weiter. KeyboardInterrupt/SystemExit (BaseException) bubbeln
                 # durch zur outer except in _run -> Fail-Fast.
                 self._record_error(exc)
-                try:
-                    job.loop.call_soon_threadsafe(
-                        _complete_future_with_exception, job.future, job, exc
-                    )
-                except Exception:
-                    logger.exception(
-                        "call_soon_threadsafe fuer Exception-Propagation fehlgeschlagen"
-                    )
+                completion = (_complete_future_with_exception, exc)
         finally:
+            # Der atomare Runtime-Snapshot muss bereits idle sein, bevor die
+            # Future-Aufloesung den Awaiter wieder laufen lassen kann. Sonst
+            # kann unmittelbar nach einem erfolgreichen await noch der alte
+            # current_job sichtbar sein.
             self._set_current_job(None)
+
+        callback, value = completion
+        try:
+            job.loop.call_soon_threadsafe(callback, job.future, job, value)
+        except Exception:
+            logger.exception("call_soon_threadsafe fuer Job-Abschluss fehlgeschlagen")

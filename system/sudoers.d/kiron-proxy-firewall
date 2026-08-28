@@ -1,0 +1,4 @@
+# Installed by scripts/install-system-configs.sh.
+# The wrapper validates action/chain/port and hardcodes the firewall rule.
+Cmnd_Alias KIRON_PROXY_FIREWALL = /usr/local/sbin/kiron-maintenance-firewall *
+kiron-proxy ALL=(root) NOPASSWD: KIRON_PROXY_FIREWALL

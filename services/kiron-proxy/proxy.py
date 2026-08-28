@@ -2,9 +2,8 @@
 
 import asyncio
 import json
-import sys
 import time
-from pathlib import Path
+from collections.abc import Awaitable, Callable
 from typing import Optional
 
 import httpx
@@ -16,13 +15,22 @@ from starlette.routing import Route, Mount
 from request_store import RequestStore, RequestRecord
 import vram_lease
 
-_COMMON_SRC = Path(__file__).resolve().parents[1] / "kiron-common"
-if _COMMON_SRC.exists() and str(_COMMON_SRC) not in sys.path:
-    sys.path.insert(0, str(_COMMON_SRC))
-try:
-    from kiron_common.ollama_compat import apply_think_false_bytes
-except ImportError:  # pragma: no cover - half-upgraded venv fallback
-    apply_think_false_bytes = None
+from kiron_common.embedding_contract import EmbeddingContractError
+from kiron_common.embedding_registry import (
+    EMBEDDING_REGISTRY,
+    attach_show_capabilities,
+    input_type_error_payload,
+    merge_discovery_tags,
+    resolve_profile_input_type,
+)
+from kiron_common.model_catalog import BackendType, ModelEndpoint
+from kiron_common.ollama_compat import apply_think_false_bytes
+
+from routing_catalog import (
+    PROXY_ROUTING_VIEW,
+    ProxyRoute,
+    ProxyRoutingView,
+)
 
 
 # Ollama Backend-Adresse
@@ -33,21 +41,6 @@ EMBED_BACKEND = "http://127.0.0.1:11436"
 
 # DeBERTa Cross-Encoder Service (Reranking / NLI)
 DEBERTA_BACKEND = "http://127.0.0.1:11437"
-
-# Pfade die an den DeBERTa-Service geroutet werden
-DEBERTA_PATHS = {"/api/rerank", "/api/score"}
-DEFAULT_DEBERTA_MODEL = "ms-marco-MiniLM-L-6-v2"
-DEBERTA_MODELS = {"nli-deberta-v3-base", DEFAULT_DEBERTA_MODEL}
-
-# Modelle die der Embedding-Service bedient (SentenceTransformer, <1B Parameter)
-EMBED_SERVICE_MODELS = {
-    "nomic-embed-text", "mxbai-embed-large", "snowflake-arctic-embed", "bge-m3",
-}
-
-# Modelle die Ollama bedient (7B+, GGUF-Quantisierung)
-OLLAMA_EMBED_MODELS = {
-    "e5-mistral-7b-instruct", "gte-qwen2-7b-instruct",
-}
 
 # Pfade die gestreamt werden (Ollama NDJSON Streaming)
 STREAMING_PATHS = {"/api/chat", "/api/generate"}
@@ -103,16 +96,14 @@ def filter_headers(headers, exclude_set: set) -> dict:
     }
 
 
-def normalize_embed_model(name: str) -> str:
-    """Ollama-Modellname normalisieren: Namespace und Tag entfernen, lowercase."""
-    name = name.strip()
-    # Namespace entfernen: "hellord/e5-mistral-7b-instruct:Q4_0" → "e5-mistral-7b-instruct:Q4_0"
-    if "/" in name:
-        name = name.rsplit("/", 1)[1]
-    # Tag entfernen: "e5-mistral-7b-instruct:Q4_0" → "e5-mistral-7b-instruct"
-    if ":" in name:
-        name = name.split(":")[0]
-    return name.strip().lower()
+def normalize_embed_model(
+    name: object,
+    endpoint: ModelEndpoint = ModelEndpoint.EMBED,
+) -> str:
+    """Resolve an exact managed input to its selected backend model name."""
+
+    route = PROXY_ROUTING_VIEW.resolve(name, endpoint)
+    return route.backend_model_name if route is not None else ""
 
 
 def extract_model_from_body(body: bytes) -> str:
@@ -137,6 +128,17 @@ def _body_json(body: bytes) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
+def _replace_model_in_body(body: bytes, model_name: str) -> bytes:
+    """Rewrite an explicitly resolved alias to its concrete backend name."""
+    data = _body_json(body)
+    if data is None:
+        return body
+    data["model"] = model_name
+    return json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode(
+        "utf-8"
+    )
+
+
 def _explicit_verified_cpu_offload(body: bytes) -> bool:
     data = _body_json(body)
     if data is None:
@@ -153,33 +155,28 @@ def _explicit_verified_cpu_offload(body: bytes) -> bool:
     )
 
 
-def normalize_deberta_model(name: str) -> str | None:
-    name = name.strip() if isinstance(name, str) else ""
-    if not name:
-        name = DEFAULT_DEBERTA_MODEL
-    if "/" in name:
-        name = name.rsplit("/", 1)[1]
-    if ":" in name:
-        name = name.split(":", 1)[0]
-    return name if name in DEBERTA_MODELS else None
+def normalize_deberta_model(
+    name: object,
+    endpoint: ModelEndpoint = ModelEndpoint.RERANK,
+) -> str | None:
+    """Resolve only an exact DeBERTa canonical ID or declared alias."""
+
+    route = PROXY_ROUTING_VIEW.resolve(
+        name,
+        endpoint,
+        backend=BackendType.KIRON_DEBERTA,
+    )
+    return route.backend_model_name if route is not None else None
+
+
+def merge_model_tags(ollama_payload: object, embedding_payload: object) -> dict:
+    """Merge vector rows by explicit canonical group, fail-closed."""
+    return merge_discovery_tags(ollama_payload, embedding_payload)
 
 
 def inject_think_false(body: bytes, path: str) -> bytes:
     """Setzt 'think': false im Request-Body, wenn nicht explizit 'think': true gesetzt ist."""
-    if apply_think_false_bytes is not None:
-        return apply_think_false_bytes(body, path)
-    if path not in STREAMING_PATHS or not body:
-        return body
-    try:
-        data = json.loads(body)
-        if not isinstance(data, dict):
-            return body
-        if data.get("think") is not True:
-            data["think"] = False
-            return json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode()
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        pass
-    return body
+    return apply_think_false_bytes(body, path)
 
 
 # Maximaler num_ctx fuer vollstaendiges GPU-Offload (RTX 3060 12 GiB).
@@ -192,7 +189,10 @@ MAX_LOGGED_RESPONSE_BODY = 256 * 1024
 
 # Obergrenze fuer nicht-streamende Backend-Responses. Verhindert, dass eine
 # unerwartet grosse Response den Proxy-Speicher sprengt (Gegenstueck zu MAX_BODY_SIZE).
-MAX_RESPONSE_SIZE = 16 * 1024 * 1024
+# ColBERT-Antworten enthalten pro Text bis zu 256x128 Float-Werte. Der
+# Endpoint akzeptiert bis zu 128 Texte; der Proxy darf diesen Vertrag nicht
+# mit einem kleineren Response-Limit brechen.
+MAX_RESPONSE_SIZE = 128 * 1024 * 1024
 
 
 def _truncate_for_log(text: str) -> str:
@@ -263,7 +263,10 @@ def check_streaming_requested(body: bytes, path: str) -> bool:
         return False
 
 
-def create_proxy_app(request_store: RequestStore) -> Starlette:
+def create_proxy_app(
+    request_store: RequestStore,
+    routing_view: ProxyRoutingView = PROXY_ROUTING_VIEW,
+) -> Starlette:
     """Erstellt die Starlette ASGI Proxy-App.
 
     Args:
@@ -272,6 +275,13 @@ def create_proxy_app(request_store: RequestStore) -> Starlette:
     Returns:
         Starlette-App die als Reverse Proxy fungiert.
     """
+
+    if not isinstance(routing_view, ProxyRoutingView):
+        raise TypeError("routing_view must be a ProxyRoutingView")
+
+    # Mandatory startup validator: discovery must never start with an
+    # inconsistent, duplicated, or hash-invalid profile registry.
+    EMBEDDING_REGISTRY.validate()
 
     # #299: Request-Logging-Fehler duerfen den Proxy-Erfolg nicht kippen.
     # Wenn MariaDB nach dem Start ausfaellt oder update_request wirft, bekommt der
@@ -349,6 +359,56 @@ def create_proxy_app(request_store: RequestStore) -> Starlette:
             headers={"X-Kiron-VRAM-Lease": "blocked"},
         )
 
+    def _embedding_backend_error_response(
+        model_name: str,
+        endpoint: str,
+        *,
+        status_code: int,
+    ) -> Response:
+        group = EMBEDDING_REGISTRY.require(model_name)
+        profile = EMBEDDING_REGISTRY.default_profile(model_name, endpoint)
+        return Response(
+            content=json.dumps(
+                {
+                    "error": {
+                        "code": "embedding_backend_incompatible_or_unavailable",
+                        "model": group.canonical_model_id,
+                        "profile_id": (
+                            profile["profile_id"] if profile is not None else None
+                        ),
+                        "field_path": "/backend",
+                    }
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+            status_code=status_code,
+            media_type="application/json",
+        )
+
+    def _embedding_registry_error_response(
+        error: EmbeddingContractError,
+        model_name: str = "embedding-registry",
+    ) -> Response:
+        group = EMBEDDING_REGISTRY.resolve(model_name)
+        return Response(
+            content=json.dumps(
+                {
+                    "error": {
+                        "code": error.reason_code,
+                        "model": (
+                            group.canonical_model_id if group is not None else model_name
+                        ),
+                        "field_path": error.field_path,
+                    }
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+            status_code=503,
+            media_type="application/json",
+        )
+
     async def _ollama_model_loaded_gpu(model_name: str) -> bool:
         if not model_name:
             return False
@@ -393,6 +453,54 @@ def create_proxy_app(request_store: RequestStore) -> Starlette:
         ):
             return data
         return None
+
+    async def _overlay_embedding_tags(response_body: bytes) -> bytes:
+        """Build complete canonical discovery or fail the whole request."""
+        try:
+            ollama_payload = json.loads(response_body)
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise EmbeddingContractError(
+                "/ollama", "tags response is not valid JSON"
+            ) from exc
+        try:
+            response = await embed_client.get("/api/tags")
+        except httpx.RequestError as exc:
+            raise EmbeddingContractError(
+                "/kiron_embeddings", "tags endpoint is unavailable"
+            ) from exc
+        if response.status_code != 200:
+            raise EmbeddingContractError(
+                "/kiron_embeddings",
+                f"tags endpoint returned HTTP {response.status_code}",
+            )
+        try:
+            embedding_payload = response.json()
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise EmbeddingContractError(
+                "/kiron_embeddings", "tags response is not valid JSON"
+            ) from exc
+        merged = merge_model_tags(ollama_payload, embedding_payload)
+        return json.dumps(
+            merged,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+
+    async def _overlay_embedding_show(
+        response_body: bytes, model_name: str
+    ) -> bytes:
+        try:
+            payload = json.loads(response_body)
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise EmbeddingContractError(
+                "/show", "response is not valid JSON"
+            ) from exc
+        result = attach_show_capabilities(payload, model_name)
+        return json.dumps(
+            result,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
 
     async def _begin_lazy_operation(
         *,
@@ -472,9 +580,16 @@ def create_proxy_app(request_store: RequestStore) -> Starlette:
         request_path: str,
         model_name: str,
         request_body: bytes,
+        managed_route: ProxyRoute | None,
     ) -> vram_lease.GPUServiceOperation | None:
-        if request_path not in STREAMING_PATHS and not (
-            request_path == "/api/embed" and normalize_embed_model(model_name) in OLLAMA_EMBED_MODELS
+        is_managed_ollama_embedding = (
+            managed_route is not None
+            and managed_route.endpoint is ModelEndpoint.EMBED
+            and managed_route.backend is BackendType.OLLAMA
+        )
+        if (
+            request_path not in STREAMING_PATHS
+            and not is_managed_ollama_embedding
         ):
             return None
         if _explicit_verified_cpu_offload(request_body):
@@ -495,10 +610,13 @@ def create_proxy_app(request_store: RequestStore) -> Starlette:
     async def _begin_embedding_lazy_operation(normalized_model: str) -> vram_lease.GPUServiceOperation:
         async def _already_loaded() -> bool:
             data = await _service_health(embed_client)
+            if not isinstance(data, dict):
+                return False
+            loaded_models = data.get("loaded_models")
             return (
-                data is not None
-                and data.get("status") == "ok"
-                and data.get("current_model") == normalized_model
+                data.get("status") == "ok"
+                and isinstance(loaded_models, list)
+                and normalized_model in loaded_models
                 and not data.get("loading_model")
             )
 
@@ -574,12 +692,182 @@ def create_proxy_app(request_store: RequestStore) -> Starlette:
 
         # Modellname und Streaming-Info aus Body extrahieren
         model = extract_model_from_body(body)
+        requested_model = model
         is_streaming = check_streaming_requested(body, path)
+
+        managed_endpoint = routing_view.endpoint(path)
+        managed_route: ProxyRoute | None = None
+        if managed_endpoint is not None:
+            request_data = _body_json(body)
+            supplied_model: object = None
+            model_is_supplied = False
+            if request_data is not None and "model" in request_data:
+                supplied_model = request_data["model"]
+                model_is_supplied = True
+            if model_is_supplied:
+                managed_route = routing_view.resolve(
+                    supplied_model,
+                    managed_endpoint,
+                )
+            elif request_data is not None and managed_endpoint in (
+                ModelEndpoint.RERANK,
+                ModelEndpoint.SCORE,
+            ):
+                managed_route = routing_view.request_default(managed_endpoint)
+
+            if managed_route is None:
+                available_models = list(
+                    routing_view.available_models(managed_endpoint)
+                )
+                if managed_endpoint in (
+                    ModelEndpoint.RERANK,
+                    ModelEndpoint.SCORE,
+                ):
+                    error_message = (
+                        f"DeBERTa-Modell '{supplied_model}' wird nicht "
+                        "unterstuetzt."
+                    )
+                    log_message = f"Unbekanntes DeBERTa-Modell: {supplied_model}"
+                    payload = {
+                        "error": error_message,
+                        "available_models": available_models,
+                    }
+                elif managed_endpoint is ModelEndpoint.EMBED_COLBERT:
+                    error_message = (
+                        f"ColBERT-Modell '{supplied_model}' wird nicht "
+                        "unterstuetzt."
+                    )
+                    log_message = f"Unbekanntes ColBERT-Modell: {supplied_model}"
+                    payload = {
+                        "error": error_message,
+                        "available_models": available_models,
+                    }
+                elif managed_endpoint is ModelEndpoint.EMBED_LATE:
+                    error_message = (
+                        f"Late Chunking ist fuer Modell '{supplied_model}' "
+                        "nicht aktiv."
+                    )
+                    log_message = (
+                        f"Late-Embed-Modell abgelehnt: {supplied_model}"
+                    )
+                    payload = {
+                        "error": error_message,
+                        "hint": (
+                            "Re-Ingest nutzt Standard-Embedding via /api/embed."
+                        ),
+                        "available_models": available_models,
+                    }
+                else:
+                    error_message = (
+                        f"Embedding-Modell '{supplied_model}' ist auf dem "
+                        "Ollama-Server nicht verfuegbar."
+                    )
+                    log_message = (
+                        f"Unbekanntes Embedding-Modell: {supplied_model}"
+                    )
+                    payload = {
+                        "error": error_message,
+                        "available_models": available_models,
+                        "hint": (
+                            "Bitte den Server-Administrator kontaktieren, um "
+                            "das Modell zu installieren."
+                        ),
+                    }
+                request_body_text = body.decode("utf-8", errors="replace")
+                record = RequestRecord(
+                    client_ip=client_ip,
+                    method=method,
+                    path=path,
+                    model=(
+                        supplied_model if type(supplied_model) is str else ""
+                    ),
+                    request_size=len(body),
+                    is_streaming=is_streaming,
+                    state="active",
+                    request_body=_truncate_for_log(request_body_text),
+                )
+                await _safe_log_add(record)
+                duration_ms = (time.monotonic() - start_time) * 1000
+                await _safe_log_update(
+                    record.id,
+                    state="error",
+                    status_code=400,
+                    duration_ms=round(duration_ms, 1),
+                    error_message=log_message,
+                )
+                return Response(
+                    content=json.dumps(payload),
+                    status_code=400,
+                    media_type="application/json",
+                )
+
+            requested_model = (
+                supplied_model if type(supplied_model) is str else ""
+            )
+
+        # Vektor-Requestvertrag lokal und vor VRAM-Gate, Modell-Healthcheck oder
+        # Backendkontakt erzwingen. Damit kann weder ein Fallback noch ein
+        # Lade-/Unloading-Pfad einen fehlenden oder ungueltigen Rollentyp
+        # verschlucken.
+        if managed_endpoint in (
+            ModelEndpoint.EMBED,
+            ModelEndpoint.EMBED_LATE,
+            ModelEndpoint.EMBED_COLBERT,
+        ):
+            request_data = _body_json(body)
+            if request_data is not None:
+                input_decision = resolve_profile_input_type(
+                    managed_route.canonical_model_id,
+                    managed_endpoint.value,
+                    request_data.get("input_type"),
+                )
+                if input_decision is not None and not input_decision.accepted:
+                    request_body_text = body.decode("utf-8", errors="replace")
+                    record = RequestRecord(
+                        client_ip=client_ip,
+                        method=method,
+                        path=path,
+                        model=requested_model,
+                        request_size=len(body),
+                        is_streaming=is_streaming,
+                        state="active",
+                        request_body=_truncate_for_log(request_body_text),
+                    )
+                    await _safe_log_add(record)
+                    duration_ms = (time.monotonic() - start_time) * 1000
+                    await _safe_log_update(
+                        record.id,
+                        state="error",
+                        status_code=400,
+                        duration_ms=round(duration_ms, 1),
+                        error_message=input_decision.error_code,
+                    )
+                    return Response(
+                        content=json.dumps(
+                            input_type_error_payload(input_decision),
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ).encode("utf-8"),
+                        status_code=400,
+                        media_type="application/json",
+                    )
+
+        if managed_route is not None:
+            body = _replace_model_in_body(
+                body,
+                managed_route.backend_model_name,
+            )
+            model = managed_route.backend_model_name
 
         # VRAM-Lease Intercept (#285): Docling beansprucht GPU waehrend
         # STARTING/RUNNING+active/STOPPED_DIRTY. Bytes-Helper entscheidet
         # anhand Policy (block/force_cpu/pass) ueber Outcome.
-        body, lease_outcome = await vram_lease.apply_bytes(body, path, model)
+        body, lease_outcome = await vram_lease.apply_bytes(
+            body,
+            path,
+            model,
+            routing_view,
+        )
         # #611: Warnung NACH apply_bytes, damit FORCE_CPU (num_gpu=0) den
         # irrefuehrenden GPU-Partial-Offload-Hinweis korrekt unterdrueckt.
         perf_warning = check_num_ctx_warning(body, path)
@@ -594,7 +882,7 @@ def create_proxy_app(request_store: RequestStore) -> Starlette:
             client_ip=client_ip,
             method=method,
             path=path,
-            model=model,
+            model=requested_model,
             request_size=request_size,
             is_streaming=is_streaming,
             state="active",
@@ -640,31 +928,12 @@ def create_proxy_app(request_store: RequestStore) -> Starlette:
         if query_string:
             target_url = f"{path}?{query_string}"
 
-        # DeBERTa-Requests: Reranking und NLI-Scoring
-        if path in DEBERTA_PATHS:
-            resolved_deberta = normalize_deberta_model(model)
-            if resolved_deberta is None:
-                # Unbekannter nicht-leerer Modellname: 400 VOR dem GPU-Gate,
-                # damit aktive Gates nicht 409 statt der vertraglichen
-                # 400-Validierungsantwort liefern. Leere Namen werden in
-                # normalize_deberta_model bereits auf DEFAULT_DEBERTA_MODEL gemappt.
-                error_body = json.dumps({
-                    "error": f"DeBERTa-Modell '{model}' wird nicht unterstuetzt.",
-                    "available_models": sorted(DEBERTA_MODELS),
-                })
-                duration_ms = (time.monotonic() - start_time) * 1000
-                await _safe_log_update(
-                    record.id,
-                    state="error",
-                    status_code=400,
-                    duration_ms=round(duration_ms, 1),
-                    error_message=f"Unbekanntes DeBERTa-Modell: {model}",
-                )
-                return Response(
-                    content=error_body,
-                    status_code=400,
-                    media_type="application/json",
-                )
+        # DeBERTa-Requests: route was resolved and rewritten before any gate.
+        if (
+            managed_route is not None
+            and managed_route.backend is BackendType.KIRON_DEBERTA
+        ):
+            resolved_deberta = managed_route.backend_model_name
             gpu_op = await _begin_deberta_lazy_operation(resolved_deberta)
             if not gpu_op.allowed:
                 duration_ms = (time.monotonic() - start_time) * 1000
@@ -775,44 +1044,120 @@ def create_proxy_app(request_store: RequestStore) -> Starlette:
                     media_type="application/json",
                 )
 
-        # Embed-Requests: Modellbasiertes Routing (Embedding-Service vs. Ollama)
-        if path in ("/api/embed", "/api/embed_late"):
-            normalized = normalize_embed_model(model)
-
-            # D2-Filter fuer /api/embed_late: nur nomic-embed-text. Pruefung
-            # vor dem GPU-Gate (analog DeBERTa-Pattern proxy.py:644-650), damit
-            # aktive Gates nicht 409 statt 400 liefern.
-            if path == "/api/embed_late" and normalized != "nomic-embed-text":
-                if normalized in OLLAMA_EMBED_MODELS:
-                    error_msg = (
-                        f"Late Chunking ist fuer Modell '{model}' nicht aktiv "
-                        "(Ollama-Modell, kein Late-Endpoint)."
-                    )
-                else:
-                    error_msg = (
-                        f"Late Chunking ist fuer Modell '{model}' nicht aktiv "
-                        "(nicht-Mean-Pooling)."
-                    )
-                error_body = json.dumps({
-                    "error": error_msg,
-                    "hint": "Re-Ingest nutzt Standard-Embedding via /api/embed.",
-                    "available_models": ["nomic-embed-text"],
-                })
+        # ColBERT-Requests: always kiron-embeddings, never Ollama.
+        if managed_endpoint is ModelEndpoint.EMBED_COLBERT:
+            if managed_route is None:  # pragma: no cover - rejected above
+                raise AssertionError("managed ColBERT route disappeared")
+            gpu_op = await _begin_embedding_lazy_operation(
+                managed_route.backend_model_name
+            )
+            if not gpu_op.allowed:
                 duration_ms = (time.monotonic() - start_time) * 1000
                 await _safe_log_update(
                     record.id,
                     state="error",
-                    status_code=400,
+                    status_code=gpu_op.decision.status_code,
                     duration_ms=round(duration_ms, 1),
-                    error_message=f"Late-Embed-Modell abgelehnt: {model}",
+                    error_message=f"GPU-Gate blockiert: {gpu_op.decision.reason}",
+                )
+                return _gpu_gate_response(gpu_op.decision)
+            try:
+                return await _handle_standard_request(
+                    http_client=embed_client,
+                    request_store=request_store,
+                    record=record,
+                    method=method,
+                    target_url=target_url,
+                    headers=forward_headers,
+                    body=body,
+                    start_time=start_time,
+                    lease_header=lease_header_value,
+                    gpu_op=gpu_op,
+                )
+            except httpx.ConnectError:
+                duration_ms = (time.monotonic() - start_time) * 1000
+                await _safe_log_update(
+                    record.id,
+                    state="error",
+                    status_code=503,
+                    duration_ms=round(duration_ms, 1),
+                    error_message="ColBERT Embedding-Service nicht erreichbar",
+                )
+                return _embedding_backend_error_response(
+                    model,
+                    path,
+                    status_code=503,
+                )
+            except httpx.PoolTimeout:
+                duration_ms = (time.monotonic() - start_time) * 1000
+                await _safe_log_update(
+                    record.id,
+                    state="error",
+                    status_code=503,
+                    duration_ms=round(duration_ms, 1),
+                    error_message="Proxy-Pool erschoepft (ColBERT-Embedding-Client)",
+                )
+                return _embedding_backend_error_response(
+                    model,
+                    path,
+                    status_code=503,
+                )
+            except httpx.TimeoutException:
+                duration_ms = (time.monotonic() - start_time) * 1000
+                await _safe_log_update(
+                    record.id,
+                    state="error",
+                    status_code=502,
+                    duration_ms=round(duration_ms, 1),
+                    error_message="ColBERT Embedding-Service Timeout",
+                )
+                return _embedding_backend_error_response(
+                    model,
+                    path,
+                    status_code=502,
+                )
+            except httpx.RequestError as e:
+                duration_ms = (time.monotonic() - start_time) * 1000
+                await _safe_log_update(
+                    record.id,
+                    state="error",
+                    status_code=502,
+                    duration_ms=round(duration_ms, 1),
+                    error_message=f"Kommunikation mit ColBERT Embedding-Service fehlgeschlagen: {e}",
+                )
+                return _embedding_backend_error_response(
+                    model,
+                    path,
+                    status_code=502,
+                )
+            except Exception as e:
+                duration_ms = (time.monotonic() - start_time) * 1000
+                await _safe_log_update(
+                    record.id,
+                    state="error",
+                    status_code=500,
+                    duration_ms=round(duration_ms, 1),
+                    error_message=f"Interner Proxy-Fehler (ColBERT): {e}",
                 )
                 return Response(
-                    content=error_body,
-                    status_code=400,
+                    content=json.dumps({
+                        "error": "Internal Server Error",
+                        "message": "Ein interner Fehler ist im Proxy aufgetreten.",
+                    }),
+                    status_code=500,
                     media_type="application/json",
                 )
 
-            if normalized in EMBED_SERVICE_MODELS:
+        # Dense/Late requests use the exact Catalog-selected deployment.
+        if managed_endpoint in (
+            ModelEndpoint.EMBED,
+            ModelEndpoint.EMBED_LATE,
+        ):
+            if managed_route is None:  # pragma: no cover - rejected above
+                raise AssertionError("managed embedding route disappeared")
+            normalized = managed_route.backend_model_name
+
+            if managed_route.backend is BackendType.KIRON_EMBEDDINGS:
                 # Kleine Modelle → Embedding-Service (schnell, FP16)
                 gpu_op = await _begin_embedding_lazy_operation(normalized)
                 if not gpu_op.allowed:
@@ -839,62 +1184,24 @@ def create_proxy_app(request_store: RequestStore) -> Starlette:
                         gpu_op=gpu_op,
                     )
                 except httpx.ConnectError:
-                    # #465: Nur ConnectError rechtfertigt Ollama-Fallback fuer
-                    # /api/embed (Service down, Ollama hat das Modell evtl. auch).
-                    # Fuer /api/embed_late: 502 ohne Fallback — Ollama hat
-                    # keinen /api/embed_late-Endpoint und wuerde 404 liefern.
-                    if path == "/api/embed_late":
-                        duration_ms = (time.monotonic() - start_time) * 1000
-                        await _safe_log_update(
-                            record.id,
-                            state="error",
-                            status_code=502,
-                            duration_ms=round(duration_ms, 1),
-                            error_message="Embedding-Service nicht erreichbar (late-embed)",
-                        )
-                        return Response(
-                            content=json.dumps({
-                                "error": "Embedding-Service nicht erreichbar.",
-                                "hint": "kiron-embeddings prueefen; kein Ollama-Fallback fuer Late-Embed.",
-                            }),
-                            status_code=502,
-                            media_type="application/json",
-                        )
-                    import logging
-                    logging.getLogger("proxy").warning(
-                        "Embedding-Service nicht erreichbar, Fallback auf Ollama"
+                    # A same-named Ollama model is not a compatibility proof.
+                    # No current cross-backend pair has two verified equal IDs.
+                    duration_ms = (time.monotonic() - start_time) * 1000
+                    await _safe_log_update(
+                        record.id,
+                        state="error",
+                        status_code=502,
+                        duration_ms=round(duration_ms, 1),
+                        error_message=(
+                            "Embedding-Service nicht erreichbar; "
+                            "kein verifizierter kompatibler Fallback"
+                        ),
                     )
-                    fallback_body, fallback_outcome = (
-                        await vram_lease.apply_ollama_embed_fallback(
-                            body, "/api/embed", model
-                        )
+                    return _embedding_backend_error_response(
+                        model,
+                        path,
+                        status_code=502,
                     )
-                    if fallback_outcome == vram_lease.LeaseOutcome.BLOCK:
-                        duration_ms = (time.monotonic() - start_time) * 1000
-                        await _safe_log_update(
-                            record.id,
-                            state="error",
-                            status_code=503,
-                            duration_ms=round(duration_ms, 1),
-                            error_message=(
-                                "GPU-Gate aktiv — Ollama-Embed-Fallback blockiert"
-                            ),
-                        )
-                        return Response(
-                            content=json.dumps({
-                                "error": "GPU-Operation blockiert",
-                                "hint": "Embedding-Service spaeter erneut versuchen; "
-                                        "Ollama-Fallback ist waehrend aktiver GPU-Gates blockiert.",
-                                "vram_lease": "active",
-                            }),
-                            status_code=503,
-                            media_type="application/json",
-                            headers={"X-Kiron-VRAM-Lease": "blocked"},
-                        )
-                    body = fallback_body
-                    # start_time wird NICHT zurueckgesetzt — Duration soll den gesamten
-                    # Request inkl. fehlgeschlagenem Embed-Versuch messen
-                    # Fallthrough zu Ollama
                 except httpx.PoolTimeout:
                     duration_ms = (time.monotonic() - start_time) * 1000
                     await _safe_log_update(
@@ -904,33 +1211,24 @@ def create_proxy_app(request_store: RequestStore) -> Starlette:
                         duration_ms=round(duration_ms, 1),
                         error_message="Proxy-Pool erschoepft (Embedding-Client)",
                     )
-                    return Response(
-                        content=json.dumps({
-                            "error": "Service Unavailable",
-                            "message": "Proxy-Verbindungspool zum Embedding-Service erschoepft. Spaeter erneut versuchen.",
-                        }),
+                    return _embedding_backend_error_response(
+                        model,
+                        path,
                         status_code=503,
-                        media_type="application/json",
                     )
                 except httpx.TimeoutException:
-                    # #465: Timeout heisst Service ueberlastet, nicht down.
-                    # Kein Fallback auf Ollama (haette evtl. andere Performance-
-                    # Charakteristik, Client kann retry'en). Konsistent zu DeBERTa-Block.
                     duration_ms = (time.monotonic() - start_time) * 1000
                     await _safe_log_update(
                         record.id,
                         state="error",
-                        status_code=504,
+                        status_code=502,
                         duration_ms=round(duration_ms, 1),
                         error_message="Embedding-Service Timeout",
                     )
-                    return Response(
-                        content=json.dumps({
-                            "error": "Gateway Timeout",
-                            "message": "Embedding-Service hat nicht rechtzeitig geantwortet.",
-                        }),
-                        status_code=504,
-                        media_type="application/json",
+                    return _embedding_backend_error_response(
+                        model,
+                        path,
+                        status_code=502,
                     )
                 except httpx.RequestError as e:
                     # #465: Sonstige Netzwerk-/Protokollfehler (nicht ConnectError,
@@ -943,13 +1241,10 @@ def create_proxy_app(request_store: RequestStore) -> Starlette:
                         duration_ms=round(duration_ms, 1),
                         error_message=f"Embedding-Service Netzwerkfehler: {e}",
                     )
-                    return Response(
-                        content=json.dumps({
-                            "error": "Bad Gateway",
-                            "message": "Kommunikationsfehler mit Embedding-Service.",
-                        }),
+                    return _embedding_backend_error_response(
+                        model,
+                        path,
                         status_code=502,
-                        media_type="application/json",
                     )
                 except Exception as e:
                     duration_ms = (time.monotonic() - start_time) * 1000
@@ -969,33 +1264,59 @@ def create_proxy_app(request_store: RequestStore) -> Starlette:
                         media_type="application/json",
                     )
 
-            elif normalized in OLLAMA_EMBED_MODELS:
-                # 7B-Modelle → direkt an Ollama (GGUF, passt in VRAM)
-                pass  # Fallthrough zu normalem Ollama-Routing
-
+            elif managed_route.backend is BackendType.OLLAMA:
+                # Catalog-managed GGUF deployment: fall through to Ollama.
+                if managed_endpoint is not ModelEndpoint.EMBED:
+                    raise AssertionError(
+                        "Ollama deployment reached a non-dense endpoint"
+                    )
             else:
-                # Unbekanntes Modell → Fehlermeldung fuer KIara-Admin
-                all_models = sorted(EMBED_SERVICE_MODELS | OLLAMA_EMBED_MODELS)
-                error_body = json.dumps({
-                    "error": f"Embedding-Modell '{model}' ist auf dem Ollama-Server nicht verfuegbar.",
-                    "available_models": all_models,
-                    "hint": "Bitte den Server-Administrator kontaktieren, um das Modell zu installieren.",
-                })
-                duration_ms = (time.monotonic() - start_time) * 1000
-                await _safe_log_update(
-                    record.id,
-                    state="error",
-                    status_code=400,
-                    duration_ms=round(duration_ms, 1),
-                    error_message=f"Unbekanntes Embedding-Modell: {model}",
-                )
-                return Response(
-                    content=error_body,
-                    status_code=400,
-                    media_type="application/json",
+                raise AssertionError(
+                    "validated embedding route has an unsupported backend"
                 )
 
-        gpu_op = await _begin_ollama_lazy_operation(path, model, body)
+        # /api/show follows the explicit canonical group. Service-owned groups
+        # (including ColBERT) come from kiron-embeddings; Ollama-only groups are
+        # augmented after their native show response.
+        show_group = EMBEDDING_REGISTRY.resolve(model) if path == "/api/show" else None
+        if (
+            show_group is not None
+            and show_group.service_model is None
+            and show_group.ollama_model is not None
+        ):
+            body = _replace_model_in_body(body, show_group.ollama_model)
+            model = show_group.ollama_model
+        standard_client = http_client
+        backend_name = "Ollama"
+        backend_pool_label = "Ollama-Client"
+        backend_unavailable_message = (
+            "Ollama Backend nicht erreichbar. Laeuft Ollama auf Port 11435?"
+        )
+        backend_pool_message = (
+            "Proxy-Verbindungspool zu Ollama erschoepft. Spaeter erneut versuchen."
+        )
+        backend_request_error_message = "Kommunikation mit Ollama Backend fehlgeschlagen."
+        if show_group is not None and show_group.service_model is not None:
+            standard_client = embed_client
+            backend_name = "Embedding-Service"
+            backend_pool_label = "Embedding-Client"
+            backend_unavailable_message = "Embedding-Service nicht erreichbar."
+            backend_pool_message = (
+                "Proxy-Verbindungspool zum Embedding-Service erschoepft. "
+                "Spaeter erneut versuchen."
+            )
+            backend_request_error_message = (
+                "Kommunikation mit Embedding-Service fehlgeschlagen."
+            )
+
+        gpu_op = None
+        if standard_client is http_client:
+            gpu_op = await _begin_ollama_lazy_operation(
+                path,
+                model,
+                body,
+                managed_route,
+            )
         if gpu_op is not None and not gpu_op.allowed:
             duration_ms = (time.monotonic() - start_time) * 1000
             await _safe_log_update(
@@ -1006,6 +1327,14 @@ def create_proxy_app(request_store: RequestStore) -> Starlette:
                 error_message=f"GPU-Gate blockiert: {gpu_op.decision.reason}",
             )
             return _gpu_gate_response(gpu_op.decision)
+
+        standard_response_transform = None
+        if method == "GET" and path == "/api/tags":
+            standard_response_transform = _overlay_embedding_tags
+        elif show_group is not None:
+            standard_response_transform = lambda response_body: _overlay_embedding_show(
+                response_body, model
+            )
 
         try:
             if is_streaming:
@@ -1024,7 +1353,7 @@ def create_proxy_app(request_store: RequestStore) -> Starlette:
                 )
             else:
                 return await _handle_standard_request(
-                    http_client=http_client,
+                    http_client=standard_client,
                     request_store=request_store,
                     record=record,
                     method=method,
@@ -1035,7 +1364,19 @@ def create_proxy_app(request_store: RequestStore) -> Starlette:
                     perf_warning=perf_warning,
                     lease_header=lease_header_value,
                     gpu_op=gpu_op,
+                    response_transform=standard_response_transform,
                 )
+
+        except EmbeddingContractError as e:
+            duration_ms = (time.monotonic() - start_time) * 1000
+            await _safe_log_update(
+                record.id,
+                state="error",
+                status_code=503,
+                duration_ms=round(duration_ms, 1),
+                error_message=str(e),
+            )
+            return _embedding_registry_error_response(e, model or "embedding-registry")
 
         except httpx.ConnectError as e:
             # Ollama nicht erreichbar
@@ -1045,12 +1386,12 @@ def create_proxy_app(request_store: RequestStore) -> Starlette:
                 state="error",
                 status_code=502,
                 duration_ms=round(duration_ms, 1),
-                error_message=f"Verbindung zu Ollama fehlgeschlagen: {e}",
+                error_message=f"Verbindung zu {backend_name} fehlgeschlagen: {e}",
             )
             return Response(
                 content=json.dumps({
                     "error": "Bad Gateway",
-                    "message": "Ollama Backend nicht erreichbar. Laeuft Ollama auf Port 11435?",
+                    "message": backend_unavailable_message,
                 }),
                 status_code=502,
                 media_type="application/json",
@@ -1063,12 +1404,12 @@ def create_proxy_app(request_store: RequestStore) -> Starlette:
                 state="error",
                 status_code=503,
                 duration_ms=round(duration_ms, 1),
-                error_message="Proxy-Pool erschoepft (Ollama-Client)",
+                error_message=f"Proxy-Pool erschoepft ({backend_pool_label})",
             )
             return Response(
                 content=json.dumps({
                     "error": "Service Unavailable",
-                    "message": "Proxy-Verbindungspool zu Ollama erschoepft. Spaeter erneut versuchen.",
+                    "message": backend_pool_message,
                 }),
                 status_code=503,
                 media_type="application/json",
@@ -1081,12 +1422,12 @@ def create_proxy_app(request_store: RequestStore) -> Starlette:
                 state="error",
                 status_code=504,
                 duration_ms=round(duration_ms, 1),
-                error_message=f"Timeout bei Ollama-Anfrage: {e}",
+                error_message=f"Timeout bei {backend_name}-Anfrage: {e}",
             )
             return Response(
                 content=json.dumps({
                     "error": "Gateway Timeout",
-                    "message": "Ollama hat nicht rechtzeitig geantwortet.",
+                    "message": f"{backend_name} hat nicht rechtzeitig geantwortet.",
                 }),
                 status_code=504,
                 media_type="application/json",
@@ -1099,12 +1440,12 @@ def create_proxy_app(request_store: RequestStore) -> Starlette:
                 state="error",
                 status_code=502,
                 duration_ms=round(duration_ms, 1),
-                error_message=f"Kommunikation mit Ollama fehlgeschlagen: {e}",
+                error_message=f"Kommunikation mit {backend_name} fehlgeschlagen: {e}",
             )
             return Response(
                 content=json.dumps({
                     "error": "Bad Gateway",
-                    "message": "Kommunikation mit Ollama Backend fehlgeschlagen.",
+                    "message": backend_request_error_message,
                 }),
                 status_code=502,
                 media_type="application/json",
@@ -1140,6 +1481,7 @@ def create_proxy_app(request_store: RequestStore) -> Starlette:
         perf_warning: Optional[str] = None,
         lease_header: Optional[str] = None,
         gpu_op: vram_lease.GPUServiceOperation | None = None,
+        response_transform: Callable[[bytes], Awaitable[bytes]] | None = None,
     ) -> Response:
         """Nicht-Streaming Request verarbeiten und komplett weiterleiten."""
 
@@ -1208,6 +1550,30 @@ def create_proxy_app(request_store: RequestStore) -> Starlette:
                     )
                 body_chunks.append(chunk)
             response_body = b"".join(body_chunks)
+            if (
+                response_transform is not None
+                and 200 <= backend_response.status_code < 300
+            ):
+                response_body = await response_transform(response_body)
+                if len(response_body) > MAX_RESPONSE_SIZE:
+                    duration_ms = (time.monotonic() - start_time) * 1000
+                    await _safe_log_update(
+                        record.id,
+                        state="error",
+                        status_code=502,
+                        duration_ms=round(duration_ms, 1),
+                        error_message="Transformierte Backend-Response ueberschreitet Limit",
+                    )
+                    return Response(
+                        content=json.dumps({
+                            "error": (
+                                "Backend response too large "
+                                f"(max {MAX_RESPONSE_SIZE // (1024 * 1024)}MB)"
+                            )
+                        }).encode(),
+                        status_code=502,
+                        media_type="application/json",
+                    )
             if gpu_op is not None and gpu_op.token is not None:
                 if 200 <= backend_response.status_code < 300:
                     try:

@@ -431,18 +431,36 @@ function renderSystemMetrics(metrics) {
         var embedRunning = embedding.running;
         var embedModel = embedding.model || '';
         var embedLoading = embedding.loading_model || '';
+        var embedLoadedModels = Array.isArray(embedding.loaded_models)
+            ? embedding.loaded_models.filter(Boolean)
+            : [];
+        var embedColbertAvailable = Array.isArray(embedding.available_colbert_models)
+            ? embedding.available_colbert_models
+            : [];
+        var embedCurrentIsColbert = embedLoadedModels.some(function(modelName) {
+            return embedColbertAvailable.includes(modelName);
+        });
+        var embedLoadingIsColbert = embedLoading && embedColbertAvailable.includes(embedLoading);
         var embedStatusBadge = embedRunning
             ? (embedLoading
                 ? '<span class="models-badge models-badge-mixed">Loading</span>'
                 : '<span class="models-badge models-badge-vram">Running</span>')
             : '<span class="models-badge models-badge-unloaded">Stopped</span>';
+        var embedKindBadge = (embedCurrentIsColbert || embedLoadingIsColbert)
+            ? ' <span class="models-badge models-badge-type-colbert">ColBERT</span>'
+            : '';
+        var embedSlotInfo = Number.isFinite(Number(embedding.model_slots))
+            ? ' <span class="gpu-mgr-model-name">(' + embedLoadedModels.length + '/' + escapeHtml(String(embedding.model_slots)) + ' Slots)</span>'
+            : '';
         var embedModelInfo = embedLoading
-            ? ' <span class="gpu-mgr-model-name">' + escapeHtml(embedLoading) + '</span>'
-            : (embedModel ? ' <span class="gpu-mgr-model-name">' + escapeHtml(embedModel) + '</span>' : '');
+            ? ' <span class="gpu-mgr-model-name">' + escapeHtml(embedLoading) + '</span>' + embedSlotInfo
+            : (embedLoadedModels.length
+                ? ' <span class="gpu-mgr-model-name">' + escapeHtml(embedLoadedModels.join(', ')) + '</span>' + embedSlotInfo
+                : embedSlotInfo);
 
         html += '<tr><td>Embedding</td>';
         html += '<td>' + Math.round(embedVram) + ' MB</td>';
-        html += '<td>' + embedStatusBadge + embedModelInfo + '</td>';
+        html += '<td>' + embedStatusBadge + embedKindBadge + embedModelInfo + '</td>';
         html += '<td class="models-actions">';
         if (embedRunning) {
             html += '<button class="action-btn" onclick="stopEmbedding()" data-kpi="gpu_mgr_embed_action">Stoppen</button>';

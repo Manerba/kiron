@@ -1,0 +1,129 @@
+{
+  "schema_version": 1,
+  "canonical_model_id": "hellord/e5-mistral-7b-instruct:Q4_0",
+  "aliases": [
+    "e5-mistral-7b-instruct",
+    "hellord/e5-mistral-7b-instruct"
+  ],
+  "deployments": [
+    {
+      "id": "ollama-e5-mistral-dense-v1.deployment",
+      "backend": {
+        "type": "ollama",
+        "parameters": {
+          "implementation": "ollama",
+          "implementation_revision": "0.18.0",
+          "model_name": "hellord/e5-mistral-7b-instruct:Q4_0"
+        }
+      },
+      "artifact": {
+        "type": "ollama",
+        "repository": null,
+        "revision": null,
+        "manifest_digest": "sha256:c53c78f9f295165b7b4311cec0063639e1675f699584fd955253944bb35b50b5",
+        "trust_remote_code": false,
+        "weights": [
+          {
+            "path": "model",
+            "sha256": "f75c0e30696fa7f1656320905943fb42e489e7c4156c37f37e9a17060b5e3e89"
+          }
+        ],
+        "auxiliary": [],
+        "metadata": {}
+      },
+      "routes": [
+        {
+          "task": "embedding",
+          "endpoint": "/api/embed"
+        }
+      ],
+      "loader": {
+        "type": "ollama",
+        "parameters": {}
+      },
+      "metadata": {}
+    }
+  ],
+  "profiles": [
+    {
+      "id": "ollama-e5-mistral-dense-v1",
+      "deployment_id": "ollama-e5-mistral-dense-v1.deployment",
+      "task": "embedding",
+      "endpoint": "/api/embed",
+      "default_for_endpoint": true,
+      "metadata": {
+        "kind": "dense",
+        "dimensions": 4096,
+        "max_input_tokens": {
+          "unit": "tokenizer_tokens",
+          "counting": "after_server_formatting_including_special_tokens",
+          "truncation": "unknown",
+          "overflow": "unknown",
+          "by_role": {
+            "search_document": null,
+            "search_query": null
+          }
+        },
+        "output_normalized": null,
+        "similarity": "unknown",
+        "input_type": {
+          "supported": [
+            "search_document",
+            "search_query"
+          ],
+          "additional_task_roles": [],
+          "aliases": [],
+          "role_sensitive": null,
+          "required": false,
+          "default": null,
+          "missing_role_behavior": "unknown"
+        },
+        "formatting_owner": "server",
+        "pipeline": {
+          "tokenizer": {
+            "repository": null,
+            "revision": null
+          },
+          "formatting": {
+            "search_document": {
+              "template": null,
+              "parameters": {}
+            },
+            "search_query": {
+              "template": null,
+              "parameters": {}
+            }
+          },
+          "pooling": {
+            "method": "unknown",
+            "parameters": {}
+          },
+          "normalization": {
+            "method": "unknown",
+            "dtype": "unknown",
+            "scope": "unknown"
+          },
+          "parameters": {
+            "observed_context_length": 32768,
+            "observed_quantization": "Q4_0"
+          }
+        },
+        "verification": {
+          "status": "unverified",
+          "evidence": [
+            "local-ollama-manifest-sha256:c53c78f9f295165b7b4311cec0063639e1675f699584fd955253944bb35b50b5",
+            "local-ollama-model-blob-sha256:f75c0e30696fa7f1656320905943fb42e489e7c4156c37f37e9a17060b5e3e89",
+            "ollama-api-version:0.18.0"
+          ],
+          "blocking_reasons": [
+            "api_show_advertises_completion_only",
+            "missing_embedding_pipeline_layers_and_reference_witness",
+            "missing_exact_upstream_revision_and_conversion_provenance"
+          ]
+        }
+      }
+    }
+  ],
+  "request_defaults": [],
+  "metadata": {}
+}

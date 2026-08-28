@@ -62,6 +62,10 @@ class DashboardAuthIntegrationTests(unittest.TestCase):
         resp = self.client.get("/api/maintenance/status")
         self.assertEqual(resp.status_code, 401)
 
+    def test_restart_endpoint_without_auth_is_401(self):
+        resp = self.client.post("/api/dashboard/restart")
+        self.assertEqual(resp.status_code, 401)
+
     def test_static_without_auth_is_401(self):
         resp = self.client.get("/static/js/app_core.js")
         self.assertEqual(resp.status_code, 401)

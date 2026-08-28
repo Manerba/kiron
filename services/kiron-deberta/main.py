@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import threading
 import time
 from contextlib import asynccontextmanager
 from typing import Annotated, Any
@@ -12,30 +13,76 @@ import uvicorn
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, StringConstraints
-from sentence_transformers import CrossEncoder
+
+from kiron_common.embedding_registry import (
+    MODEL_CATALOG as SHARED_MODEL_CATALOG,
+    MODEL_STATE_VIEW,
+)
+from kiron_common.model_catalog import BackendType, ModelEndpoint
+from kiron_common.model_state import (
+    BackendRuntimeSnapshot,
+    LocalModelInventory,
+    RuntimeInventory,
+    default_huggingface_hub_cache,
+    scan_huggingface_inventory,
+)
+
+from catalog_view import (
+    DebertaServiceModel,
+    DebertaServiceView,
+    build_deberta_service_view,
+)
+from loaders import LOADER_REGISTRY
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-# Modell-Mapping: Kurzname → HuggingFace-Name + Konfiguration
-# labels=None → Single-Score Regression (Reranking)
-# labels=[...] → Multi-Label Klassifikation (NLI)
-MODELS = {
-    "nli-deberta-v3-base": {
-        "hf": "cross-encoder/nli-deberta-v3-base",
-        "labels": ["contradiction", "entailment", "neutral"],
-        "rerank_label": "entailment",
-        "size": 748_850_969,
-    },
-    "ms-marco-MiniLM-L-6-v2": {
-        "hf": "cross-encoder/ms-marco-MiniLM-L-6-v2",
-        "labels": None,
-        "rerank_label": None,
-        "size": 91_816_134,
-    },
-}
+DEBERTA_CATALOG_VIEW = build_deberta_service_view(
+    SHARED_MODEL_CATALOG,
+    LOADER_REGISTRY,
+)
 
-DEFAULT_MODEL = "ms-marco-MiniLM-L-6-v2"
+
+def _local_model_inventory() -> LocalModelInventory:
+    return LocalModelInventory(
+        huggingface_revisions=scan_huggingface_inventory(
+            MODEL_STATE_VIEW,
+            default_huggingface_hub_cache(),
+        )
+    )
+
+
+def _model_states_from_snapshot(
+    snapshot: dict[str, object],
+    local_inventory: LocalModelInventory,
+) -> list[dict[str, object]]:
+    raw_current = snapshot.get("current_model")
+    loaded = (
+        frozenset((raw_current,))
+        if isinstance(raw_current, str) and raw_current
+        else frozenset()
+    )
+    raw_loading = snapshot.get("loading_model")
+    loading = (
+        frozenset((raw_loading,))
+        if isinstance(raw_loading, str) and raw_loading
+        else frozenset()
+    )
+    runtime = RuntimeInventory({
+        BackendType.KIRON_DEBERTA: BackendRuntimeSnapshot(
+            known=True,
+            loaded_names=loaded,
+            loading_names=loading,
+        )
+    })
+    return [
+        state.to_dict()
+        for state in MODEL_STATE_VIEW.states(
+            local_inventory,
+            runtime,
+            backends=(BackendType.KIRON_DEBERTA,),
+        )
+    ]
 _CUDA_RUNTIME_ERROR_HINTS = (
     "out of memory",
     "cuda",
@@ -51,13 +98,14 @@ _CUDA_RUNTIME_ERROR_HINTS = (
 )
 
 
-def normalize_model_name(name: str) -> str | None:
-    """Modellname normalisieren und gegen Mapping pruefen."""
-    if "/" in name:
-        name = name.rsplit("/", 1)[1]
-    if ":" in name:
-        name = name.split(":")[0]
-    return name if name in MODELS else None
+def normalize_model_name(
+    name: object,
+    endpoint: ModelEndpoint | None = None,
+) -> str | None:
+    """Resolve only exact canonical IDs and explicitly declared aliases."""
+
+    model = DEBERTA_CATALOG_VIEW.resolve(name, endpoint)
+    return model.model_name if model is not None else None
 
 
 def _is_cuda_runtime_error(exc: RuntimeError) -> bool:
@@ -126,14 +174,18 @@ LongString = Annotated[str, StringConstraints(max_length=50_000)]
 
 
 class RerankRequest(BaseModel):
-    model: str = DEFAULT_MODEL
+    model: str = DEBERTA_CATALOG_VIEW.request_default(
+        ModelEndpoint.RERANK
+    ).model_name
     query: LongString
     documents: list[LongString] = Field(max_length=256)
     top_k: int | None = Field(default=None, ge=0, strict=True)
 
 
 class ScoreRequest(BaseModel):
-    model: str = DEFAULT_MODEL
+    model: str = DEBERTA_CATALOG_VIEW.request_default(
+        ModelEndpoint.SCORE
+    ).model_name
     # #902: Inner-Strukturen tolerant aufnehmen (kein list[list[Any]], kein StringConstraints),
     # damit Format-Fehler im Endpoint einheitlich als 400+error gemeldet werden statt FastAPI-422+detail.
     # Doku (kb-kiron-validation-contracts.md) spezifiziert 400 fuer falsches Format.
@@ -143,37 +195,63 @@ class ScoreRequest(BaseModel):
 # --- Model Manager ---
 
 class ModelManager:
-    def __init__(self):
+    def __init__(
+        self,
+        service_view: DebertaServiceView = DEBERTA_CATALOG_VIEW,
+    ) -> None:
+        self._service_view = service_view
         self.current_model_name: str | None = None
-        self.model: CrossEncoder | None = None
-        self.config: dict | None = None
+        self.model: Any | None = None
+        self.config: DebertaServiceModel | None = None
         self.loading_model: str | None = None
         self._lock = asyncio.Lock()
+        self._state_lock = threading.RLock()
 
-    async def get_model(self, short_name: str) -> tuple[CrossEncoder, dict]:
+    def snapshot(self) -> dict[str, object]:
+        """Return current/loading state from one atomic read."""
+
+        with self._state_lock:
+            current = (
+                self.current_model_name
+                if self.model is not None and self.config is not None
+                else None
+            )
+            return {
+                "current_model": current,
+                "loaded_models": [current] if current is not None else [],
+                "loading_model": self.loading_model,
+            }
+
+    async def get_model(
+        self, short_name: str
+    ) -> tuple[Any, DebertaServiceModel]:
         """Gibt Modell+Config zurueck. Lock wird NICHT gehalten — Caller muss _lock verwenden."""
-        if self.current_model_name == short_name and self.model is not None and self.config is not None:
-            return self.model, self.config
+        with self._state_lock:
+            if (
+                self.current_model_name == short_name
+                and self.model is not None
+                and self.config is not None
+            ):
+                return self.model, self.config
         return await _shielded_to_thread(self._load_model, short_name)
 
-    def _load_model(self, short_name: str) -> tuple[CrossEncoder, dict]:
-        self.loading_model = short_name
+    def _load_model(
+        self, short_name: str
+    ) -> tuple[Any, DebertaServiceModel]:
+        with self._state_lock:
+            self.loading_model = short_name
         try:
             if not torch.cuda.is_available():
                 raise RuntimeError("CUDA nicht verfuegbar - DeBERTa Service benoetigt GPU")
-            config = MODELS[short_name]
+            config = self._service_view.require_runtime_model(short_name)
 
             # Transactional: neues Modell laden, altes erst nach erfolgreichem Load freigeben (#438)
-            hf_name = config["hf"]
-            logger.info(f"Lade {hf_name} auf GPU (FP16)...")
+            hf_name = config.artifact.repository
+            precision = config.precision.upper()
+            logger.info(f"Lade {hf_name} auf GPU ({precision})...")
             try:
-                # Direkt in FP16 laden, nicht erst FP32 -> .half() (sonst doppelter VRAM-Peak beim Load)
-                new_model = CrossEncoder(
-                    hf_name,
-                    max_length=512,
-                    device="cuda",
-                    model_kwargs={"torch_dtype": torch.float16},
-                )
+                loader = self._service_view.loader_for(config)
+                new_model = loader(config)
             except (RuntimeError, OSError):
                 # Neuer Load fehlgeschlagen - altes Modell bleibt aktiv, Service bleibt funktionsfaehig
                 # Lokale Referenz vor empty_cache freigeben, damit VRAM tatsaechlich freigegeben werden kann
@@ -187,19 +265,23 @@ class ModelManager:
                     pass
                 raise
 
-            # Neuer Load erfolgreich - altes Modell entladen
-            if self.model is not None:
-                logger.info(f"Entlade {self.current_model_name}...")
-                del self.model
+            # Commit des neuen Runtime-Snapshots atomar; teure Freigabe des alten
+            # Objekts danach ausserhalb des State-Locks.
+            with self._state_lock:
+                old_model = self.model
+                old_name = self.current_model_name
+                self.model = new_model
+                self.config = config
+                self.current_model_name = short_name
+            if old_model is not None and old_model is not new_model:
+                logger.info(f"Entlade {old_name}...")
+                del old_model
                 torch.cuda.empty_cache()
-
-            self.model = new_model
-            self.config = config
-            self.current_model_name = short_name
             logger.info(f"Modell {short_name} ({hf_name}) bereit.")
             return new_model, config
         finally:
-            self.loading_model = None
+            with self._state_lock:
+                self.loading_model = None
 
     async def unload(self) -> bool:
         async with self._lock:
@@ -207,14 +289,17 @@ class ModelManager:
 
     def _unload_locked(self) -> bool:
         """Modell entladen - Caller MUSS _lock halten."""
-        if self.model is None:
-            return False
-        logger.info(f"Entlade {self.current_model_name}...")
-        del self.model
-        self.model = None
-        self.current_model_name = None
-        self.config = None
-        self.loading_model = None
+        with self._state_lock:
+            if self.model is None:
+                return False
+            old_model = self.model
+            old_name = self.current_model_name
+            self.model = None
+            self.current_model_name = None
+            self.config = None
+            self.loading_model = None
+        logger.info(f"Entlade {old_name}...")
+        del old_model
         torch.cuda.empty_cache()
         logger.info("Modell entladen, VRAM freigegeben.")
         return True
@@ -225,10 +310,11 @@ class ModelManager:
         Caller MUSS _lock halten.
         """
         logger.warning("force_reset_locked: setze ModelManager-State zurueck nach CUDA-Fehler")
-        self.model = None
-        self.current_model_name = None
-        self.config = None
-        self.loading_model = None
+        with self._state_lock:
+            self.model = None
+            self.current_model_name = None
+            self.config = None
+            self.loading_model = None
         try:
             torch.cuda.empty_cache()
         except Exception:
@@ -258,11 +344,15 @@ app = FastAPI(title="Kiron DeBERTa Cross-Encoder", lifespan=lifespan)
 
 @app.post("/api/rerank")
 async def rerank(req: RerankRequest):
-    resolved = normalize_model_name(req.model)
+    resolved = normalize_model_name(req.model, ModelEndpoint.RERANK)
     if resolved is None:
         return JSONResponse(
             {"error": f"Modell '{req.model}' wird nicht unterstuetzt.",
-             "available_models": list(MODELS.keys())},
+             "available_models": list(
+                 DEBERTA_CATALOG_VIEW.available_model_names(
+                     ModelEndpoint.RERANK
+                 )
+             )},
             status_code=400,
         )
 
@@ -319,7 +409,7 @@ async def rerank(req: RerankRequest):
         start = time.monotonic()
         pairs = [(req.query, doc) for doc in req.documents]
 
-        is_classification = config["labels"] is not None
+        is_classification = config.labels is not None
 
         def _predict():
             with torch.amp.autocast(device_type="cuda"):
@@ -387,7 +477,7 @@ async def rerank(req: RerankRequest):
         if is_classification:
             # #537: Defensiver Shape-Check — bei unerwartetem Skalar-Output von model.predict()
             # wuerde scores.reshape(1,-1) zu (1,1) werden und scores[:, rerank_idx>0] IndexError werfen.
-            n_expected = len(config["labels"])
+            n_expected = len(config.labels)
             if scores.ndim != 2 or scores.shape[1] != n_expected:
                 # #873: Strukturierte JSONResponse statt raise — sonst faellt FastAPI auf
                 # generisches {"detail": "Internal Server Error"} zurueck.
@@ -400,7 +490,7 @@ async def rerank(req: RerankRequest):
                     {"error": "Interner Inference-Fehler.", "detail": detail},
                     status_code=500,
                 )
-            rerank_idx = config["labels"].index(config["rerank_label"])
+            rerank_idx = config.labels.index(config.rerank_label)
             rerank_scores = scores[:, rerank_idx]
         else:
             # Single-Score Regression (z.B. ms-marco)
@@ -430,11 +520,15 @@ async def rerank(req: RerankRequest):
 
 @app.post("/api/score")
 async def score(req: ScoreRequest):
-    resolved = normalize_model_name(req.model)
+    resolved = normalize_model_name(req.model, ModelEndpoint.SCORE)
     if resolved is None:
         return JSONResponse(
             {"error": f"Modell '{req.model}' wird nicht unterstuetzt.",
-             "available_models": list(MODELS.keys())},
+             "available_models": list(
+                 DEBERTA_CATALOG_VIEW.available_model_names(
+                     ModelEndpoint.SCORE
+                 )
+             )},
             status_code=400,
         )
 
@@ -491,7 +585,7 @@ async def score(req: ScoreRequest):
 
         start = time.monotonic()
         pairs = [tuple(p) for p in req.pairs]
-        is_classification = config["labels"] is not None
+        is_classification = config.labels is not None
 
         def _predict():
             with torch.amp.autocast(device_type="cuda"):
@@ -554,7 +648,7 @@ async def score(req: ScoreRequest):
         )
 
         # Label-Namen zuordnen
-        labels = config["labels"]
+        labels = config.labels
         if labels is not None:
             # #1033: Strikter ndim-Check analog zu /api/rerank (#537), sonst faellt eine
             # unerwartete 3D-Shape (z.B. (1,1,3)) in den else-Zweig und liefert
@@ -594,9 +688,10 @@ async def score(req: ScoreRequest):
 
 @app.get("/health")
 def health():
-    # Snapshot, damit status und current_model nicht durch concurrent unload divergieren
-    loading = model_manager.loading_model
-    current = model_manager.current_model_name
+    snapshot = model_manager.snapshot()
+    loading = snapshot["loading_model"]
+    current = snapshot["current_model"]
+    current_config = DEBERTA_CATALOG_VIEW.runtime_model(current)
     model_loaded = current is not None
     if loading is not None:
         status = "loading"
@@ -606,9 +701,19 @@ def health():
         status_code = 200 if model_loaded else 503
     content = {
         "status": status,
+        "catalog_digest": DEBERTA_CATALOG_VIEW.catalog_digest,
         "current_model": current,
-        "precision": "fp16",
-        "available_models": list(MODELS.keys()),
+        "loaded_models": snapshot["loaded_models"],
+        "precision": (
+            current_config.precision if current_config is not None else "fp16"
+        ),
+        "available_models": list(
+            DEBERTA_CATALOG_VIEW.available_model_names()
+        ),
+        "model_states": _model_states_from_snapshot(
+            snapshot,
+            _local_model_inventory(),
+        ),
     }
     if loading is not None:
         content["loading_model"] = loading
@@ -625,14 +730,18 @@ async def load_model_endpoint(body: dict):
     if not isinstance(name, str):
         return JSONResponse(
             {"error": f"Modell '{name}' nicht unterstuetzt.",
-             "available_models": list(MODELS.keys())},
+             "available_models": list(
+                 DEBERTA_CATALOG_VIEW.available_model_names()
+             )},
             status_code=400,
         )
     resolved = normalize_model_name(name)
     if resolved is None:
         return JSONResponse(
             {"error": f"Modell '{name}' nicht unterstuetzt.",
-             "available_models": list(MODELS.keys())},
+             "available_models": list(
+                 DEBERTA_CATALOG_VIEW.available_model_names()
+             )},
             status_code=400,
         )
     async with model_manager._lock:
@@ -680,7 +789,12 @@ async def unload_model_endpoint():
 @app.get("/api/tags")
 def tags():
     """Listet alle unterstuetzten Modelle."""
-    return {"models": [{"name": k, "size": cfg.get("size", 0)} for k, cfg in MODELS.items()]}
+    return {
+        "models": [
+            {"name": model.model_name, "size": model.size}
+            for model in DEBERTA_CATALOG_VIEW.models
+        ]
+    }
 
 
 if __name__ == "__main__":

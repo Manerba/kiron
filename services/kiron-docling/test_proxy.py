@@ -11,10 +11,12 @@ import asyncio
 import concurrent.futures
 import contextlib
 import importlib
+import io
 import json
 import os
 from pathlib import Path
 import subprocess
+import shutil
 import sys
 import threading
 import time
@@ -34,12 +36,17 @@ def _reload_module():
     """Frischer Import von proxy — State und Globals werden zurueckgesetzt."""
     os.environ["KIRON_RUNTIME_DIR"] = str(TEST_RUNTIME_DIR)
     os.environ["KIRON_ACTIVE_REQUESTS_URL"] = ""
+    if TEST_RUNTIME_DIR.exists():
+        for path in TEST_RUNTIME_DIR.iterdir():
+            try:
+                if path.is_dir() and not path.is_symlink():
+                    shutil.rmtree(path)
+                else:
+                    path.unlink()
+            except FileNotFoundError:
+                pass
     TEST_RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
-    for path in TEST_RUNTIME_DIR.glob("docling-vram-*.json"):
-        try:
-            path.unlink()
-        except OSError:
-            pass
+    os.chmod(TEST_RUNTIME_DIR, 0o2770)
     module_dir = Path(__file__).resolve().parent
     current = sys.modules.get("proxy")
     current_file = Path(getattr(current, "__file__", "")).resolve() if current else None
@@ -57,6 +64,9 @@ def _reload_module():
         return func(*args, **kwargs)
 
     module._to_thread = inline_to_thread
+    module._runtime_marker_file_owner_uids = lambda: frozenset({os.geteuid()})
+    module._runtime_marker_group_gid = lambda: os.getegid()
+    module._runtime_marker_dir_owner_uid = lambda: os.geteuid()
     return module
 
 
@@ -1710,8 +1720,11 @@ class IsRunningBestEffortTests(unittest.IsolatedAsyncioTestCase):
         def boom(*a, **kw):
             raise subprocess.TimeoutExpired(cmd="docker", timeout=10)
 
-        with mock.patch.object(subprocess, "run", boom):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr), \
+             mock.patch.object(subprocess, "run", boom):
             self.assertFalse(p._is_running())
+        self.assertIn("<4>docker inspect Timeout\n", stderr.getvalue())
 
     def test_file_not_found_returns_false(self):
         p = self.proxy
@@ -1789,6 +1802,30 @@ class ContainerImageValidationTests(unittest.IsolatedAsyncioTestCase):
              mock.patch.object(p, "_remediate_restart_policy",
                                 unexpected_policy):
             self.assertFalse(p._start())
+
+    def test_start_docker_start_failure_logs_err_priority(self):
+        p = self.proxy
+
+        def boom(*a, **kw):
+            raise subprocess.CalledProcessError(
+                1,
+                a[0],
+                stderr="start boom",
+            )
+
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr), \
+             mock.patch.object(p, "_has_expected_image", lambda: True), \
+             mock.patch.object(p, "_remediate_restart_policy", lambda: True), \
+             mock.patch.object(p, "_has_expected_port_binding", lambda: True), \
+             mock.patch.object(p, "_is_running", lambda: False), \
+             mock.patch.object(subprocess, "run", boom):
+            self.assertFalse(p._start())
+
+        self.assertIn(
+            "<3>docker start fehlgeschlagen: start boom\n",
+            stderr.getvalue(),
+        )
 
 
 class ContainerPortBindingValidationTests(unittest.IsolatedAsyncioTestCase):
@@ -2017,6 +2054,20 @@ class DirtyStateTests(unittest.IsolatedAsyncioTestCase):
             except Exception:
                 pass
             p._dirty_retry_task = None
+
+    def test_journal_log_writes_priority_prefixes_to_stderr(self):
+        p = self.proxy
+        stream = io.StringIO()
+
+        with contextlib.redirect_stderr(stream):
+            p._journal_log(p.JOURNAL_WARNING, "warning test")
+            p._journal_log(p.JOURNAL_ERR, "err test")
+            p._journal_log(p.JOURNAL_CRIT, "crit test")
+
+        self.assertEqual(
+            stream.getvalue(),
+            "<4>warning test\n<3>err test\n<2>crit test\n",
+        )
 
     # --- _finalize_stop direkt ---
 
@@ -2545,6 +2596,33 @@ class DirtyStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(p._state, p.State.STOPPED_DIRTY)
         self.assertTrue(p._dirty_retry_task.done())
 
+    async def test_retry_exceptions_log_warning_priority(self):
+        p = self.proxy
+        p._DIRTY_RETRY_MAX_ATTEMPTS = 1
+        async with p._state_lock:
+            p._state = p.State.STOPPED_DIRTY
+
+        def inspect_boom():
+            raise RuntimeError("inspect boom")
+
+        async def stop_boom():
+            raise RuntimeError("stop boom")
+
+        async def noop_finalize(stop_ok):
+            return None
+
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr), \
+             mock.patch.object(p, "_is_running_for_dirty", inspect_boom), \
+             mock.patch.object(p, "_run_stop_once", stop_boom), \
+             mock.patch.object(p, "_finalize_stop", noop_finalize):
+            p._dirty_retry_task = asyncio.create_task(p._dirty_retry_loop())
+            await asyncio.wait_for(p._dirty_retry_task, timeout=2.0)
+
+        log = stderr.getvalue()
+        self.assertIn("<4>Dirty-Retry-Inspect Exception: inspect boom", log)
+        self.assertIn("<4>Dirty-Retry-Stop Exception: stop boom", log)
+
     async def test_retry_max_attempts_terminates_and_stays_dirty(self):
         p = self.proxy
         p._DIRTY_RETRY_MAX_ATTEMPTS = 3
@@ -2557,7 +2635,9 @@ class DirtyStateTests(unittest.IsolatedAsyncioTestCase):
             attempts["n"] += 1
             return False
 
-        with mock.patch.object(p, "_is_running_for_dirty", lambda: True), \
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr), \
+             mock.patch.object(p, "_is_running_for_dirty", lambda: True), \
              mock.patch.object(p, "_run_stop_once", counting_stop):
             p._dirty_retry_task = asyncio.create_task(p._dirty_retry_loop())
             await asyncio.wait_for(p._dirty_retry_task, timeout=3.0)
@@ -2565,6 +2645,10 @@ class DirtyStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(attempts["n"], 3)
         self.assertIs(p._state, p.State.STOPPED_DIRTY)
         self.assertTrue(p._dirty_retry_task.done())
+        self.assertIn(
+            "<2>Dirty-Retry MAX (3) erreicht",
+            stderr.getvalue(),
+        )
 
     # --- Shutdown-Interaktionen ---
 
@@ -3321,7 +3405,7 @@ class InflightGpuDrainTests(unittest.IsolatedAsyncioTestCase):
             async def __aexit__(self, *exc):
                 return False
 
-            async def get(self, url):
+            async def get(self, url, auth=None):
                 return FakeResp()
 
         with mock.patch.object(httpx, "AsyncClient", FakeClient):
@@ -3341,7 +3425,7 @@ class InflightGpuDrainTests(unittest.IsolatedAsyncioTestCase):
             async def __aexit__(self, *exc):
                 return False
 
-            async def get(self, url):
+            async def get(self, url, auth=None):
                 raise httpx.ConnectError("down", request=None)
 
         with mock.patch.object(httpx, "AsyncClient", FakeClient):
@@ -3378,6 +3462,7 @@ class InflightGpuDrainTests(unittest.IsolatedAsyncioTestCase):
         p.GPU_INFLIGHT_DRAIN_POLL_S = 0.01
         calls = {"n": 0}
         urls = []
+        auths = []
 
         class FakeResp:
             status_code = 200
@@ -3401,8 +3486,9 @@ class InflightGpuDrainTests(unittest.IsolatedAsyncioTestCase):
             async def __aexit__(self, *exc):
                 return False
 
-            async def get(self, url):
+            async def get(self, url, auth=None):
                 urls.append(url)
+                auths.append(auth)
                 return FakeResp()
 
         with mock.patch.object(httpx, "AsyncClient", FakeClient):
@@ -3410,6 +3496,40 @@ class InflightGpuDrainTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls["n"], 2)
         self.assertEqual(urls, [p.KIRON_ACTIVE_REQUESTS_URL,
                                 p.KIRON_ACTIVE_REQUESTS_URL])
+        self.assertEqual(auths, [
+            (p.KIRON_DASHBOARD_USER, p.KIRON_DASHBOARD_PASSWORD),
+            (p.KIRON_DASHBOARD_USER, p.KIRON_DASHBOARD_PASSWORD),
+        ])
+
+    async def test_drain_uses_configured_dashboard_credentials(self):
+        p = self.proxy
+        p.KIRON_DASHBOARD_USER = "operator"
+        p.KIRON_DASHBOARD_PASSWORD = "secret"
+        auths = []
+
+        class FakeResp:
+            status_code = 200
+
+            def json(self):
+                return {"requests": []}
+
+        class FakeClient:
+            def __init__(self, timeout=None):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+            async def get(self, url, auth=None):
+                auths.append(auth)
+                return FakeResp()
+
+        with mock.patch.object(httpx, "AsyncClient", FakeClient):
+            await p._drain_inflight_gpu_requests()
+        self.assertEqual(auths, [("operator", "secret")])
 
     async def test_drain_treats_deberta_paths_as_gpu_active(self):
         p = self.proxy
@@ -3435,7 +3555,7 @@ class InflightGpuDrainTests(unittest.IsolatedAsyncioTestCase):
             async def __aexit__(self, *exc):
                 return False
 
-            async def get(self, url):
+            async def get(self, url, auth=None):
                 return FakeResp()
 
         with mock.patch.object(httpx, "AsyncClient", FakeClient):
@@ -3465,7 +3585,7 @@ class InflightGpuDrainTests(unittest.IsolatedAsyncioTestCase):
             async def __aexit__(self, *exc):
                 return False
 
-            async def get(self, url):
+            async def get(self, url, auth=None):
                 return FakeResp()
 
         with mock.patch.object(httpx, "AsyncClient", FakeClient):
@@ -3480,10 +3600,11 @@ class CorruptMarkerRecoveryTests(unittest.TestCase):
         self.proxy = _reload_module()
 
     def _write_raw(self, path, content):
-        path.parent.mkdir(parents=True, mode=0o755, exist_ok=True)
+        path.parent.mkdir(parents=True, mode=0o2770, exist_ok=True)
+        os.chmod(path.parent, 0o2770)
         with open(path, "w", encoding="utf-8") as fh:
             fh.write(content)
-        os.chmod(path, 0o600)
+        os.chmod(path, 0o660)
 
     def test_invalid_json_does_not_block_new_marker(self):
         p = self.proxy
@@ -3513,6 +3634,175 @@ class CorruptMarkerRecoveryTests(unittest.TestCase):
         self.assertFalse(active)
         token = p._write_vram_marker("startup", ttl_s=1.0)
         self.assertIsInstance(token, str)
+
+
+class MarkerPermissionContractTests(unittest.TestCase):
+    """VRAM-Marker folgen dem kiron-runtime Gruppenvertrag."""
+
+    def setUp(self):
+        self.proxy = _reload_module()
+
+    def _write_valid_marker(self, path, *, mode=0o660, payload=None):
+        path.parent.mkdir(parents=True, mode=0o2770, exist_ok=True)
+        os.chmod(path.parent, 0o2770)
+        if payload is None:
+            payload = {"deadline_monotonic": time.monotonic() + 60.0}
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh)
+        os.chmod(path, mode)
+
+    def test_accepts_valid_kiron_runtime_marker(self):
+        p = self.proxy
+        self._write_valid_marker(p.STARTUP_MARKER_PATH)
+
+        ok, reason, _ = p._path_is_safe_regular_file(p.STARTUP_MARKER_PATH)
+        data, active = p._marker_payload(p.STARTUP_MARKER_PATH)
+
+        self.assertTrue(ok, reason)
+        self.assertIsInstance(data, dict)
+        self.assertTrue(active)
+
+    def test_rejects_marker_symlink(self):
+        p = self.proxy
+        target = p.RUNTIME_MARKER_DIR / "target.json"
+        self._write_valid_marker(target)
+        p.STARTUP_MARKER_PATH.symlink_to(target)
+
+        ok, reason, _ = p._path_is_safe_regular_file(p.STARTUP_MARKER_PATH)
+
+        self.assertFalse(ok)
+        self.assertEqual(reason, "symlink")
+
+    def test_rejects_marker_world_bits(self):
+        p = self.proxy
+        self._write_valid_marker(p.STARTUP_MARKER_PATH, mode=0o664)
+
+        ok, reason, _ = p._path_is_safe_regular_file(p.STARTUP_MARKER_PATH)
+
+        self.assertFalse(ok)
+        self.assertEqual(reason, "file_world_bits")
+
+    def test_rejects_wrong_marker_owner(self):
+        p = self.proxy
+        self._write_valid_marker(p.STARTUP_MARKER_PATH)
+        wrong_uid = os.geteuid() + 1
+
+        with mock.patch.object(
+            p,
+            "_runtime_marker_file_owner_uids",
+            lambda: frozenset({wrong_uid}),
+        ):
+            ok, reason, _ = p._path_is_safe_regular_file(p.STARTUP_MARKER_PATH)
+
+        self.assertFalse(ok)
+        self.assertEqual(reason, "file_owner_not_allowed")
+
+    def test_rejects_wrong_marker_group(self):
+        p = self.proxy
+        self._write_valid_marker(p.STARTUP_MARKER_PATH)
+        wrong_gid = os.getegid() + 1
+
+        with mock.patch.object(p, "_path_is_safe_runtime_dir",
+                               lambda path: (True, "ok")), \
+             mock.patch.object(p, "_runtime_marker_group_gid",
+                               lambda: wrong_gid):
+            ok, reason, _ = p._path_is_safe_regular_file(p.STARTUP_MARKER_PATH)
+
+        self.assertFalse(ok)
+        self.assertEqual(reason, "file_group_not_runtime")
+
+    def test_rejects_wrong_marker_file_type(self):
+        p = self.proxy
+        p.STARTUP_MARKER_PATH.mkdir()
+
+        ok, reason, _ = p._path_is_safe_regular_file(p.STARTUP_MARKER_PATH)
+
+        self.assertFalse(ok)
+        self.assertEqual(reason, "not_regular")
+
+    def test_rejects_missing_group_write_mode(self):
+        p = self.proxy
+        self._write_valid_marker(p.STARTUP_MARKER_PATH, mode=0o640)
+
+        ok, reason, _ = p._path_is_safe_regular_file(p.STARTUP_MARKER_PATH)
+
+        self.assertFalse(ok)
+        self.assertEqual(reason, "file_mode_not_0660")
+
+    def test_open_marker_lock_creates_valid_lock_file(self):
+        p = self.proxy
+        lock_fd = p._open_marker_lock(p.STARTUP_MARKER_PATH)
+        os.close(lock_fd)
+        lock_path = p._marker_lock_path(p.STARTUP_MARKER_PATH)
+
+        ok, reason, _ = p._path_is_safe_regular_file(lock_path)
+
+        self.assertTrue(ok, reason)
+        self.assertEqual(
+            lock_path.stat().st_mode & 0o777,
+            p.RUNTIME_MARKER_FILE_MODE,
+        )
+
+    def test_open_marker_lock_accepts_existing_valid_lock_without_chmod(self):
+        p = self.proxy
+        lock_path = p._marker_lock_path(p.STARTUP_MARKER_PATH)
+        self._write_valid_marker(lock_path)
+
+        with mock.patch.object(
+            p.os,
+            "fchmod",
+            side_effect=AssertionError("existing peer lock must not chmod"),
+        ):
+            lock_fd = p._open_marker_lock(p.STARTUP_MARKER_PATH)
+
+        os.close(lock_fd)
+
+    def test_marker_payload_uses_fd_bound_open(self):
+        p = self.proxy
+        self._write_valid_marker(p.STARTUP_MARKER_PATH)
+
+        with mock.patch.object(
+            Path,
+            "open",
+            side_effect=AssertionError("marker reads must use os.open/fstat"),
+        ):
+            data, active = p._marker_payload(p.STARTUP_MARKER_PATH)
+
+        self.assertIsInstance(data, dict)
+        self.assertTrue(active)
+
+    def test_clear_does_not_unlink_replaced_marker(self):
+        p = self.proxy
+        old_payload = {
+            "token": "old",
+            "deadline_monotonic": time.monotonic() + 60.0,
+        }
+        replacement_payload = {
+            "token": "replacement",
+            "deadline_monotonic": time.monotonic() + 60.0,
+        }
+        self._write_valid_marker(
+            p.STARTUP_MARKER_PATH,
+            payload=old_payload,
+        )
+        original_payload_with_stat = p._marker_payload_with_stat
+
+        def replacing_payload(path):
+            result = original_payload_with_stat(path)
+            path.unlink()
+            self._write_valid_marker(path, payload=replacement_payload)
+            return result
+
+        with mock.patch.object(
+            p,
+            "_marker_payload_with_stat",
+            replacing_payload,
+        ):
+            p._clear_vram_marker("startup", "old")
+
+        with open(p.STARTUP_MARKER_PATH, encoding="utf-8") as fh:
+            data = json.load(fh)
+        self.assertEqual(data["token"], "replacement")
 
 
 def _future(value):

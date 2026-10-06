@@ -1,78 +1,97 @@
-"""Single registration use case shared by future dashboard and root CLI."""
-
-from __future__ import annotations
+"""One local registration use case shared by dashboard and root CLI."""
 
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
+from collections.abc import Mapping
 
-from kiron_common.model_catalog import LoaderType
-
-from .errors import InvalidLoaderError, InvalidProviderError
-from .models import LocalModelProvider, RegistrationCandidate, RegistryEntry
+from kiron_common.model_catalog import ArtifactFormat, ArtifactType, BackendType, LoaderType
+from .errors import InvalidLoaderError, InvalidProviderError, ModelRegistrationError, LoaderMetadataError
+from .models import RegistrationCandidate, RegistryEntry, loader_backend, HF_LOADERS
 from .registry import RuntimeModelRegistry
 from .validators import HuggingFaceLocalValidator, OllamaLocalValidator
+from .gguf import GGUFLocalValidator
 
 
 @dataclass(frozen=True, slots=True)
 class RegistrationValidators:
     ollama: OllamaLocalValidator
     huggingface: HuggingFaceLocalValidator
+    gguf: GGUFLocalValidator
 
-    def __post_init__(self) -> None:
-        if not isinstance(self.ollama, OllamaLocalValidator):
-            raise TypeError("ollama validator has the wrong type")
-        if not isinstance(self.huggingface, HuggingFaceLocalValidator):
-            raise TypeError("huggingface validator has the wrong type")
+    def __post_init__(self):
+        if not isinstance(self.ollama, OllamaLocalValidator) or not isinstance(self.huggingface, HuggingFaceLocalValidator) or not isinstance(self.gguf, GGUFLocalValidator):
+            raise TypeError("invalid registration validators")
 
 
-def _provider(value: object) -> LocalModelProvider:
-    if isinstance(value, LocalModelProvider):
+@dataclass(frozen=True, slots=True)
+class CandidateDiscovery:
+    candidates: tuple[RegistrationCandidate, ...]
+    errors: Mapping[BackendType, str]
+
+    def __post_init__(self):
+        object.__setattr__(self, "candidates", tuple(self.candidates))
+        object.__setattr__(self, "errors", MappingProxyType(dict(self.errors)))
+
+
+def _provider(value):
+    if isinstance(value, BackendType):
         return value
-    if type(value) is not str:
-        raise InvalidProviderError()
     try:
-        return LocalModelProvider(value.strip().lower())
+        if type(value) is not str:
+            raise ValueError()
+        return BackendType(value.strip().lower())
     except ValueError:
         raise InvalidProviderError() from None
 
 
-def _loader(value: object) -> LoaderType:
+def _loader(value):
     if isinstance(value, LoaderType):
         return value
-    if type(value) is not str:
-        raise InvalidLoaderError()
     try:
+        if type(value) is not str:
+            raise ValueError()
         return LoaderType(value.strip().lower())
     except ValueError:
         raise InvalidLoaderError() from None
 
 
-def register_model(
-    registry: RuntimeModelRegistry,
-    validators: RegistrationValidators,
-    *,
-    provider: object,
-    reference: object,
-    loader: object = None,
-) -> RegistryEntry:
-    """Validate one already-local model and atomically register it."""
-
-    if not isinstance(registry, RuntimeModelRegistry):
-        raise TypeError("registry has the wrong type")
-    if not isinstance(validators, RegistrationValidators):
-        raise TypeError("validators have the wrong type")
-    resolved_provider = _provider(provider)
-    if resolved_provider is LocalModelProvider.OLLAMA:
-        resolved_loader = LoaderType.OLLAMA if loader is None else _loader(loader)
-        if resolved_loader is not LoaderType.OLLAMA:
-            raise InvalidLoaderError()
-        candidate = validators.ollama.validate(reference)
+def register_model(registry, validators, *, runtime_provider, reference, loader=None,
+                   projector_reference=None, runtime_profile=None, expected_sha256=None,
+                   expected_projector_sha256=None):
+    if not isinstance(registry, RuntimeModelRegistry) or not isinstance(validators, RegistrationValidators):
+        raise TypeError("invalid registration dependencies")
+    provider = _provider(runtime_provider)
+    if provider is BackendType.OLLAMA:
+        selected = LoaderType.OLLAMA if loader is None else _loader(loader)
+    elif provider is BackendType.PRISM:
+        selected = LoaderType.PRISM_GGUF if loader is None else _loader(loader)
+    elif provider in (BackendType.KIRON_EMBEDDINGS, BackendType.KIRON_DEBERTA):
+        selected = _loader(loader)
     else:
-        resolved_loader = _loader(loader)
-        if resolved_loader is LoaderType.OLLAMA:
+        raise InvalidProviderError()
+    if loader_backend(selected) is not provider:
+        raise InvalidLoaderError()
+    if provider is not BackendType.PRISM and any(item is not None for item in
+            (projector_reference, runtime_profile, expected_sha256, expected_projector_sha256)):
+        raise LoaderMetadataError()
+    if provider is BackendType.OLLAMA:
+        candidate = validators.ollama.validate(reference)
+    elif provider in (BackendType.KIRON_EMBEDDINGS, BackendType.KIRON_DEBERTA):
+        if selected not in HF_LOADERS:
             raise InvalidLoaderError()
-        candidate = validators.huggingface.validate(reference, resolved_loader)
-    return registry.add(candidate.to_entry())
+        candidate = validators.huggingface.validate(reference, selected)
+    elif provider is BackendType.PRISM:
+        candidate = validators.gguf.validate(reference, runtime_profile=runtime_profile,
+                    projector_reference=projector_reference, expected_sha256=expected_sha256,
+                    expected_projector_sha256=expected_projector_sha256)
+    else:
+        raise InvalidProviderError()
+    try:
+        entry = candidate.to_entry()
+    except (TypeError, ValueError):
+        raise LoaderMetadataError() from None
+    return registry.add(entry)
 
 
 def list_models(registry: RuntimeModelRegistry) -> tuple[RegistryEntry, ...]:
@@ -90,104 +109,53 @@ def read_model(
     return registry.get(entry_id)
 
 
-def list_candidates(
-    registry: RuntimeModelRegistry,
-    validators: RegistrationValidators,
-) -> tuple[RegistrationCandidate, ...]:
-    """Discover already-local models not yet present in the runtime registry."""
-
-    if not isinstance(registry, RuntimeModelRegistry):
-        raise TypeError("registry has the wrong type")
-    if not isinstance(validators, RegistrationValidators):
-        raise TypeError("validators have the wrong type")
-    registered = registry.list()
-    registered_ollama = {
-        entry.reference.lower()
-        for entry in registered
-        if entry.provider is LocalModelProvider.OLLAMA
-    }
-    registered_huggingface = {
-        entry.reference
-        for entry in registered
-        if entry.provider is LocalModelProvider.HUGGINGFACE
-    }
-    candidates = [
-        RegistrationCandidate(
-            provider=LocalModelProvider.OLLAMA,
-            reference=reference,
-            display_name=reference,
-        )
-        for reference in validators.ollama.available_references()
-        if reference.lower() not in registered_ollama
-    ]
-    candidates.extend(
-        RegistrationCandidate(
-            provider=LocalModelProvider.HUGGINGFACE,
-            reference=reference,
-            display_name=Path(reference).name,
-        )
-        for reference in validators.huggingface.available_references()
-        if reference not in registered_huggingface
+def list_candidates(registry, validators):
+    registered = registry.list()  # Corrupt persistent state remains a whole-snapshot failure.
+    identities = {(entry.runtime_provider, entry.reference) for entry in registered}
+    candidates, errors = [], {}
+    sources = (
+        (BackendType.OLLAMA, ArtifactType.OLLAMA, ArtifactFormat.OLLAMA_MANIFEST, validators.ollama),
+        (BackendType.KIRON_EMBEDDINGS, ArtifactType.LOCAL, ArtifactFormat.HF_WEIGHTS, validators.huggingface),
+        (BackendType.KIRON_DEBERTA, ArtifactType.LOCAL, ArtifactFormat.HF_WEIGHTS, validators.huggingface),
+        (BackendType.PRISM, ArtifactType.LOCAL, ArtifactFormat.GGUF, validators.gguf),
     )
-    return tuple(
-        sorted(
-            candidates,
-            key=lambda item: (
-                item.provider.value,
-                item.display_name.casefold(),
-                item.reference,
-            ),
-        )
-    )
+    for provider, origin, format_, validator in sources:
+        try:
+            references = validator.available_references()
+        except ModelRegistrationError as exc:
+            errors[provider] = exc.code
+            continue
+        for reference in references:
+            if (provider, reference) in identities:
+                continue
+            name = reference if provider is BackendType.OLLAMA else Path(reference).name
+            candidates.append(RegistrationCandidate(provider, origin, format_, reference, name))
+    return CandidateDiscovery(tuple(sorted(candidates, key=lambda item:
+                             (item.runtime_provider.value, item.display_name.casefold(), item.reference))), errors)
 
 
 class ModelRegistrationService:
-    """Bound facade so every caller executes the same use case."""
+    def __init__(self, registry, validators):
+        if not isinstance(registry, RuntimeModelRegistry) or not isinstance(validators, RegistrationValidators):
+            raise TypeError("invalid registration dependencies")
+        self._registry, self._validators = registry, validators
 
-    __slots__ = ("_registry", "_validators")
+    def register_model(self, *, runtime_provider, reference, loader=None, projector_reference=None,
+                       runtime_profile=None, expected_sha256=None, expected_projector_sha256=None):
+        return register_model(self._registry, self._validators, runtime_provider=runtime_provider,
+                              reference=reference, loader=loader, projector_reference=projector_reference,
+                              runtime_profile=runtime_profile, expected_sha256=expected_sha256,
+                              expected_projector_sha256=expected_projector_sha256)
 
-    def __init__(
-        self,
-        registry: RuntimeModelRegistry,
-        validators: RegistrationValidators,
-    ) -> None:
-        if not isinstance(registry, RuntimeModelRegistry):
-            raise TypeError("registry has the wrong type")
-        if not isinstance(validators, RegistrationValidators):
-            raise TypeError("validators have the wrong type")
-        self._registry = registry
-        self._validators = validators
-
-    def register_model(
-        self,
-        *,
-        provider: object,
-        reference: object,
-        loader: object = None,
-    ) -> RegistryEntry:
-        return register_model(
-            self._registry,
-            self._validators,
-            provider=provider,
-            reference=reference,
-            loader=loader,
-        )
-
-    def list_models(self) -> tuple[RegistryEntry, ...]:
+    def list_models(self):
         return list_models(self._registry)
 
-    def read_model(self, entry_id: object) -> RegistryEntry | None:
+    def read_model(self, entry_id):
         return read_model(self._registry, entry_id)
 
-    def list_candidates(self) -> tuple[RegistrationCandidate, ...]:
+    def list_candidates(self):
         return list_candidates(self._registry, self._validators)
 
-
-__all__ = [
-    "ModelRegistrationService",
-    "RegistrationValidators",
-    "list_candidates",
-    "list_models",
-    "read_model",
-    "register_model",
-]
+    def registration_profiles(self):
+        """Immutable approved GGUF registration choices; never launch parameters."""
+        return MappingProxyType(dict(self._validators.gguf.profiles))

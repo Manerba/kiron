@@ -5,6 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Callable
+import time
+
+from kiron_common.gpu_admission import AdmissionError, AdmissionStore, MemorySnapshot
 
 import capabilities
 
@@ -35,6 +38,26 @@ class ExecutionStartDecision:
     conflict_status: str
     source_status: str
     maintenance: str
+
+
+def training_admission_store() -> AdmissionStore:
+    return AdmissionStore()
+
+
+def measure_training_memory() -> MemorySnapshot:
+    """Fresh availability, without relaxing the separate training policy.
+
+    Training receives exclusive admission, not a fabricated job-size estimate.
+    The store calls this under its lock; no policy/store calls belong here.
+    """
+    warnings: list[str] = []
+    _, host = capabilities._host_memory_bytes(warnings)
+    devices, status, _ = capabilities._cuda_accelerators()
+    if (status != "complete" or len(devices) != 1 or type(host) is not int or host <= 0
+            or type(devices[0].get("vram_available_bytes")) is not int
+            or devices[0]["vram_available_bytes"] <= 0):
+        raise AdmissionError("resource_unknown", "fresh training memory unavailable")
+    return MemorySnapshot(devices[0]["vram_available_bytes"], host, time.monotonic())
 
 
 def decide_execution_start(

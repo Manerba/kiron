@@ -5,9 +5,10 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 import os
 from pathlib import Path
+import re
 import stat
 
-from kiron_common.model_catalog import LoaderType
+from kiron_common.model_catalog import ArtifactFormat, ArtifactType, BackendType, LoaderType
 
 from .errors import (
     InvalidReferenceError,
@@ -17,7 +18,8 @@ from .errors import (
 )
 from .models import (
     LocalLoaderMetadata,
-    LocalModelProvider,
+    loader_backend,
+    HF_LOADERS,
     ValidatedLocalModel,
     canonical_ollama_reference,
 )
@@ -51,6 +53,10 @@ class OllamaLocalValidator:
 
     def available_references(self) -> tuple[str, ...]:
         """Return exact local names; Ollama cloud proxies are not local models."""
+        return tuple(sorted((item[0] for item in self._listed_models().values()),
+                            key=lambda item: (item.casefold(), item)))
+
+    def _listed_models(self) -> dict[str, tuple[str, object]]:
 
         try:
             payload = self._list_models()
@@ -61,7 +67,7 @@ class OllamaLocalValidator:
         rows = payload.get("models")
         if type(rows) is not list:
             raise LocalValidationError()
-        available: dict[str, str] = {}
+        available: dict[str, tuple[str, object]] = {}
         for row in rows:
             if not isinstance(row, Mapping):
                 raise LocalValidationError()
@@ -75,19 +81,23 @@ class OllamaLocalValidator:
                 raise LocalValidationError()
             if canonical.rsplit(":", 1)[1].lower() == "cloud":
                 continue
-            available[key] = canonical
-        return tuple(sorted(
-            available.values(),
-            key=lambda item: (item.casefold(), item),
-        ))
+            available[key] = (canonical, row.get("digest"))
+        return available
+
+    @staticmethod
+    def _manifest_digest(value: object) -> str:
+        match = re.fullmatch(r"(?:sha256:)?([0-9a-fA-F]{64})", value) if type(value) is str else None
+        if match is None:
+            raise LocalValidationError()
+        return match.group(1).lower()
 
     def validate(self, reference: object) -> ValidatedLocalModel:
         requested = normalize_ollama_reference(reference)
-        canonical = {
-            item.lower(): item for item in self.available_references()
-        }.get(requested.lower())
-        if canonical is None:
+        listed = self._listed_models().get(requested.lower())
+        if listed is None:
             raise LocalModelNotFoundError()
+        canonical, raw_digest = listed
+        digest = self._manifest_digest(raw_digest)
         try:
             shown = self._show_model(canonical)
         except Exception:
@@ -102,11 +112,20 @@ class OllamaLocalValidator:
                     raise LocalValidationError() from None
                 if shown_name.lower() != canonical.lower():
                     raise LocalValidationError()
+        # Detect observed tag replacement around show; neither names nor reported
+        # model sizes are evidence of the manifest's content identity.
+        current = self._listed_models().get(requested.lower())
+        if (current is None or current[0] != canonical
+                or self._manifest_digest(current[1]) != digest):
+            raise LocalValidationError()
         return ValidatedLocalModel(
-            provider=LocalModelProvider.OLLAMA,
+            runtime_provider=BackendType.OLLAMA,
+            artifact_origin=ArtifactType.OLLAMA,
+            artifact_format=ArtifactFormat.OLLAMA_MANIFEST,
             reference=canonical,
             display_name=canonical,
             loader=LoaderType.OLLAMA,
+            sha256=digest,
         )
 
 
@@ -211,6 +230,8 @@ class HuggingFaceLocalValidator:
         reference: object,
         loader: LoaderType,
     ) -> ValidatedLocalModel:
+        if loader not in HF_LOADERS:
+            raise LoaderMetadataError()
         path = _canonical_local_directory(reference)
         try:
             root = self._canonical_root()
@@ -226,7 +247,9 @@ class HuggingFaceLocalValidator:
             raise LoaderMetadataError()
         display_name = metadata.display_name or path.name
         return ValidatedLocalModel(
-            provider=LocalModelProvider.HUGGINGFACE,
+            runtime_provider=loader_backend(loader),
+            artifact_origin=ArtifactType.LOCAL,
+            artifact_format=ArtifactFormat.HF_WEIGHTS,
             reference=str(path),
             display_name=display_name,
             loader=loader,

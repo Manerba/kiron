@@ -18,6 +18,7 @@ from kiron_common.model_catalog import (
     ModelTask,
     WireProfile,
 )
+from kiron_common.gpu_admission.native_contract import NativeMemoryBudget
 
 
 _SERVICE_BACKEND = BackendType.KIRON_DEBERTA
@@ -84,6 +85,7 @@ class DebertaServiceModel:
     size: int
     display_order: int
     endpoints: tuple[ModelEndpoint, ...]
+    gpu_memory: NativeMemoryBudget
 
     @property
     def max_length(self) -> int:
@@ -184,6 +186,7 @@ class _ModelAccumulator:
     size: int
     display_order: int
     endpoints: list[ModelEndpoint]
+    gpu_memory: NativeMemoryBudget
 
 
 def _fail(path: str, detail: str) -> None:
@@ -388,7 +391,7 @@ def _parse_service_metadata(
         metadata["service"],
         path=f"{path}/service",
         required=frozenset(
-            ("display_order", "labels", "rerank_label", "size")
+            ("display_order", "labels", "rerank_label", "size", "gpu_memory")
         ),
     )
     labels = _labels(service["labels"], path=f"{path}/service/labels")
@@ -521,6 +524,12 @@ def build_deberta_service_view(
         labels, rerank_label, size, display_order = _parse_service_metadata(
             wire, path=f"{path}/metadata"
         )
+        try:
+            gpu_memory = NativeMemoryBudget.parse(
+                wire.deployment_metadata["service"]["gpu_memory"]
+            )
+        except ValueError as exc:
+            _fail(f"{path}/metadata/service/gpu_memory", str(exc))
 
         previous = accumulators.get(model_name)
         if previous is None:
@@ -536,6 +545,7 @@ def build_deberta_service_view(
                 size=size,
                 display_order=display_order,
                 endpoints=[wire.endpoint],
+                gpu_memory=gpu_memory,
             )
             continue
 
@@ -549,6 +559,7 @@ def build_deberta_service_view(
             ("rerank_label", previous.rerank_label, rerank_label),
             ("size", previous.size, size),
             ("display_order", previous.display_order, display_order),
+            ("gpu_memory", previous.gpu_memory, gpu_memory),
         )
         for field_name, expected, actual in comparisons:
             if actual != expected:
@@ -580,6 +591,7 @@ def build_deberta_service_view(
                     size=item.size,
                     display_order=item.display_order,
                     endpoints=tuple(sorted(item.endpoints, key=lambda endpoint: endpoint.value)),
+                    gpu_memory=item.gpu_memory,
                 )
                 for item in accumulators.values()
             ),

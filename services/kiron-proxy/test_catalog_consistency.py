@@ -9,7 +9,7 @@ import metrics
 
 
 EXPECTED = (
-    "sha256:c91229d7ea472b49d87f6344dbfb640fc760f43e8cace398421d5b364452e6f6"
+    "sha256:be10f0dca76de099a561f53ba77adab9e4c9b9e7238ae10ac6d8b506206f4fc0"
 )
 
 

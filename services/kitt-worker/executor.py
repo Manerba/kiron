@@ -17,6 +17,8 @@ import job_stubs
 import queue_store
 import runners
 
+from kiron_common.gpu_admission import AdmissionError, AdmissionStore, MemorySnapshot, Ticket
+
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +44,8 @@ class KittWorkerExecutor:
         runner_factory: RunnerFactory | None = None,
         policy_decider: PolicyDecider | None = None,
         capability_snapshot_fn: CapabilitySnapshotFn | None = None,
+        admission_store: AdmissionStore | None = None,
+        admission_measure: Callable[[], MemorySnapshot] | None = None,
     ) -> None:
         self.store = store
         self.cfg = cfg
@@ -58,6 +62,10 @@ class KittWorkerExecutor:
         self.state = ExecutorState()
         self._stop_event = asyncio.Event()
         self._active_cancel_event: asyncio.Event | None = None
+        self.admission_store = gpu_policy.training_admission_store() if admission_store is None else admission_store
+        self.admission_measure = gpu_policy.measure_training_memory if admission_measure is None else admission_measure
+        self._admission_generation = uuid.uuid4().hex
+        self._admission_ticket: Ticket | None = None
 
     async def run(self) -> None:
         self.state.running = True
@@ -109,6 +117,9 @@ class KittWorkerExecutor:
 
     async def _execute(self, leased: queue_store.JobRecord) -> None:
         self.state.active_job_uid = leased.job_uid
+        runner = None
+        task = None
+        cancel_event = None
         try:
             if self._cancel_if_requested_before_start(leased.job_uid):
                 return
@@ -144,6 +155,20 @@ class KittWorkerExecutor:
             if self._cancel_if_requested_before_start(leased.job_uid):
                 return
 
+            if job_type == "sft":
+                try:
+                    self._admission_ticket = self.admission_store.reserve(
+                        operation_id=uuid.uuid4().hex, owner=self.owner,
+                        generation=self._admission_generation, deployment_id=leased.job_uid,
+                        kind="training", gpu_bytes=0, host_bytes=0,
+                        measure=self.admission_measure, exclusive=True, ttl_seconds=300,
+                    )
+                except AdmissionError:
+                    self.store.mark_policy_blocked(job_uid=leased.job_uid, owner=self.owner,
+                                                   reason_code="policy_blocked")
+                    return
+            if self._cancel_if_requested_before_start(leased.job_uid):
+                return
             runner_kind = _runner_kind_for_job(leased)
             running_job = self.store.mark_running(
                 job_uid=leased.job_uid,
@@ -167,9 +192,33 @@ class KittWorkerExecutor:
                 outcome = await self._drive_runner(running_job.job_uid, task, cancel_event)
             finally:
                 self._active_cancel_event = None
+            self._release_training_admission(runner, task)
             await self._terminalize_runner_outcome(running_job.job_uid, outcome)
         finally:
-            self.state.active_job_uid = None
+            try:
+                if task is not None and not task.done():
+                    cancel_event.set()
+                    await self._wait_for_runner_stop(task)
+            finally:
+                self._release_training_admission(runner, task)
+                self._active_cancel_event = None
+                self.state.active_job_uid = None
+
+    def _release_training_admission(self, runner, task) -> None:
+        ticket = self._admission_ticket
+        if ticket is None:
+            return
+        try:
+            # A completed coroutine is not proof that descendants stopped.
+            ended = task is None or (task.done() and getattr(runner, "backend_terminated", False) is True)
+        except Exception:
+            ended = False
+        try:
+            self.admission_store.release(ticket.operation_id, owner=ticket.owner,
+                                         generation=ticket.generation, confirmed_terminated=ended)
+        except AdmissionError:
+            logger.error("training admission cleanup remains unconfirmed")
+        self._admission_ticket = None
 
     def _runner_for_kind(self, runner_kind: str) -> object:
         if self.runner_factory is not None:
@@ -198,6 +247,8 @@ class KittWorkerExecutor:
             getattr(self.cfg, "executor_job_timeout_seconds", 300)
         )
         renew_interval = int(getattr(self.cfg, "executor_renew_interval_seconds", 60))
+        if self._admission_ticket is not None:
+            renew_interval = min(renew_interval, 60)  # Stay below the admission TTL even with a long queue lease.
         renew_at = loop.time() + renew_interval
         while True:
             if self._stop_event.is_set():
@@ -233,7 +284,11 @@ class KittWorkerExecutor:
             if now >= renew_at:
                 try:
                     self.store.renew_lease(job_uid=job_uid, owner=self.owner)
-                except queue_store.LeaseUnavailable:
+                    if self._admission_ticket is not None:
+                        ticket = self._admission_ticket
+                        self.admission_store.heartbeat(ticket.operation_id, owner=ticket.owner,
+                                                       generation=ticket.generation)
+                except (queue_store.LeaseUnavailable, AdmissionError):
                     cancel_event.set()
                     await self._wait_for_runner_stop(task)
                     return self._lease_lost_outcome(job_uid)
@@ -377,18 +432,15 @@ class KittWorkerExecutor:
         if task.done():
             return
         grace = int(getattr(self.cfg, "executor_shutdown_grace_seconds", 10))
-        try:
-            await asyncio.wait_for(task, timeout=grace)
-        except asyncio.TimeoutError:
+        done, _ = await asyncio.wait({task}, timeout=grace)
+        if not done:
             task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                return
-            except Exception:
-                return
-        except Exception:
-            return
+            # A cancellation-resistant coroutine must not stall cleanup or
+            # turn a surviving process into an apparently released ticket.
+            await asyncio.wait({task}, timeout=grace)
+        if task.done():
+            with suppress(BaseException):
+                task.result()
 
     async def _stage_runner_artifacts(
         self,

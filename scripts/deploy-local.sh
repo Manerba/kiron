@@ -22,8 +22,8 @@ DST="/usr/lib/kiron"
 REPORT_DIR="$SRC/data/ollama_compat_reports"
 RUNTIME_HANDOFF="$DST/data/ollama_compat_runtime.json"
 SKIP_GATE="${KIRON_SKIP_OLLAMA_COMPAT_GATE:-0}"
-KIRON_SERVICES=(kiron-proxy kiron-docling kiron-embeddings kiron-deberta kitt-worker)
-COMMON_CONSUMERS=(kiron-proxy kiron-docling kiron-embeddings kiron-deberta)
+KIRON_SERVICES=(kiron-proxy kiron-docling kiron-embeddings kiron-deberta kiron-prism kitt-worker)
+COMMON_CONSUMERS=(kiron-proxy kiron-docling kiron-embeddings kiron-deberta kiron-prism kitt-worker)
 PROXY_DATA_DIR="$DST/data/kiron-proxy"
 SHARED_DATA_DIR="$DST/data/shared"
 MODEL_REGISTRY_FILE="$SHARED_DATA_DIR/local-model-registry.json"
@@ -37,6 +37,7 @@ service_group() {
         kiron-docling) echo "kiron-docling" ;;
         kiron-embeddings) echo "kiron-embeddings" ;;
         kiron-deberta) echo "kiron-deberta" ;;
+        kiron-prism) echo "kiron-prism" ;;
         kitt-worker) echo "kitt-worker" ;;
         *) echo "FEHLER: unbekannter Service $1" >&2; return 1 ;;
     esac
@@ -63,6 +64,13 @@ apply_code_permissions() {
     for svc in "${KIRON_SERVICES[@]}"; do
         group="$(service_group "$svc")"
         apply_readonly_tree_permissions "$DST/services/$svc" "$group"
+    done
+    # The proxy binds its Prism adapter revision to these controller sources.
+    # Both services already share the read-only controller access group.
+    chgrp kiron-prism-control "$DST/services/kiron-prism"
+    local name
+    for name in main.py composition.py controller.py process.py admission.py; do
+        chgrp kiron-prism-control "$DST/services/kiron-prism/$name"
     done
 }
 
@@ -96,10 +104,10 @@ apply_local_model_registry_permissions() {
         if [ ! -e "$file" ]; then
             continue
         fi
-        chown kiron-proxy:kiron-config "$file"
+        chown kiron-proxy:kiron-common "$file"
         chmod 0640 "$file"
-        if [ "$(stat -c '%U:%G %a' "$file")" != "kiron-proxy:kiron-config 640" ]; then
-            echo "FEHLER: $file muss kiron-proxy:kiron-config 0640 sein." >&2
+        if [ "$(stat -c '%U:%G %a' "$file")" != "kiron-proxy:kiron-common 640" ]; then
+            echo "FEHLER: $file muss kiron-proxy:kiron-common 0640 sein." >&2
             return 1
         fi
     done
@@ -114,7 +122,7 @@ apply_data_permissions() {
     chown kiron-proxy:kiron-proxy "$PROXY_DATA_DIR"
     chmod 0750 "$PROXY_DATA_DIR"
 
-    chown kiron-proxy:kiron-config "$SHARED_DATA_DIR"
+    chown kiron-proxy:kiron-common "$SHARED_DATA_DIR"
     chmod 2750 "$SHARED_DATA_DIR"
     apply_local_model_registry_permissions
 
@@ -171,11 +179,12 @@ check_catalog_consistency_after_restart() {
 
 required_identity_groups() {
     case "$1" in
-        kiron-proxy) echo "docker kiron-runtime kiron-common" ;;
+        kiron-proxy) echo "docker kiron-runtime kiron-common kiron-config kiron-prism-control" ;;
         kiron-docling) echo "docker kiron-runtime kiron-common" ;;
-        kiron-embeddings) echo "kiron-models kiron-config kiron-common video render" ;;
+        kiron-embeddings) echo "kiron-models kiron-config kiron-common kiron-runtime video render" ;;
         kiron-deberta) echo "kiron-models kiron-common video render" ;;
-        kitt-worker) echo "" ;;
+        kiron-prism) echo "kiron-common kiron-config kiron-runtime kiron-prism-control video render" ;;
+        kitt-worker) echo "kiron-runtime" ;;
         *) echo "FEHLER: unbekannter Service $1" >&2; return 1 ;;
     esac
 }
@@ -210,7 +219,7 @@ check_issue_859_deploy_prereqs() {
     local svc group
 
     for group in \
-        kiron-proxy kiron-docling kiron-embeddings kiron-deberta \
+        kiron-proxy kiron-docling kiron-embeddings kiron-deberta kiron-prism kiron-prism-control \
         kiron-models kiron-runtime kiron-config kiron-common \
         docker video render kitt-worker; do
         if ! getent group "$group" >/dev/null 2>&1; then
@@ -316,17 +325,88 @@ validator_command_hint() {
     printf '  %s --image %s\n' "$SRC/scripts/check-ollama-compat.py" "$NEW_OLLAMA_IMAGE"
 }
 
+install_compat_report() {
+    if [ "$MATCHING_REPORT" = "override" ]; then
+        printf '%s\n' override
+        return
+    fi
+    # Freeze and revalidate exact bytes using the existing offline gate. Runtime
+    # consumers never need access to the development repository.
+    python3 - "$SRC/scripts/check-ollama-compat.py" "$MATCHING_REPORT" \
+        "$NEW_OLLAMA_IMAGE" "$TARGET_DIGEST" "$MATCHING_REPORT_NUM_GPU" \
+        "$DST/data/ollama_compat_reports" <<'PY'
+import grp
+import hashlib
+import importlib.util
+import os
+from pathlib import Path
+import stat
+import sys
+import tempfile
+
+validator_path, source, image, digest, expected_safe, destination = sys.argv[1:]
+spec = importlib.util.spec_from_file_location("kiron_compat_gate", validator_path)
+validator = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = validator
+spec.loader.exec_module(validator)
+descriptor = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+with os.fdopen(descriptor, "rb") as stream:
+    info = os.fstat(stream.fileno())
+    if not stat.S_ISREG(info.st_mode) or info.st_size > 1024 * 1024:
+        raise SystemExit("invalid or oversized compat report")
+    payload = stream.read(1024 * 1024 + 1)
+    if len(payload) != info.st_size:
+        raise SystemExit("compat report changed during read")
+with tempfile.TemporaryDirectory(prefix="kiron-compat-gate-") as scratch:
+    snapshot = Path(scratch) / "snapshot.json"
+    snapshot.write_bytes(payload)
+    match = validator.find_matching_report(Path(scratch), image, digest)
+    if match is None or match[1] != (expected_safe == "true"):
+        raise SystemExit("compat report differs from the accepted gate result")
+checksum = hashlib.sha256(payload).hexdigest()
+directory = Path(destination)
+directory.mkdir(mode=0o750, parents=True, exist_ok=True)
+directory_info = directory.lstat()
+if not stat.S_ISDIR(directory_info.st_mode) or directory_info.st_uid != 0 or directory_info.st_mode & 0o022:
+    raise SystemExit("unsafe runtime report directory")
+gid = grp.getgrnam("kiron-common").gr_gid
+os.chown(directory, 0, gid)
+directory.chmod(0o750)
+target = directory / ("sha256-" + checksum + ".json")
+descriptor, temporary = tempfile.mkstemp(prefix=".report-", dir=directory)
+try:
+    with os.fdopen(descriptor, "wb") as stream:
+        os.fchown(stream.fileno(), 0, gid)
+        os.fchmod(stream.fileno(), 0o640)
+        stream.write(payload)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, target)
+    descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+finally:
+    Path(temporary).unlink(missing_ok=True)
+print(target)
+PY
+}
+
 write_runtime_handoff() {
     local digest="$1"
     local report_path="$2"
     local effective="$3"
     mkdir -p "$(dirname "$RUNTIME_HANDOFF")"
     python3 - "$RUNTIME_HANDOFF" "$digest" "$report_path" "$effective" <<'PY'
-import json, os, pathlib, sys
+import hashlib, json, os, pathlib, sys
 path = pathlib.Path(sys.argv[1])
+report_path = sys.argv[3]
 payload = {
     "image_digest": sys.argv[2],
-    "report_path": sys.argv[3],
+    "report_path": report_path,
+    "report_sha256": (hashlib.sha256(pathlib.Path(report_path).read_bytes()).hexdigest()
+                      if report_path != "override" else None),
     "num_gpu_zero_effective": sys.argv[4] == "true",
 }
 tmp = path.with_suffix(path.suffix + ".tmp")
@@ -356,6 +436,21 @@ check_common_venvs() {
     done
 }
 
+check_kitt_common_snapshot() {
+    # Private package copy: reject stale code before a restart/deploy mutation.
+    "$DST/services/kitt-worker/venv/bin/python" - "$1" <<'PY'
+import hashlib
+from pathlib import Path
+import sys
+import kiron_common
+def inventory(root):
+    return {str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in root.rglob("*") if path.is_file() and path.suffix in {".py", ".json"}}
+if inventory(Path(sys.argv[1])) != inventory(Path(kiron_common.__file__).parent):
+    raise SystemExit("KITT common package differs: run scripts/setup-venvs.sh before restart")
+PY
+}
+
 smoke_common_imports() {
     # MUSS nach rsync von kiron-common laufen, damit der aktuelle Code geprueft wird.
     # Fuer deklarierte Common-Consumer ist ein fehlender Import ein harter
@@ -379,6 +474,9 @@ smoke_common_imports() {
             echo "  bash /opt/kiron/scripts/deploy-local.sh --restart" >&2
             return 1
         }
+        if [ "$svc" = "kitt-worker" ]; then
+            check_kitt_common_snapshot "$DST/services/kiron-common/kiron_common" || return 1
+        fi
         if [ "$svc" = "kiron-proxy" ] || \
            [ "$svc" = "kiron-embeddings" ] || \
            [ "$svc" = "kiron-deberta" ]; then
@@ -388,6 +486,17 @@ smoke_common_imports() {
             }
         fi
     done
+}
+
+check_prism_restart_prereqs() {
+    local py="$DST/services/kiron-prism/venv/bin/python"
+    [ -x "$py" ] || { echo "FEHLER: kiron-prism venv fehlt; setup-venvs.sh zuerst ausfuehren." >&2; return 1; }
+    # Verify as the actual consumer; no sockets, subprocesses or model loads.
+    runuser -u kiron-prism -- env PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1 \
+        "$py" -c 'from pathlib import Path; from kiron_common.prism_runtime_policy import Policy; from kiron_common.local_model_registry import RuntimeModelRegistry; Policy.load(Path("/usr/lib/kiron/data/prism-runtime-policy.json")); RuntimeModelRegistry(readonly=True).list()' || {
+        echo "FEHLER: Prism Policy/Binarybundle/Registry nicht startbereit; Deploy bleibt unveraendert." >&2
+        return 1
+    }
 }
 
 check_kitt_worker_restart_prereqs() {
@@ -649,10 +758,13 @@ fi
 
 check_kitt_worker_no_dispatch_activation "$SRC/services/kitt-worker" "$SRC/scripts" "$SRC/systemd"
 check_issue_859_deploy_prereqs
+python3 "$SRC/scripts/check-ollama-admission.py"
 
 if [ "${1:-}" = "--restart" ]; then
     check_common_venvs
+    check_kitt_common_snapshot "$SRC/services/kiron-common/kiron_common"
     check_kitt_worker_restart_prereqs
+    check_prism_restart_prereqs
 fi
 
 if [ "$OLLAMA_IMAGE_CHANGED" = "1" ]; then
@@ -785,6 +897,7 @@ if [ "${1:-}" = "--restart" ]; then
 fi
 
 # Docker-Compose
+MATCHING_REPORT="$(install_compat_report)"
 rsync -a --delete "$SRC/docker/" "$DST/docker/"
 
 # External Docker-Volume fuer Ollama sicherstellen (#232)

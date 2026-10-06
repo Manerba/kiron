@@ -1,5 +1,6 @@
 """Sentence-Transformers Embedding Service mit Ollama-kompatibler API."""
 
+import gc
 import hashlib
 import json
 import logging
@@ -17,9 +18,14 @@ from typing import Any
 import numpy as np
 import torch
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
+
+from kiron_common.gpu_admission import AdmissionError
+from kiron_common.gpu_admission.native_contract import (
+    COMPLETION_HEADER, OPERATION_HEADER, OVERLAY_HEADER, valid_operation_id,
+)
 
 from kiron_common.embedding_registry import (
     EMBEDDING_REGISTRY,
@@ -43,6 +49,8 @@ from catalog_view import (
     build_embedding_service_view,
 )
 from loaders import ColbertModelBundle, LOADER_REGISTRY
+from token_usage import capture_forward_usage
+from native_runtime import has_closed_loader_provenance, verify_local_artifact
 
 from model_worker import (
     MODEL_WORKER_SHUTDOWN_TIMEOUT_S,
@@ -52,6 +60,7 @@ from model_worker import (
     LateEmbedResult,
     NonFiniteEmbeddingError,
     SerialModelWorker,
+    StaleGenerationError,
     WorkerQueueFullError,
     WorkerStoppedError,
     derive_health_status,
@@ -277,6 +286,11 @@ class LoadRequest(BaseModel):
     model: str
 
 
+class UnloadRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    model: str = Field(min_length=1)
+
+
 class ShowRequest(BaseModel):
     model: str
 
@@ -299,11 +313,48 @@ class ModelManager:
         self.current_model_name: str | None = None
         self.model: Any | None = None
         self.models: OrderedDict[str, Any] = OrderedDict()
+        self._artifact_proofs = {}
+        self._model_epoch = 0
         self.max_model_slots = _coerce_model_slots(
             model_slots if model_slots is not None else _configured_model_slots()
         )
         self.loading_model: str | None = None
         self.device: str = "unknown"
+        self.residency = None
+
+    def residency_boundary(self) -> None:
+        self.assert_worker_thread()
+        if torch.cuda.is_initialized():
+            # Ingestion can leave several GiB of unused allocator blocks behind.
+            # Return that workspace before the next service measures free VRAM;
+            # live model tensors and their residency remain owned by this worker.
+            try:
+                torch.cuda.synchronize()
+                reserved_before = torch.cuda.memory_reserved()
+                torch.cuda.empty_cache()
+                reserved_after = torch.cuda.memory_reserved()
+            except Exception:
+                self.residency_unknown()
+                raise
+            if reserved_after != reserved_before:
+                logger.info(
+                    "CUDA workspace released: allocated_bytes=%d "
+                    "reserved_before_bytes=%d reserved_after_bytes=%d",
+                    torch.cuda.memory_allocated(), reserved_before, reserved_after,
+                )
+        if self.residency is not None:
+            with self.state_lock:
+                snapshot = self.snapshot()
+                instances = {name: id(model) for name, model in self.models.items()}
+            self.residency.complete(snapshot, instances)
+
+    def residency_idle(self) -> None:
+        if self.residency is not None:
+            self.residency.heartbeat(self.snapshot())
+
+    def residency_unknown(self) -> None:
+        if self.residency is not None:
+            self.residency.unknown()
 
     def set_worker_thread(self) -> None:
         with self.state_lock:
@@ -334,6 +385,9 @@ class ModelManager:
                 "model_slots": self.max_model_slots,
                 "loading_model": self.loading_model,
                 "device": self.device,
+                "model_epoch": self._model_epoch,
+                "verified_artifacts": {name: proof.fingerprint for name, (model_id, proof) in self._artifact_proofs.items()
+                                       if id(self.models.get(name)) == model_id},
             }
 
     def clear_loading_for_crash(self) -> None:
@@ -363,6 +417,9 @@ class ModelManager:
         *,
         config: EmbeddingServiceModel,
     ) -> Any:
+        if config.loader_type is LoaderType.TRANSFORMERS_LAST_TOKEN:
+            # Its catalog declares FP32 computation on both CPU and CUDA.
+            return model.to("cuda")
         if config.loader_type is LoaderType.COLBERT_XMOD:
             model.backbone = model.backbone.half().to("cuda")
             model.linear = model.linear.half().to("cuda")
@@ -386,6 +443,8 @@ class ModelManager:
         if self.model is not None and all(old is not self.model for old in old_models):
             old_models.append(self.model)
         self.models.clear()
+        self._artifact_proofs.clear()
+        self._model_epoch += 1
         self.model = None
         self.current_model_name = None
         return old_models
@@ -393,6 +452,8 @@ class ModelManager:
     def _evict_lru_model_unlocked(self) -> Any | None:
         if self.models:
             evicted_name, evicted_model = self.models.popitem(last=False)
+            self._artifact_proofs.pop(evicted_name, None)
+            self._model_epoch += 1
             logger.info(f"Entlade {evicted_name}...")
             if self.current_model_name == evicted_name:
                 if self.models:
@@ -452,6 +513,8 @@ class ModelManager:
             self._evict_lru_model_sync()
 
     def _store_model_unlocked(self, ollama_name: str, model: Any) -> None:
+        self._artifact_proofs.pop(ollama_name, None)
+        self._model_epoch += 1
         old_model = self.models.pop(ollama_name, None)
         if old_model is not None and old_model is not model:
             del old_model
@@ -459,13 +522,20 @@ class ModelManager:
         self.model = model
         self.current_model_name = ollama_name
 
-    def _load_model_sync(self, ollama_name: str):
+    def _load_model_sync(self, ollama_name: str, *, load_parent: tuple[str, str] | None = None):
         self.assert_worker_thread()
         with self.state_lock:
             self.loading_model = ollama_name
             device = self.device
         try:
             detected = self._detect_device()
+            if self.residency is not None:
+                with self.state_lock:
+                    instance = self.models.get(ollama_name)
+                    before = self.snapshot()
+                self.residency.before_load(ollama_name, detected, before,
+                                           id(instance) if instance is not None else None,
+                                           load_parent=load_parent)
             if detected != device:
                 logger.warning(
                     f"Embedding Device-Wechsel erkannt: {device} -> {detected}"
@@ -483,10 +553,14 @@ class ModelManager:
                 device = detected
 
             config = EMBEDDING_SERVICE_VIEW.require_runtime_model(ollama_name)
+            api_profiles = [profile for profile in MODEL_CATALOG.require(config.canonical_model_id).profiles
+                            if profile.deployment_id in {item.deployment_id for item in config.profiles}
+                            and "created" in profile.metadata]
+            proof = (verify_local_artifact(config.artifact)
+                     if api_profiles and has_closed_loader_provenance(config) else None)
             hf_name = config.artifact.repository
             logger.info(
-                f"Lade {hf_name} auf {device.upper()}"
-                f"{' (FP16)' if device == 'cuda' else ''}..."
+                f"Lade {hf_name} auf {device.upper()}..."
             )
 
             # #288: explizit device="cpu", sonst defaultet sentence-transformers auf cuda
@@ -495,6 +569,8 @@ class ModelManager:
             # wirft HF LocalEntryNotFoundError (OSError-Subklasse), der vom bestehenden
             # OSError-Handler als "nicht auf dem Server installiert" gemeldet wird.
             new_model = self._construct_model_cpu_sync(config)
+            if proof is not None:
+                proof.recheck()
 
             if device == "cuda":
                 # CUDA: Cache-Kapazitaet vor dem Transfer freimachen. Bei freien
@@ -519,6 +595,8 @@ class ModelManager:
                         )
                         self._drop_all_models_sync()
                         new_model = self._construct_model_cpu_sync(config)
+                        if proof is not None:
+                            proof.recheck()
                         try:
                             new_model = self._transfer_model_to_cuda_sync(
                                 new_model,
@@ -553,12 +631,15 @@ class ModelManager:
             logger.info(
                 f"Modell {ollama_name} ({hf_name}) bereit auf {device.upper()}."
             )
+            if proof is not None:
+                with self.state_lock:
+                    self._artifact_proofs[ollama_name] = (id(new_model), proof)
             return new_model
         finally:
             with self.state_lock:
                 self.loading_model = None
 
-    def _ensure_model_sync(self, ollama_name: str) -> tuple[Any, int]:
+    def _ensure_model_sync(self, ollama_name: str, *, load_parent: tuple[str, str] | None = None) -> tuple[Any, int]:
         self.assert_worker_thread()
         with self.state_lock:
             cached_model = self._cached_model_unlocked(ollama_name)
@@ -572,7 +653,7 @@ class ModelManager:
             if self._detect_device() == current_device:
                 return (cached_model, 0)
         load_start = time.monotonic()
-        model = self._load_model_sync(ollama_name)
+        model = self._load_model_sync(ollama_name, load_parent=load_parent)
         load_duration_ns = int((time.monotonic() - load_start) * 1_000_000_000)
         return (model, load_duration_ns)
 
@@ -581,9 +662,23 @@ class ModelManager:
         ollama_name: str,
         texts: list[str],
         input_type: str | None,
+        *, expected_artifact: str | None = None, expected_epoch: int | None = None,
     ) -> EncodeResult:
         self.assert_worker_thread()
-        model, load_duration_ns = self._ensure_model_sync(ollama_name)
+        if expected_artifact is None:
+            model, load_duration_ns = self._ensure_model_sync(ollama_name)
+        else:
+            with self.state_lock:
+                # Validate before even changing LRU/current_model state. A
+                # StaleGenerationError proves the queued request never touched
+                # a model and is safe for the native rejection-end protocol.
+                model = self.models.get(ollama_name)
+                evidence = self._artifact_proofs.get(ollama_name)
+                if (model is None or evidence is None or evidence[0] != id(model)
+                        or evidence[1].fingerprint != expected_artifact or expected_epoch != self._model_epoch):
+                    raise StaleGenerationError("embedding resident identity changed before execution")
+                model = self._cached_model_unlocked(ollama_name)
+            load_duration_ns = 0
 
         config = EMBEDDING_SERVICE_VIEW.require_runtime_model(ollama_name)
         encode_texts = _apply_prefix(texts, config, input_type)
@@ -625,15 +720,17 @@ class ModelManager:
             batch_size = 8 if max_len > 2048 else 16
 
         try:
-            if use_cuda:
-                with torch.amp.autocast("cuda"):
+            with capture_forward_usage(model) as usage:
+                if use_cuda:
+                    with torch.amp.autocast("cuda"):
+                        embeddings = model.encode(
+                            encode_texts, batch_size=batch_size, convert_to_numpy=True
+                        )
+                else:
                     embeddings = model.encode(
                         encode_texts, batch_size=batch_size, convert_to_numpy=True
                     )
-            else:
-                embeddings = model.encode(
-                    encode_texts, batch_size=batch_size, convert_to_numpy=True
-                )
+                prompt_eval_count = usage.finish(len(encode_texts))
         except torch.cuda.OutOfMemoryError:
             logger.error(
                 f"[{ollama_name}] CUDA OOM waehrend Encode — entlade Modell und leere Cache"
@@ -664,22 +761,6 @@ class ModelManager:
                 raise CudaRuntimeError(e) from e
             raise
 
-        # #605: prompt_eval_count via Tokenizer (padding=False, sonst Pad-Tokens
-        # mitgezaehlt). Char//4-Heuristik als Fallback (#687, OpenAI-Standard).
-        try:
-            tokenizer_kwargs = {"padding": False, "truncation": True}
-            max_seq_length = getattr(model, "max_seq_length", None)
-            if (
-                isinstance(max_seq_length, int)
-                and not isinstance(max_seq_length, bool)
-                and max_seq_length > 0
-            ):
-                tokenizer_kwargs["max_length"] = max_seq_length
-            tokenized = model.tokenizer(encode_texts, **tokenizer_kwargs)
-            prompt_eval_count = sum(len(ids) for ids in tokenized["input_ids"])
-        except Exception:
-            prompt_eval_count = sum(len(t) for t in encode_texts) // 4
-
         # L2-Normalisierung in FP32 (Praezision gegen FP16-Rundungsfehler)
         embeddings = embeddings.astype(np.float32)
         finite_mask = np.isfinite(embeddings).all(axis=1)
@@ -701,10 +782,17 @@ class ModelManager:
         norms = np.where(norms == 0, 1, norms)
         embeddings = embeddings / norms
 
+        with self.state_lock:
+            execution_epoch = self._model_epoch
+            proof = self._artifact_proofs.get(ollama_name)
+            execution_artifact = proof[1].fingerprint if proof is not None and proof[0] == id(model) else None
+
         return EncodeResult(
             embeddings=embeddings.tolist(),
             prompt_eval_count=prompt_eval_count,
             load_duration_ns=load_duration_ns,
+            execution_epoch=execution_epoch,
+            execution_artifact=execution_artifact,
         )
 
     def _late_embed_sync(
@@ -742,6 +830,9 @@ class ModelManager:
             tok_kwargs["max_length"] = msl
         encoding = model.tokenizer(prefixed_doc, **tok_kwargs)
         offset_mapping = encoding["offset_mapping"][0].tolist()
+        token_ids = encoding["input_ids"][0].tolist()
+        attended = encoding["attention_mask"][0].tolist()
+        special_token_ids = set(model.tokenizer.all_special_ids)
 
         # Forward-Pass auf Token-Ebene. torch.no_grad() zwingend, sonst speichert
         # PyTorch Activations fuer Backward (8192-Token-Forward = 1-2 GiB extra
@@ -812,15 +903,17 @@ class ModelManager:
 
             # Fallback wenn Chunk hinter dem Token-Window beginnt
             # (Vergleich in prefixed-Koordinaten — F7).
-            if shifted_start >= max_char_covered_prefixed:
+            if chunk_start == chunk_end or shifted_start >= max_char_covered_prefixed:
                 fallback_texts.append(chunk_text)
                 fallback_indices.append(i)
                 continue
 
             token_indices: list[int] = []
             for tok_idx, (tok_start, tok_end) in enumerate(offset_mapping):
-                # Special-Tokens (CLS/SEP/PAD) ueberspringen.
-                if tok_start == 0 and tok_end == 0:
+                # Auch ausgeschriebene Special-Tokens haben echte Offsets.
+                # Offset (0, 0) allein erkennt z.B. "[SEP]" im Text nicht.
+                if (not attended[tok_idx] or token_ids[tok_idx] in special_token_ids
+                        or tok_end <= tok_start):
                     continue
                 # Token komplett im Prefix-Bereich ueberspringen.
                 if tok_end <= prefix_char_len:
@@ -1166,6 +1259,29 @@ class ModelManager:
         self.assert_worker_thread()
         self._drop_all_models_sync()
 
+    def _unload_model_sync(self, name: str) -> bool:
+        """Remove one cache entry at a serial worker boundary, without loading."""
+        self.assert_worker_thread()
+        with self.state_lock:
+            if name not in self.models:
+                return False
+        # Finish GPU work before dropping the instance and its residency proof.
+        if self.device == "cuda":
+            torch.cuda.synchronize()
+        with self.state_lock:
+            old_model = self.models.pop(name)
+            self._artifact_proofs.pop(name, None)
+            self._model_epoch += 1
+            if self.current_model_name == name:
+                self.current_model_name = next(reversed(self.models), None)
+                self.model = self.models.get(self.current_model_name)
+        del old_model
+        gc.collect()
+        if self.device == "cuda":
+            torch.cuda.empty_cache()
+        logger.info("Modell %s entladen", name)
+        return True
+
 
 model_manager = ModelManager()
 model_worker = SerialModelWorker(model_manager)
@@ -1176,6 +1292,10 @@ async def lifespan(app):
     # Discovery is an all-or-nothing contract: a malformed/duplicate registry
     # must stop the producer before it can advertise a partial model set.
     EMBEDDING_REGISTRY.validate()
+    from native_runtime import generation
+    from residency import build_owner
+    model_manager.residency = build_owner(MODEL_CATALOG,
+        lambda snapshot: json.dumps(list(generation(snapshot).values()), separators=(",", ":")))
     model_worker.start()
     try:
         yield
@@ -1186,6 +1306,8 @@ async def lifespan(app):
             logger.exception("Worker-Stop fehlgeschlagen")
 
 app = FastAPI(title="Embedding Service", lifespan=lifespan)
+from native_api import create_native_router
+app.include_router(create_native_router(MODEL_CATALOG, EMBEDDING_SERVICE_VIEW, lambda: model_worker))
 
 # #567: Pydantic parst den kompletten Body bevor MAX_TEXTS/MAX_TEXT_LEN
 # in der Handler-Logik greifen. Body-Limit vor dem Parsing verhindert OOM
@@ -1822,7 +1944,26 @@ def health():
 
 
 @app.post("/api/load")
-async def load_model_endpoint(req: LoadRequest):
+async def load_model_endpoint(req: LoadRequest, request: Request = None):
+    parent = None
+    if request is not None:
+        operation = request.headers.get(OPERATION_HEADER)
+        overlay = request.headers.get(OVERLAY_HEADER)
+        if operation is not None or overlay is not None:
+            if not valid_operation_id(operation) or not valid_operation_id(overlay):
+                return JSONResponse({"error": "Ungueltige Ladeoperation."}, status_code=400)
+            parent = (operation, overlay)
+    result = await _load_model_endpoint(req, load_parent=parent)
+    # The worker future (including residency reconciliation) or a pre-dispatch
+    # rejection has completed. Cancellation never reaches this receipt.
+    if parent is not None:
+        if not isinstance(result, JSONResponse):
+            result = JSONResponse(result)
+        result.headers[COMPLETION_HEADER] = parent[0]
+    return result
+
+
+async def _load_model_endpoint(req: LoadRequest, *, load_parent: tuple[str, str] | None = None):
     """Modell explizit laden/wechseln ohne Embed-Request."""
     resolved = normalize_load_model_name(req.model)
     if resolved is None:
@@ -1834,7 +1975,7 @@ async def load_model_endpoint(req: LoadRequest):
             status_code=400,
         )
     try:
-        await model_worker.load(resolved)
+        await model_worker.load(resolved, load_parent=load_parent)
         return {"status": "ok", "model": resolved}
     except WorkerStoppedError:
         return JSONResponse(
@@ -1846,6 +1987,8 @@ async def load_model_endpoint(req: LoadRequest):
             {"error": "Model-Worker Queue voll"},
             status_code=503,
         )
+    except AdmissionError as exc:
+        return JSONResponse({"error": "GPU-Ladevorgang derzeit gesperrt.", "code": exc.code}, status_code=409)
     except FileNotFoundError as e:
         logger.error(f"[{resolved}] FileNotFoundError beim Laden: {type(e).__name__}: {e}")
         return JSONResponse(
@@ -1895,6 +2038,24 @@ async def load_model_endpoint(req: LoadRequest):
              "detail": str(e)},
             status_code=500,
         )
+
+
+@app.post("/api/unload")
+async def unload_model_endpoint(req: UnloadRequest):
+    config = EMBEDDING_SERVICE_VIEW.resolve(req.model)
+    if config is None:
+        return JSONResponse({"error": f"Modell '{req.model}' nicht unterstuetzt."}, status_code=400)
+    try:
+        removed = await model_worker.unload(config.model_name)
+        return {"status": "unloaded", "model": config.model_name, "already": not removed}
+    except (WorkerStoppedError, WorkerQueueFullError) as exc:
+        return JSONResponse({"error": str(exc)}, status_code=503)
+    except AdmissionError as exc:
+        return JSONResponse({"error": "Ressourcenfreigabe konnte nicht bestaetigt werden.",
+                             "code": exc.code}, status_code=409)
+    except Exception:
+        logger.exception("[%s] Fehler beim Entladen", config.model_name)
+        return JSONResponse({"error": f"Modell '{config.model_name}' konnte nicht entladen werden."}, status_code=500)
 
 
 @app.post("/api/show")

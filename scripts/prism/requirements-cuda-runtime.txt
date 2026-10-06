@@ -1,0 +1,5 @@
+# Runtime libraries for the pinned Linux x86_64 CUDA 12.8 release, not nvcc.
+# Install only into /usr/lib/kiron/test-venvs/prism-runtime for upstream probes.
+# Wheels are pinned to the official PyPI metadata inspected on 2026-09-21.
+nvidia-cublas-cu12==12.8.4.1 --hash=sha256:8ac4e771d5a348c551b2a426eda6193c19aa630236b418086020df5ba9667142
+nvidia-cuda-runtime-cu12==12.8.90 --hash=sha256:adade8dcbd0edf427b7204d480d6066d33902cab2a4707dcfc48a2d0fd44ab90

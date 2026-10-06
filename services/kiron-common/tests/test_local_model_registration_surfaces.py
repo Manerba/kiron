@@ -1,4 +1,4 @@
-from __future__ import annotations
+from kiron_common.model_catalog import ArtifactFormat, ArtifactType, BackendType, LoaderType
 
 import ast
 import json
@@ -23,7 +23,7 @@ class _LocalOllama:
 
     def list_models(self) -> object:
         self.calls.append(("list", None))
-        return {"models": [{"name": name} for name in self.names]}
+        return {"models": [{"name": name, "digest": "a" * 64} for name in self.names]}
 
     def show_model(self, name: str) -> object:
         self.calls.append(("show", name))
@@ -62,11 +62,11 @@ def test_shared_composition_registers_ollama_and_huggingface_locally(
     hf_path = _hf_model(tmp_path / "hf-model")
 
     ollama_entry = service.register_model(
-        provider="ollama",
+        runtime_provider="ollama",
         reference="unit/model:q4_0",
     )
     hf_entry = service.register_model(
-        provider="huggingface",
+        runtime_provider="kiron_embeddings",
         reference=str(hf_path),
         loader="sentence_transformers",
     )
@@ -77,6 +77,7 @@ def test_shared_composition_registers_ollama_and_huggingface_locally(
     assert ollama.calls == [
         ("list", None),
         ("show", "Unit/Model:Q4_0"),
+        ("list", None),
     ]
     assert service.list_models() == tuple(
         sorted((ollama_entry, hf_entry), key=lambda entry: entry.id)
@@ -148,7 +149,7 @@ def test_cli_register_and_list_are_stable_json_values_and_persistent(
     service = _service(registry_path, _LocalOllama("demo:latest"))
 
     code, registered = run_cli(
-        ["register", "--provider", "ollama", "--reference", "DEMO"],
+        ["register", "--runtime-provider", "ollama", "--reference", "DEMO"],
         service=service,
         effective_uid=0,
     )

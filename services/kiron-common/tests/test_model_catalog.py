@@ -49,21 +49,21 @@ def _hf_manifest(
     request_default: bool = True,
 ) -> dict:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "canonical_model_id": canonical_model_id,
         "aliases": [stem],
         "deployments": [
             {
                 "id": f"{stem}.service",
-                "backend": {"type": "kiron_deberta", "parameters": {}},
+                "backend": {"type": "kiron_deberta", "parameters": {}}, "runtime_profile": None,
                 "artifact": {
-                    "type": "huggingface",
+                    "type": "huggingface", "format": "hf_weights", "projector": None,
                     "repository": f"org/{stem}",
                     "revision": "b" * 40,
                     "manifest_digest": None,
                     "trust_remote_code": False,
                     "weights": [
-                        {"path": "model.safetensors", "sha256": "4" * 64}
+                        {"path": "model.safetensors", "sha256": "4" * 64, "size_bytes": None}
                     ],
                     "auxiliary": [],
                     "metadata": {},
@@ -150,12 +150,12 @@ def _assert_invalid(manifest: dict, match: str) -> CatalogValidationError:
 
 def test_schema_contract_is_packaged_next_to_the_runtime_parser():
     schema_resource = resources.files("kiron_common.model_catalog").joinpath(
-        "model-manifest-v1.schema.json"
+        "model-manifest-v2.schema.json"
     )
     schema = json.loads(schema_resource.read_text(encoding="utf-8"))
 
-    assert schema["$id"].endswith("model-manifest-v1.schema.json")
-    assert schema["properties"]["schema_version"] == {"const": 1}
+    assert schema["$id"].endswith("model-manifest-v2.schema.json")
+    assert schema["properties"]["schema_version"] == {"const": 2}
     assert schema["additionalProperties"] is False
     Draft202012Validator.check_schema(schema)
     assert list(Draft202012Validator(schema).iter_errors(_fixture())) == []
@@ -410,7 +410,7 @@ def test_digest_is_independent_of_manifest_and_set_like_array_order():
     beta = _hf_manifest()
     baseline = ModelCatalog.from_manifests([alpha, beta])
     assert baseline.catalog_digest == (
-        "sha256:b6be2177726bae12666a8f90268ac566b44f77d3b44f0c38867118b781ff9f86"
+        "sha256:0c6160273374f66580fa003ab92a33d2e14626944b9c806f54c036f587ce5d95"
     )
 
     reordered_alpha = copy.deepcopy(alpha)
@@ -511,7 +511,7 @@ def test_packaged_production_catalog_matches_complete_digest_golden():
     ]
 
     assert expected["fixture_version"] == 1
-    assert expected["catalog_schema_version"] == 1
+    assert expected["catalog_schema_version"] == 2
     assert manifest_files == expected["manifest_files"]
     assert len(catalog.groups) == expected["group_count"] == 13
     assert len(catalog.wire_profiles) == expected["profile_count"] == 23
@@ -629,7 +629,7 @@ def test_embedding_task_accepts_each_adr_0009_endpoint(endpoint):
 
 def test_unknown_schema_versions_fields_enums_and_wrong_types_fail_closed():
     manifest = _fixture()
-    manifest["schema_version"] = 2
+    manifest["schema_version"] = 1
     _assert_invalid(manifest, "unsupported schema version")
 
     manifest = _fixture()

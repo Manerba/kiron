@@ -184,6 +184,7 @@ class MankeiRerankerTests(unittest.TestCase):
         manager = main.ModelManager(service_view)
         with (
             mock.patch.object(main.torch.cuda, "is_available", return_value=True),
+            mock.patch.object(main.torch.cuda, "mem_get_info", return_value=(12 * 1024**3, 12 * 1024**3)),
             mock.patch.object(main.torch.cuda, "empty_cache"),
         ):
             loaded, config = manager._load_model("mankei-326m-reranker")

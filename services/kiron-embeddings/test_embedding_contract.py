@@ -27,9 +27,16 @@ class _DeterministicModel:
     def tokenizer(texts, **_kwargs):
         return {"input_ids": [[ord(character) for character in text] for text in texts]}
 
-    @staticmethod
-    def encode(texts, *, batch_size, convert_to_numpy):
+    def forward(self, features):
+        return features
+
+    def encode(self, texts, *, batch_size, convert_to_numpy):
         del batch_size, convert_to_numpy
+        lengths = [len(text) + 2 for text in texts]
+        mask = main.torch.zeros((len(texts), max(lengths)), dtype=main.torch.int64)
+        for index, length in enumerate(lengths):
+            mask[index, :length] = 1
+        self.forward({"input_ids": mask.clone(), "attention_mask": mask})
         vectors = []
         for text in texts:
             digest = hashlib.sha256(text.encode("utf-8")).digest()
@@ -94,7 +101,7 @@ class EmbeddingDiscoveryContractTests(unittest.TestCase):
             shown = main.show_model_endpoint(main.ShowRequest(model=row["name"]))
             capabilities = row["kiron_capabilities"]
             group = MODEL_CATALOG.require(capabilities["canonical_model_id"])
-            manifest = group.to_manifest_dict(schema_version=1)
+            manifest = group.to_manifest_dict(schema_version=2)
             profiles = {item["id"]: item for item in manifest["profiles"]}
             deployments = {
                 item["id"]: item for item in manifest["deployments"]
@@ -113,7 +120,7 @@ class EmbeddingDiscoveryContractTests(unittest.TestCase):
                         field: capability_profile[field]
                         for field in metadata_fields
                     },
-                    profile["metadata"],
+                    {key: value for key, value in profile["metadata"].items() if key != "created"},
                 )
                 self.assertEqual(
                     capability_profile["backend"],

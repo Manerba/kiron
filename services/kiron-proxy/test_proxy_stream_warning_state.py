@@ -1,11 +1,14 @@
 """Regressionstests fuer Proxy-Streaming-Finalisierung (#704)."""
 
+import asyncio
+import json
 import os
 import sys
 import unittest
 from unittest import mock
 
 import httpx
+from starlette.requests import ClientDisconnect
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import proxy  # noqa: E402
@@ -66,6 +69,73 @@ async def _pass_vram_lease(body, path, model, routing_view):
 
 
 class ProxyStreamWarningStateTests(unittest.IsolatedAsyncioTestCase):
+    async def test_disconnect_finalizes_database_even_inside_cancelled_asgi_scope(self):
+        await self._assert_disconnected_record("disconnect")
+
+    async def test_header_failure_finalizes_unstarted_stream_and_drains_backend(self):
+        await self._assert_disconnected_record("headers")
+
+    async def test_failed_body_send_closes_generator_and_finalizes_record(self):
+        await self._assert_disconnected_record("body")
+
+    async def _assert_disconnected_record(self, failure):
+        finalized, first_output, finish_backend = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        class Store(_Store):
+            async def update_request(self, request_id, **kwargs):
+                await asyncio.sleep(.01)
+                await super().update_request(request_id, **kwargs)
+                if kwargs.get("error_message", "").startswith("Client disconnected"):
+                    finalized.set()
+        class Backend(_BackendResponse):
+            async def aiter_bytes(self):
+                yield b'{"response":"partial","done":false}\n'
+                await finish_backend.wait()
+                yield b'{"done":true}\n'
+        store, backend = Store(), Backend([])
+        with mock.patch.object(proxy.httpx, "AsyncClient", side_effect=lambda **kwargs: _ProxyHttpClient(backend)):
+            app = proxy.create_proxy_app(store)
+        body = json.dumps({"model": "qwen3:8b", "prompt": "hi", "stream": True,
+                           "options": {"num_gpu": 0}}).encode()
+        received = False
+        async def receive():
+            nonlocal received
+            if not received:
+                received = True
+                return {"type": "http.request", "body": body, "more_body": False}
+            await first_output.wait()
+            return {"type": "http.disconnect"}
+        async def send(message):
+            if failure == "headers" and message["type"] == "http.response.start":
+                raise OSError("fixture client closed before headers")
+            if message["type"] == "http.response.body" and message.get("body"):
+                first_output.set()
+                if failure == "body":
+                    raise OSError("fixture client send failed")
+        scope = {"type": "http", "asgi": {"version": "3.0", "spec_version": "2.0" if failure == "disconnect" else "2.4"},
+            "http_version": "1.1", "method": "POST", "scheme": "http", "path": "/api/generate",
+            "raw_path": b"/api/generate", "query_string": b"", "root_path": "",
+            "headers": [(b"content-type", b"application/json")],
+            "client": ("127.0.0.1", 1234), "server": ("testserver", 80)}
+        with mock.patch.object(proxy.vram_lease, "apply_bytes", side_effect=_pass_vram_lease), \
+             mock.patch.object(proxy.vram_lease, "num_gpu_zero_effective", return_value=True):
+            pending = asyncio.create_task(app(scope, receive, send))
+            try:
+                await asyncio.wait_for(finalized.wait(), 1)
+                self.assertEqual(store.updates[-1][1]["state"], "error")
+            finally:
+                finish_backend.set()
+                if failure == "disconnect":
+                    await asyncio.wait_for(pending, 2)
+                else:
+                    with self.assertRaises(ClientDisconnect):
+                        await asyncio.wait_for(pending, 2)
+                # Detached backend cleanup belongs to the operation, not ASGI.
+                for _ in range(100):
+                    if backend.closed:
+                        break
+                    await asyncio.sleep(.01)
+                self.assertTrue(backend.closed, store.updates)
+
     async def _call_stream(self, chunks, raise_after=None):
         store = _Store()
         backend_response = _BackendResponse(chunks, raise_after=raise_after)

@@ -27,7 +27,7 @@ def _container():
         },
         "HostConfig": {
             "PortBindings": {
-                "11435/tcp": [{"HostIp": "", "HostPort": "11435"}],
+                "11435/tcp": [{"HostIp": "127.0.0.1", "HostPort": "11435"}],
             },
             "RestartPolicy": {"Name": "unless-stopped", "MaximumRetryCount": 0},
             "DeviceRequests": [
@@ -68,6 +68,16 @@ class RuntimeContractTests(unittest.TestCase):
         errors = _errors(container)
 
         self.assertTrue(any("GPU DeviceRequest" in error for error in errors))
+
+    def test_rejects_external_or_additional_backend_binding(self):
+        for address in ("", "0.0.0.0", "::", "localhost"):
+            for extra in (False, True):
+                container = _container()
+                bindings = container["HostConfig"]["PortBindings"]["11435/tcp"]
+                if not extra:
+                    bindings.clear()
+                bindings.append({"HostIp": address, "HostPort": "11435"})
+                self.assertTrue(any("PortBinding" in error for error in _errors(container)))
 
     def test_rejects_wrong_volume(self):
         container = _container()

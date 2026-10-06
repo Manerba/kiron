@@ -77,10 +77,12 @@ class _FakeRun:
 
 
 class _FakeAsyncClient:
-    def __init__(self, response=None, exc: Exception | None = None):
+    def __init__(self, response=None, exc: Exception | None = None, *, completed=False):
         self.response = response
         self.exc = exc
         self.posts = []
+        self.completed = completed
+        self.headers = None
 
     async def __aenter__(self):
         return self
@@ -88,10 +90,13 @@ class _FakeAsyncClient:
     async def __aexit__(self, exc_type, exc, tb):
         return False
 
-    async def post(self, url, json=None):
+    async def post(self, url, json=None, headers=None):
         self.posts.append((url, json))
+        self.headers = headers
         if self.exc is not None:
             raise self.exc
+        if self.completed:
+            self.response.headers[app_module.COMPLETION_HEADER] = headers[app_module.OPERATION_HEADER]
         return self.response
 
 
@@ -189,9 +194,9 @@ class AppGpuServiceMarkerTests(unittest.IsolatedAsyncioTestCase):
             self.app_mod.vram_lease.GPU_SERVICE_LOADING_MARKER_PATH.exists()
         )
 
-    async def test_embedding_load_clearable_4xx_clears_marker(self):
+    async def test_embedding_load_matching_completion_clears_marker(self):
         fake = _FakeAsyncClient(
-            httpx.Response(404, json={"error": "missing"})
+            httpx.Response(404, json={"error": "missing"}), completed=True,
         )
         with mock.patch.object(self.app_mod.httpx, "AsyncClient", return_value=fake):
             resp = await self.app_mod.load_embedding_model({
@@ -202,6 +207,26 @@ class AppGpuServiceMarkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(
             self.app_mod.vram_lease.GPU_SERVICE_LOADING_MARKER_PATH.exists()
         )
+        self.assertEqual(set(fake.headers), {self.app_mod.OPERATION_HEADER, self.app_mod.OVERLAY_HEADER})
+
+    async def test_embedding_load_error_with_completion_releases_parent_reservation(self):
+        fake = _FakeAsyncClient(httpx.Response(500, json={"error": "finished"}), completed=True)
+        with mock.patch.object(self.app_mod.httpx, "AsyncClient", return_value=fake):
+            response = await self.app_mod.load_embedding_model({"model": "nomic-embed-text"})
+        self.assertEqual(response.status_code, 500)
+        self.assertFalse(self.app_mod.vram_lease.GPU_SERVICE_LOADING_MARKER_PATH.exists())
+        from native_admission import make_store
+        self.assertEqual(make_store().snapshot(), ())
+
+    async def test_embedding_load_unmatched_completion_cannot_release_parent(self):
+        fake = _FakeAsyncClient(httpx.Response(200, json={"status": "ok"},
+            headers={self.app_mod.COMPLETION_HEADER: "f" * 32}))
+        with mock.patch.object(self.app_mod.httpx, "AsyncClient", return_value=fake):
+            response = await self.app_mod.load_embedding_model({"model": "nomic-embed-text"})
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(self.app_mod.vram_lease.GPU_SERVICE_LOADING_MARKER_PATH.exists())
+        from native_admission import make_store
+        self.assertEqual(make_store().snapshot()[0].phase, "unknown")
 
     async def test_embedding_stop_already_inactive_clears_marker(self):
         with mock.patch.object(
@@ -216,15 +241,15 @@ class AppGpuServiceMarkerTests(unittest.IsolatedAsyncioTestCase):
             self.app_mod.vram_lease.GPU_SERVICE_LOADING_MARKER_PATH.exists()
         )
 
-    async def test_deberta_unload_5xx_leaves_marker_ttl(self):
+    async def test_deberta_unload_5xx_creates_no_allocation_marker(self):
         fake = _FakeAsyncClient(
             httpx.Response(500, json={"error": "boom"})
         )
         with mock.patch.object(self.app_mod.httpx, "AsyncClient", return_value=fake):
-            resp = await self.app_mod.unload_deberta_model({})
+            resp = await self.app_mod.unload_deberta_model({"model": "bge-reranker-v2-m3"})
 
         self.assertEqual(_json_status(resp), 500)
-        self.assertTrue(
+        self.assertFalse(
             self.app_mod.vram_lease.GPU_SERVICE_LOADING_MARKER_PATH.exists()
         )
 

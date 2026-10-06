@@ -12,6 +12,8 @@ import pytest
 
 import capabilities
 import config
+from kiron_common.gpu_admission import AdmissionStore, MemorySnapshot, RuntimeSecurity
+import time
 
 
 FIXED_NOW = datetime(2026, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
@@ -993,11 +995,17 @@ def _probe(tmp_path, *, maintenance_active=False, marker_payload=None, ollama_pa
             raise OSError("unreachable")
         return FakeResponse(ollama_payload)
 
+    admission_root = tmp_path / "vram"
+    admission_root.mkdir(exist_ok=True)
+    admission_root.chmod(0o2770)
+    admission = AdmissionStore(admission_root,
+                              security=RuntimeSecurity(os.geteuid(), os.getegid(), frozenset({os.geteuid()})))
     return capabilities.InferenceConflictProbe(
         marker_paths={"gpu_service_loading": marker},
         maintenance_path=maintenance,
         urlopen=fake_urlopen,
         wall_time_fn=lambda: 100.0,
+        admission_store=admission,
     )
 
 
@@ -1010,6 +1018,18 @@ def test_inference_probe_reports_maintenance_before_other_sources(tmp_path):
 
     assert result.status == "maintenance"
     assert result.maintenance == "active"
+
+
+def test_inference_probe_blocks_shared_unknown_or_resident_tickets(tmp_path):
+    probe = _probe(tmp_path, maintenance_active=False, ollama_payload={"models": []})
+    store = probe._admission_store
+    store.reserve(operation_id="prism", owner="prism", generation="child", deployment_id="bonsai",
+                  kind="load", gpu_bytes=0, host_bytes=0,
+                  measure=lambda: MemorySnapshot(1, 1, time.monotonic()))
+    store.transition("prism", owner="prism", expected_generation="child", phase="resident")
+    assert probe.probe().status == "gpu_marker_active"
+    store.release("prism", owner="prism", generation="child", confirmed_terminated=False)
+    assert probe.probe().status == "gpu_marker_active"
 
 
 def test_inference_probe_reports_active_gpu_marker(tmp_path):

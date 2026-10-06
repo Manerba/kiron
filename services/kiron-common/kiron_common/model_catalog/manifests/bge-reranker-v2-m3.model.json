@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "canonical_model_id": "bge-reranker-v2-m3",
   "aliases": [
     "BAAI/bge-reranker-v2-m3"
@@ -24,11 +24,14 @@
         "weights": [
           {
             "path": "model.safetensors",
-            "sha256": "d9e3e081faff1eefb84019509b2f5558fd74c1a05a2c7db22f74174fcedb5286"
+            "sha256": "d9e3e081faff1eefb84019509b2f5558fd74c1a05a2c7db22f74174fcedb5286",
+            "size_bytes": null
           }
         ],
         "auxiliary": [],
-        "metadata": {}
+        "metadata": {},
+        "format": "hf_weights",
+        "projector": null
       },
       "routes": [
         {
@@ -52,9 +55,15 @@
           "display_order": 3,
           "labels": null,
           "rerank_label": null,
-          "size": 2271071852
+          "size": 2271071852,
+          "gpu_memory": {
+            "load_bytes": 2415919104,
+            "request_bytes": 1073741824,
+            "headroom_bytes": 268435456
+          }
         }
-      }
+      },
+      "runtime_profile": null
     }
   ],
   "profiles": [

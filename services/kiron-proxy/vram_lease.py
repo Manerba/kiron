@@ -24,11 +24,14 @@ import pwd
 import stat
 import time
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any
 
 import httpx
+
+from kiron_common.gpu_admission import AdmissionError, RuntimeSecurity, runtime_lock
+from kiron_common.gpu_admission.native_contract import NativeMemoryBudget
 
 from kiron_common.model_catalog import BackendType, ModelEndpoint, ModelTask
 from kiron_common.ollama_compat import ensure_num_gpu_zero, is_real_int
@@ -171,6 +174,12 @@ class GPUServiceOperation:
     token: str | None = None
     clear_marker: bool = False
     lock_acquired: bool = False
+    admission_store: Any = None
+    admission_id: str | None = None
+    admission_generation: str | None = None
+    admission_heartbeat: Any = None
+    cleanup_task: Any = None
+    backend_session: Any = None
 
 
 # --- Module-State ---
@@ -179,6 +188,7 @@ _lease_cache: dict[str, float | bool] = {"active": False, "ts": 0.0}
 _lease_fetch_lock = asyncio.Lock()
 gpu_service_ops_lock = asyncio.Lock()
 _shared_client: httpx.AsyncClient | None = None
+_SERVICE_OPERATION_EPOCH = "native-lifecycle:" + uuid.uuid4().hex
 
 _last_unreachable_log_ts: float = 0.0
 _last_pass_warning_log_ts: float = 0.0
@@ -597,6 +607,39 @@ def _write_marker_payload(path: Path, payload: dict[str, Any]) -> None:
 def write_overlay_marker(
     kind: str = "startup", *, ttl_s: float = 300.0, token: str | None = None,
 ) -> str:
+    path = _marker_path(kind)
+    path.parent.mkdir(parents=True, mode=RUNTIME_MARKER_DIR_MODE, exist_ok=True)
+    try:
+        with runtime_lock(path.parent, security=_admission_security()):
+            return write_overlay_marker_locked(kind, ttl_s=ttl_s, token=token)
+    except AdmissionError as exc:
+        raise MarkerOwnershipError(str(exc)) from exc
+
+
+def clear_overlay_marker(kind: str = "startup", token: str | None = None) -> None:
+    if token is None:
+        return
+    path = _marker_path(kind)
+    try:
+        with runtime_lock(path.parent, security=_admission_security()):
+            clear_overlay_marker_locked(kind, token)
+    except AdmissionError as exc:
+        raise MarkerOwnershipError(str(exc)) from exc
+
+
+def _admission_security() -> RuntimeSecurity:
+    gid = _runtime_marker_group_gid()
+    if gid is None:
+        raise AdmissionError("resource_unknown", "runtime marker group missing")
+    # The global lock may be created by any participating runtime service.
+    system_writers = RuntimeSecurity.system().writer_uids
+    return RuntimeSecurity(_runtime_marker_dir_owner_uid(), gid,
+                           _runtime_marker_file_owner_uids() | system_writers)
+
+
+def write_overlay_marker_locked(
+    kind: str = "startup", *, ttl_s: float = 300.0, token: str | None = None,
+) -> str:
     """Atomically write an owned effective-gate overlay marker.
 
     Active foreign, tokenless, malformed or unsafe markers fail closed and are
@@ -639,7 +682,7 @@ def refresh_overlay_marker(kind: str, token: str, *, ttl_s: float = 300.0) -> bo
         return False
 
 
-def clear_overlay_marker(kind: str = "startup", token: str | None = None) -> None:
+def clear_overlay_marker_locked(kind: str = "startup", token: str | None = None) -> None:
     """Remove overlay marker only if ownership token matches."""
     path = _marker_path(kind)
     if token is None:
@@ -818,6 +861,9 @@ async def gpu_service_operation(
     force: bool = False,
     service_name: str = "GPU-Service",
     marker_ttl_s: float = GPU_SERVICE_LOADING_TTL_S,
+    releases_resources: bool = False,
+    serialize_release: bool = False,
+    gpu_memory: NativeMemoryBudget | None = None,
 ):
     """Serialize a marker-led GPU service operation in the proxy process.
 
@@ -828,6 +874,9 @@ async def gpu_service_operation(
         force=force,
         service_name=service_name,
         marker_ttl_s=marker_ttl_s,
+        releases_resources=releases_resources,
+        serialize_release=serialize_release,
+        gpu_memory=gpu_memory,
     )
     try:
         yield op
@@ -840,9 +889,24 @@ async def begin_gpu_service_operation(
     force: bool = False,
     service_name: str = "GPU-Service",
     marker_ttl_s: float = GPU_SERVICE_LOADING_TTL_S,
+    releases_resources: bool = False,
+    serialize_release: bool = False,
+    gpu_memory: NativeMemoryBudget | None = None,
 ) -> GPUServiceOperation:
+    # Stop/unload/delete cannot allocate a new model and must remain available
+    # when another provider owns admission. Delete alone keeps its atomic
+    # loaded-check/delete sequence; stop/unload must interrupt a stuck request.
+    if releases_resources:
+        if serialize_release:
+            await gpu_service_ops_lock.acquire()
+        return GPUServiceOperation(True, GPUGateDecision(True, "resource_release",
+                                   service_name=service_name), lock_acquired=serialize_release)
     await gpu_service_ops_lock.acquire()
-    decision = await gpu_gate_decision(force=force, service_name=service_name)
+    try:
+        decision = await gpu_gate_decision(force=force, service_name=service_name)
+    except BaseException:
+        gpu_service_ops_lock.release()
+        raise
     if not decision.allowed:
         gpu_service_ops_lock.release()
         return GPUServiceOperation(False, decision)
@@ -873,17 +937,83 @@ async def begin_gpu_service_operation(
         )
         op.clear_marker = True
         await finish_gpu_service_operation(op)
+        return op
+    try:
+        # Lazy import avoids a module cycle; this creates no service at import.
+        from native_admission import make_store, measure_memory
+        store = make_store()
+        if service_name == "Ollama":
+            from kiron_common.gpu_admission.ollama_backend import OllamaBackendSession
+            op.backend_session = OllamaBackendSession(store)
+            await op.backend_session.__aenter__()
+        operation_id = uuid.uuid4().hex
+        # Model-specific loads reserve the Catalog budget. Other lifecycle
+        # operations remain unmeasured and conflict with managed Prism residency.
+        store.reserve(operation_id=operation_id, owner="kiron-proxy-lifecycle",
+            generation=_SERVICE_OPERATION_EPOCH, deployment_id=f"native-lifecycle:{service_name}",
+            kind="request", gpu_bytes=gpu_memory.additional_bytes(loading=True) if gpu_memory else 0,
+            headroom_bytes=gpu_memory.headroom_bytes if gpu_memory else 0,
+            host_bytes=0, measure=measure_memory,
+            owned_overlays={"gpu-service-loading.json": token},
+            backend_instance=op.backend_session.instance if op.backend_session else None,
+            overlay_token=token,
+            conflicting_resident_slots=("prism",))
+        op.admission_store, op.admission_id = store, operation_id
+        op.admission_generation = _SERVICE_OPERATION_EPOCH
+        op.admission_heartbeat = asyncio.create_task(_heartbeat_service_operation(op))
+    except AdmissionError as exc:
+        op.allowed = False
+        op.decision = GPUGateDecision(False, exc.code,
+            status_code=409 if exc.code == "resource_conflict" else 503,
+            lease_state="admission", service_name=service_name)
+        op.clear_marker = True  # The caller has not started any backend work.
+        await finish_gpu_service_operation(op)
+    except BaseException:
+        op.clear_marker = True
+        await finish_gpu_service_operation(op)
+        raise
     return op
 
 
-async def finish_gpu_service_operation(op: GPUServiceOperation) -> None:
+async def _heartbeat_service_operation(op: GPUServiceOperation) -> None:
     try:
-        if op.clear_marker and op.token is not None:
-            clear_overlay_marker("gpu_service_loading", op.token)
+        while True:
+            await asyncio.sleep(60)
+            op.admission_store.heartbeat(op.admission_id, owner="kiron-proxy-lifecycle",
+                                        generation=op.admission_generation)
+    except AdmissionError:
+        logger.error("Native lifecycle admission heartbeat became unknown")
+
+
+async def _finish_gpu_service_operation(op: GPUServiceOperation) -> None:
+    try:
+        if op.admission_heartbeat is not None:
+            op.admission_heartbeat.cancel()
+            with suppress(asyncio.CancelledError):
+                await op.admission_heartbeat
+        if op.admission_id is not None:
+            # clear_marker is an endpoint-specific end/no-start proof, not
+            # merely return from an HTTP handler. Timeout/cancel stays unknown.
+            op.admission_store.release(op.admission_id, owner="kiron-proxy-lifecycle",
+                generation=op.admission_generation, confirmed_terminated=op.clear_marker,
+                owned_overlays=({"gpu-service-loading.json": op.token}
+                                if op.clear_marker and op.token else None))
     finally:
-        if op.lock_acquired:
-            op.lock_acquired = False
-            gpu_service_ops_lock.release()
+        try:
+            if op.clear_marker and op.token is not None:
+                clear_overlay_marker("gpu_service_loading", op.token)
+        finally:
+            if op.backend_session is not None:
+                op.backend_session.close()
+            if op.lock_acquired:
+                op.lock_acquired = False
+                gpu_service_ops_lock.release()
+
+
+async def finish_gpu_service_operation(op: GPUServiceOperation) -> None:
+    if op.cleanup_task is None:
+        op.cleanup_task = asyncio.create_task(_finish_gpu_service_operation(op))
+    await asyncio.shield(op.cleanup_task)
 
 
 # --- Interne Helfer ---
@@ -953,6 +1083,26 @@ def _embed_outcome(
 
 # --- Public Intercept-Helfer ---
 
+def is_native_unload(body: bytes, path: str) -> bool:
+    """Recognize only the no-inference Ollama generate release payload.
+
+    Inference with keep_alive=0 must still reserve GPU resources. Unknown keys,
+    options, nonempty prompts and chat messages cannot enter this exemption.
+    """
+    if path != "/api/generate":
+        return False
+    try:
+        value = json.loads(body)
+    except (ValueError, UnicodeError):
+        return False
+    return (isinstance(value, dict)
+            and not set(value) - {"model", "keep_alive", "stream", "prompt", "think"}
+            and isinstance(value.get("model"), str) and bool(value["model"])
+            and type(value.get("keep_alive")) is int and value["keep_alive"] == 0
+            and value.get("stream") is False and value.get("prompt", "") == ""
+            and value.get("think", False) is False)
+
+
 async def apply_bytes(
     body: bytes,
     path: str,
@@ -979,6 +1129,8 @@ async def apply_bytes(
     """
     if not isinstance(routing_view, ProxyRoutingView):
         raise TypeError("routing_view must be a ProxyRoutingView")
+    if is_native_unload(body, path):
+        return body, LeaseOutcome.PASS
     normalized_path = path
     is_embed = normalized_path == "/api/embed"
     if normalized_path not in STREAMING_INTERCEPT_PATHS and not is_embed:

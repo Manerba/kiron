@@ -506,9 +506,9 @@ def _validate_limits(raw: object, path: str, verified: bool) -> None:
         _fail(f"{path}/unit", "invalid unit")
     if value["counting"] != "after_server_formatting_including_special_tokens":
         _fail(f"{path}/counting", "invalid counting rule")
-    if value["truncation"] not in ("right", "unknown"):
+    if value["truncation"] not in ("right", "none", "unknown"):
         _fail(f"{path}/truncation", "invalid truncation rule")
-    if value["overflow"] not in ("truncate", "late_chunk_fallback", "unknown"):
+    if value["overflow"] not in ("truncate", "late_chunk_fallback", "reject", "unknown"):
         _fail(f"{path}/overflow", "invalid overflow rule")
     by_role = _require_mapping(value["by_role"], f"{path}/by_role")
     if set(by_role) != set(ROLES):
@@ -523,9 +523,8 @@ def _validate_limits(raw: object, path: str, verified: bool) -> None:
             _fail(f"{path}/by_role/{role}", "must be a positive safe integer or null")
         if verified and limit is None:
             _fail(f"{path}/by_role/{role}", "verified profiles require a limit")
-    if verified and (
-        value["truncation"] != "right"
-        or value["overflow"] not in ("truncate", "late_chunk_fallback")
+    if verified and (value["truncation"], value["overflow"]) not in (
+        ("right", "truncate"), ("right", "late_chunk_fallback"), ("none", "reject"),
     ):
         _fail(path, "verified profiles require a known input-limit policy")
 

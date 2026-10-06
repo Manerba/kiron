@@ -113,6 +113,8 @@ class PublishRunnerError(RuntimeError):
 class FakeRunner:
     """Cooperative fake runner for executor tests; it performs no I/O."""
 
+    backend_terminated = True  # This runner never owns a backend process.
+
     def __init__(
         self,
         *,
@@ -166,6 +168,28 @@ class SftSubprocessRunner:
 
     def __init__(self, cfg: object) -> None:
         self.cfg = cfg
+        self._process = None
+        self._spawn_attempted = False
+        self._job_uid = None
+
+    @property
+    def backend_terminated(self) -> bool:
+        if not self._spawn_attempted:
+            return True
+        proc = self._process
+        if proc is None or proc.returncode is None:
+            return False
+        try:
+            if not _owned_process_scan_confirms_absence(proc.pid, job_uid=self._job_uid):
+                return False
+            # The subprocess is its session/group leader. Do not signal a
+            # possibly reused PID here; any extant group is conservatively busy.
+            os.killpg(proc.pid, 0)
+        except ProcessLookupError:
+            return True
+        except (OSError, ValueError):
+            return False
+        return False
 
     async def run(self, job: Any, cancel_event: asyncio.Event) -> RunnerOutcome:
         proc: asyncio.subprocess.Process | None = None
@@ -198,6 +222,8 @@ class SftSubprocessRunner:
             catalog_path=catalog_path,
         )
         try:
+            self._spawn_attempted = True
+            self._job_uid = str(job.job_uid)
             proc = await asyncio.create_subprocess_exec(
                 *command,
                 cwd=job_dir,
@@ -207,6 +233,7 @@ class SftSubprocessRunner:
                 stderr=asyncio.subprocess.DEVNULL,
                 start_new_session=True,
             )
+            self._process = proc
         except Exception:
             return RunnerOutcome(
                 "failed",
@@ -1040,6 +1067,41 @@ def _runner_process_pids(root_pid: int, *, job_uid: str) -> list[int]:
             *_job_env_pids(job_uid),
         ]
     )
+
+
+def _owned_process_scan_confirms_absence(root_pid: int, *, job_uid: str,
+                                        proc_root: Path = Path("/proc")) -> bool:
+    """Require complete observations of this service UID before releasing work.
+
+    Foreign UIDs cannot be trainer descendants under the unit's non-root,
+    NoNewPrivileges/empty-capability contract. Unknown ownership or unreadable
+    own-process evidence is not proof of absence. The signalling scan above
+    remains best-effort; it must not be used as a positive end proof.
+    """
+    marker = f"KITT_JOB_UID={job_uid}".encode("utf-8", errors="strict")
+    uid, own_pid = os.geteuid(), os.getpid()
+    try:
+        entries = tuple(proc_root.iterdir())
+    except OSError:
+        return False
+    for entry in entries:
+        if not entry.name.isdigit() or int(entry.name) in {own_pid, 1}:
+            continue
+        try:
+            if entry.stat().st_uid != uid:
+                continue
+            fields = (entry / "stat").read_text(encoding="utf-8").rsplit(")", 1)[1].split()
+            parent, group = int(fields[1]), int(fields[2])
+            with (entry / "environ").open("rb") as stream:
+                environment = stream.read(1024 * 1024 + 1)
+        except FileNotFoundError:
+            continue  # A process disappearing during observation has ended.
+        except (OSError, UnicodeError, IndexError, ValueError):
+            return False
+        if (len(environment) > 1024 * 1024 or parent == root_pid or group == root_pid
+                or marker in environment.split(b"\0")):
+            return False
+    return True
 
 
 def _process_tree_pids(root_pid: int) -> list[int]:

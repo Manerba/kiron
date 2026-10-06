@@ -28,3 +28,4 @@ fi
 echo "Systemd-Units installiert. Aktivieren mit:"
 echo "  systemctl enable --now kiron-proxy kiron-docling kiron-embeddings kiron-deberta"
 echo "  systemctl enable --now kitt-worker   # erst nach Operatorfreigabe"
+echo "  systemctl enable --now kiron-prism  # erst nach geprueftem Binarybundle, Policy und venv"

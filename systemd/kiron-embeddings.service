@@ -8,7 +8,7 @@ StartLimitIntervalSec=300
 Type=simple
 User=kiron-embeddings
 Group=kiron-embeddings
-SupplementaryGroups=kiron-models kiron-config kiron-common video render
+SupplementaryGroups=kiron-models kiron-config kiron-common kiron-runtime video render
 WorkingDirectory=/usr/lib/kiron/services/kiron-embeddings
 ExecStart=/usr/lib/kiron/services/kiron-embeddings/venv/bin/python main.py
 Restart=always
@@ -19,13 +19,16 @@ Environment=HF_HOME=/var/cache/kiron/huggingface
 Environment=HF_HUB_CACHE=/var/cache/kiron/huggingface/hub
 Environment=SENTENCE_TRANSFORMERS_HOME=/var/cache/kiron/huggingface/sentence-transformers
 Environment=XDG_CACHE_HOME=/var/cache/kiron
+Environment=TRITON_CACHE_DIR=/var/cache/kiron-embeddings/triton
 Environment=HF_HUB_OFFLINE=1
 Environment=TRANSFORMERS_OFFLINE=1
+CacheDirectory=kiron-embeddings
+CacheDirectoryMode=0750
 UMask=0027
 PrivateTmp=true
 ProtectHome=true
 ProtectSystem=strict
-ReadWritePaths=/var/cache/kiron/huggingface
+ReadWritePaths=/var/cache/kiron/huggingface /run/kiron/vram
 RestrictSUIDSGID=true
 LockPersonality=true
 NoNewPrivileges=true

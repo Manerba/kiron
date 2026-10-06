@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
+import hashlib
+import dashboard_runtime
 import os
 from pathlib import Path
 import sys
@@ -10,6 +13,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import app as app_module  # noqa: E402
 
 from kiron_common.local_model_registry import (  # noqa: E402
+    GGUFLocalValidator,
     HuggingFaceLocalValidator,
     LocalLoaderMetadata,
     ModelRegistrationService,
@@ -32,9 +36,10 @@ def _service(
     return ModelRegistrationService(
         RuntimeModelRegistry(path),
         RegistrationValidators(
+            gguf=GGUFLocalValidator(model_root=model_root or path.parent, profiles={}),
             ollama=OllamaLocalValidator(
                 list_models=lambda: {
-                    "models": [{"name": name} for name in names]
+                    "models": [{"name": name, "digest": "sha256:" + "a" * 64} for name in names]
                 },
                 show_model=lambda name: {"model": name, "details": {}},
             ),
@@ -55,7 +60,7 @@ class _LocalOllama:
 
     def list_models(self) -> object:
         self.calls.append(("list", None))
-        return {"models": [{"name": name} for name in self.names]}
+        return {"models": [{"name": name, "digest": "sha256:" + "a" * 64} for name in self.names]}
 
     def show_model(self, name: str) -> object:
         self.calls.append(("show", name))
@@ -84,10 +89,23 @@ def _hf_model(path: Path, *, weights: bool = True) -> Path:
     return path
 
 
+def _candidate(provider, reference):
+    return hashlib.sha256((provider + "\0" + reference).encode()).hexdigest()
+
+
+def _assert_registration_parity(dashboard, cli, *, not_before):
+    model = dashboard["model"]
+    assert not_before <= datetime.fromisoformat(model["registered_at"]) <= datetime.now(timezone.utc)
+    assert model["id"] == cli["model"]["id"]
+    for key in ("runtime_provider", "artifact_origin", "artifact_format", "loader", "display_name"):
+        assert model[key] == cli["model"][key]
+    assert "reference" not in model and "sha256" not in model
+
+
 def test_dashboard_registration_is_basic_protected() -> None:
     response = TestClient(app_module.app).post(
         "/api/models/register",
-        json={"provider": "ollama", "reference": "demo"},
+        json={"runtime_provider": "ollama", "reference": "demo"},
     )
     assert response.status_code == 401
     assert response.headers["www-authenticate"].startswith("Basic ")
@@ -121,9 +139,9 @@ def test_dashboard_lists_only_unknown_local_registration_candidates(
         ),
         model_root=model_root,
     )
-    service.register_model(provider="ollama", reference="already")
+    service.register_model(runtime_provider="ollama", reference="already")
     service.register_model(
-        provider="huggingface",
+        runtime_provider="kiron_embeddings",
         reference=str(registered_hf),
         loader="sentence_transformers",
     )
@@ -133,26 +151,26 @@ def test_dashboard_lists_only_unknown_local_registration_candidates(
         response = TestClient(app_module.app).get(
             "/api/models/registration-candidates",
             auth=("admin", "admin"),
+            headers={"X-Kiron-Action": "models"},
         )
     finally:
         app_module.set_model_registration_service(previous)
 
     assert response.status_code == 200
-    assert response.json() == {
-        "status": "ok",
-        "candidates": [
-            {
-                "provider": "huggingface",
-                "reference": str(available_hf),
-                "display_name": "available-hf",
-            },
-            {
-                "provider": "ollama",
-                "reference": "qwen3.5:latest",
-                "display_name": "qwen3.5:latest",
-            },
-        ],
+    body = response.json()
+    assert body["status"] == "ok"
+    assert body["errors"] == {}
+    observed = {(row["runtime_provider"], row["candidate_id"]): row for row in body["candidates"]}
+    assert str(tmp_path) not in response.text
+    assert set(observed) == {
+        ("kiron_embeddings", _candidate("kiron_embeddings", str(available_hf))),
+        ("kiron_deberta", _candidate("kiron_deberta", str(available_hf))),
+        ("kiron_deberta", _candidate("kiron_deberta", str(registered_hf))),
+        ("ollama", _candidate("ollama", "qwen3.5:latest")),
     }
+    assert observed[("kiron_embeddings", _candidate("kiron_embeddings", str(available_hf)))]["artifact_format"] == "hf_weights"
+    assert observed[("ollama", _candidate("ollama", "qwen3.5:latest"))]["artifact_origin"] == "ollama"
+
 
 
 def test_dashboard_json_framework_boundary_is_fastapi_422() -> None:
@@ -161,12 +179,13 @@ def test_dashboard_json_framework_boundary_is_fastapi_422() -> None:
     missing = client.post(
         "/api/models/register",
         auth=("admin", "admin"),
+            headers={"X-Kiron-Action": "models"},
     )
     malformed = client.post(
         "/api/models/register",
         auth=("admin", "admin"),
-        content=b'{"provider":',
-        headers={"content-type": "application/json"},
+        content=b'{"runtime_provider":',
+        headers={"content-type": "application/json", "X-Kiron-Action": "models"},
     )
 
     assert missing.status_code == 422
@@ -182,15 +201,17 @@ def test_dashboard_and_cli_return_the_same_entry_and_domain_errors(
     app_module.set_model_registration_service(dashboard)
     try:
         client = TestClient(app_module.app)
+        registration_started = datetime.now(timezone.utc)
         response = client.post(
             "/api/models/register",
             auth=("admin", "admin"),
-            json={"provider": "ollama", "reference": "demo:q4_0"},
+            headers={"X-Kiron-Action": "models"},
+            json={"candidate_id": _candidate("ollama", "Demo:Q4_0")},
         )
         cli_code, cli_payload = run_cli(
             [
                 "register",
-                "--provider",
+                "--runtime-provider",
                 "ollama",
                 "--reference",
                 "demo:q4_0",
@@ -200,7 +221,8 @@ def test_dashboard_and_cli_return_the_same_entry_and_domain_errors(
         )
         assert response.status_code == 201
         assert cli_code == 0
-        assert response.json() == cli_payload
+        _assert_registration_parity(response.json(), cli_payload, not_before=registration_started)
+        assert dashboard.list_models()[0].sha256 == "a" * 64
 
         missing_dashboard = _service(
             tmp_path / "missing-dashboard.json",
@@ -211,12 +233,13 @@ def test_dashboard_and_cli_return_the_same_entry_and_domain_errors(
         response = client.post(
             "/api/models/register",
             auth=("admin", "admin"),
-            json={"provider": "ollama", "reference": "missing"},
+            headers={"X-Kiron-Action": "models"},
+            json={"candidate_id": _candidate("ollama", "missing:latest")},
         )
         cli_code, cli_payload = run_cli(
             [
                 "register",
-                "--provider",
+                "--runtime-provider",
                 "ollama",
                 "--reference",
                 "missing",
@@ -243,14 +266,15 @@ def test_dashboard_registration_persists_for_a_new_service_instance(
         response = TestClient(app_module.app).post(
             "/api/models/register",
             auth=("admin", "admin"),
-            json={"provider": "ollama", "reference": "persisted"},
+            headers={"X-Kiron-Action": "models"},
+            json={"candidate_id": _candidate("ollama", "persisted:latest")},
         )
         assert response.status_code == 201
     finally:
         app_module.set_model_registration_service(previous)
 
     restarted = _service(path, names=("persisted:latest",))
-    assert [entry.to_dict() for entry in restarted.list_models()] == [
+    assert [dashboard_runtime.public_registration(entry) for entry in restarted.list_models()] == [
         response.json()["model"]
     ]
 
@@ -267,20 +291,21 @@ def test_dashboard_and_cli_share_hf_canonicalization_and_domain_errors(
         dashboard = _composed_service(tmp_path / "dashboard-valid.json")
         cli = _composed_service(tmp_path / "cli-valid.json")
         app_module.set_model_registration_service(dashboard)
+        registration_started = datetime.now(timezone.utc)
         response = client.post(
             "/api/models/register",
             auth=("admin", "admin"),
+            headers={"X-Kiron-Action": "models"},
             json={
-                "provider": "huggingface",
-                "reference": str(valid),
+                "candidate_id": _candidate("kiron_embeddings", str(valid)),
                 "loader": "sentence_transformers",
             },
         )
         cli_code, cli_payload = run_cli(
             [
                 "register",
-                "--provider",
-                "huggingface",
+                "--runtime-provider",
+                "kiron_embeddings",
                 "--reference",
                 str(valid),
                 "--loader",
@@ -291,22 +316,22 @@ def test_dashboard_and_cli_share_hf_canonicalization_and_domain_errors(
         )
         assert response.status_code == 201
         assert cli_code == 0
-        assert response.json() == cli_payload
+        _assert_registration_parity(response.json(), cli_payload, not_before=registration_started)
 
         duplicate_response = client.post(
             "/api/models/register",
             auth=("admin", "admin"),
+            headers={"X-Kiron-Action": "models"},
             json={
-                "provider": "huggingface",
-                "reference": str(valid),
+                "candidate_id": _candidate("kiron_embeddings", str(valid)),
                 "loader": "sentence_transformers",
             },
         )
         duplicate_code, duplicate_payload = run_cli(
             [
                 "register",
-                "--provider",
-                "huggingface",
+                "--runtime-provider",
+                "kiron_embeddings",
                 "--reference",
                 str(valid),
                 "--loader",
@@ -315,9 +340,10 @@ def test_dashboard_and_cli_share_hf_canonicalization_and_domain_errors(
             service=cli,
             effective_uid=0,
         )
-        assert duplicate_response.status_code == 409
+        assert duplicate_response.status_code == 404
         assert duplicate_code == 3
-        assert duplicate_response.json()["error"] == duplicate_payload["error"]
+        assert duplicate_response.json()["error"]["code"] == "model_not_found"
+        assert duplicate_payload["error"]["code"] == "duplicate_model"
 
         for index, (reference, expected_status, expected_code) in enumerate(
             (
@@ -333,17 +359,17 @@ def test_dashboard_and_cli_share_hf_canonicalization_and_domain_errors(
             response = client.post(
                 "/api/models/register",
                 auth=("admin", "admin"),
+            headers={"X-Kiron-Action": "models"},
                 json={
-                    "provider": "huggingface",
-                    "reference": str(reference),
+                    "candidate_id": _candidate("kiron_embeddings", str(reference)),
                     "loader": "sentence_transformers",
                 },
             )
             cli_code, cli_payload = run_cli(
                 [
                     "register",
-                    "--provider",
-                    "huggingface",
+                    "--runtime-provider",
+                    "kiron_embeddings",
                     "--reference",
                     str(reference),
                     "--loader",
@@ -354,8 +380,8 @@ def test_dashboard_and_cli_share_hf_canonicalization_and_domain_errors(
             )
             assert response.status_code == expected_status
             assert cli_code == 3
-            assert response.json()["error"] == cli_payload["error"]
             assert response.json()["error"]["code"] == expected_code
+            assert cli_payload["error"]["code"] == expected_code
     finally:
         app_module.set_model_registration_service(previous)
 
@@ -372,7 +398,8 @@ def test_shared_registry_survives_new_dashboard_and_cli_service_instances(
         response = TestClient(app_module.app).post(
             "/api/models/register",
             auth=("admin", "admin"),
-            json={"provider": "ollama", "reference": "shared"},
+            headers={"X-Kiron-Action": "models"},
+            json={"candidate_id": _candidate("ollama", "shared:latest")},
         )
         assert response.status_code == 201
 
@@ -383,13 +410,13 @@ def test_shared_registry_survives_new_dashboard_and_cli_service_instances(
             effective_uid=0,
         )
         assert code == 0
-        assert listed["models"] == [response.json()["model"]]
+        assert [model["id"] for model in listed["models"]] == [response.json()["model"]["id"]]
 
         code, registered_hf = run_cli(
             [
                 "register",
-                "--provider",
-                "huggingface",
+                "--runtime-provider",
+                "kiron_deberta",
                 "--reference",
                 str(valid),
                 "--loader",
@@ -403,10 +430,10 @@ def test_shared_registry_survives_new_dashboard_and_cli_service_instances(
         restarted_dashboard = _composed_service(path, names=("shared:latest",))
         app_module.set_model_registration_service(restarted_dashboard)
         assert [
-            entry.to_dict()
+            dashboard_runtime.public_registration(entry)
             for entry in app_module.get_model_registration_service().list_models()
         ] == sorted(
-            (response.json()["model"], registered_hf["model"]),
+            (response.json()["model"], dashboard_runtime.public_registration(restarted_cli.read_model(registered_hf["model"]["id"]))),
             key=lambda entry: entry["id"],
         )
     finally:
@@ -430,10 +457,11 @@ def test_corrupt_registry_is_fail_closed_with_surface_parity(
         response = TestClient(app_module.app).post(
             "/api/models/register",
             auth=("admin", "admin"),
-            json={"provider": "ollama", "reference": "local"},
+            headers={"X-Kiron-Action": "models"},
+            json={"candidate_id": _candidate("ollama", "local:latest")},
         )
         cli_code, cli_payload = run_cli(
-            ["register", "--provider", "ollama", "--reference", "local"],
+            ["register", "--runtime-provider", "ollama", "--reference", "local"],
             service=cli,
             effective_uid=0,
         )

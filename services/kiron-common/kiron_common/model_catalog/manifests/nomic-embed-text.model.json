@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "canonical_model_id": "nomic-embed-text:latest",
   "aliases": [
     "nomic-embed-text"
@@ -24,11 +24,14 @@
         "weights": [
           {
             "path": "model.safetensors",
-            "sha256": "9e7d262b1fe5ea350782829496efa831901b77486bbde1cea54a4c822d010d5c"
+            "sha256": "9e7d262b1fe5ea350782829496efa831901b77486bbde1cea54a4c822d010d5c",
+            "size_bytes": null
           }
         ],
         "auxiliary": [],
-        "metadata": {}
+        "metadata": {},
+        "format": "hf_weights",
+        "projector": null
       },
       "routes": [
         {
@@ -50,7 +53,8 @@
           "precision": null,
           "size": 274000000
         }
-      }
+      },
+      "runtime_profile": null
     },
     {
       "id": "kiron-nomic-late-v1.deployment",
@@ -58,7 +62,7 @@
         "type": "kiron_embeddings",
         "parameters": {
           "implementation": "kiron-late-chunking",
-          "implementation_revision": "v1",
+          "implementation_revision": "v2",
           "model_name": "nomic-embed-text"
         }
       },
@@ -71,11 +75,14 @@
         "weights": [
           {
             "path": "model.safetensors",
-            "sha256": "9e7d262b1fe5ea350782829496efa831901b77486bbde1cea54a4c822d010d5c"
+            "sha256": "9e7d262b1fe5ea350782829496efa831901b77486bbde1cea54a4c822d010d5c",
+            "size_bytes": null
           }
         ],
         "auxiliary": [],
-        "metadata": {}
+        "metadata": {},
+        "format": "hf_weights",
+        "projector": null
       },
       "routes": [
         {
@@ -97,7 +104,8 @@
           "precision": null,
           "size": 274000000
         }
-      }
+      },
+      "runtime_profile": null
     },
     {
       "id": "ollama-nomic-dense-v1.deployment",
@@ -118,11 +126,14 @@
         "weights": [
           {
             "path": "model",
-            "sha256": "970aa74c0a90ef7482477cf803618e776e173c007bf957f635f1015bfcfef0e6"
+            "sha256": "970aa74c0a90ef7482477cf803618e776e173c007bf957f635f1015bfcfef0e6",
+            "size_bytes": null
           }
         ],
         "auxiliary": [],
-        "metadata": {}
+        "metadata": {},
+        "format": "ollama_manifest",
+        "projector": null
       },
       "routes": [
         {
@@ -134,7 +145,8 @@
         "type": "ollama",
         "parameters": {}
       },
-      "metadata": {}
+      "metadata": {},
+      "runtime_profile": null
     }
   ],
   "profiles": [
@@ -211,7 +223,8 @@
             "runtime-pipeline:kiron-embeddings-nomic-prefix-mean-fp32-l2"
           ],
           "blocking_reasons": []
-        }
+        },
+        "created": 1790035200
       }
     },
     {
@@ -271,7 +284,8 @@
             "parameters": {
               "exclude_prefix_tokens": true,
               "exclude_special_tokens": true,
-              "overlap_assignment": "character_offsets"
+              "overlap_assignment": "character_offsets",
+              "special_token_detection": "tokenizer_all_special_ids"
             }
           },
           "normalization": {
@@ -280,20 +294,22 @@
             "scope": "vector"
           },
           "parameters": {
-            "empty_overlap_fallback": "dense_encode"
+            "empty_overlap_fallback": "dense_encode",
+            "empty_span_fallback": "dense_encode",
+            "partially_covered_chunks": "pool_visible_tokens",
+            "fallback_pooling": "attention_mask_mean_including_prefix_and_special_tokens"
           }
         },
         "verification": {
-          "status": "unverified",
+          "status": "verified",
           "evidence": [
             "hf-readme:nomic-ai/nomic-embed-text-v1.5@e9b6763023c676ca8431644204f50c2b100d9aab",
             "local-weight-sha256:9e7d262b1fe5ea350782829496efa831901b77486bbde1cea54a4c822d010d5c",
+            "reference-check:scripts/verify_nomic_late.py",
+            "reference-vectors:scripts/fixtures/nomic-late-v1.reference.json@sha256:02d12dd56ddc4c69899a7833c524baafcfeecaa94ba105ceda54f1953f77bb6e",
             "runtime-pipeline:kiron-embed-late-custom"
           ],
-          "blocking_reasons": [
-            "missing_reference_vector_for_chunk_overlap_and_fallback",
-            "missing_reference_vector_for_prefix_and_special_token_exclusion"
-          ]
+          "blocking_reasons": []
         }
       }
     },

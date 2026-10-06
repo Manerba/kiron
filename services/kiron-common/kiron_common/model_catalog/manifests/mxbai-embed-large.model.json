@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "canonical_model_id": "mxbai-embed-large:latest",
   "aliases": [
     "mxbai-embed-large"
@@ -24,11 +24,14 @@
         "weights": [
           {
             "path": "model.safetensors",
-            "sha256": "36bfa45da00eb762ef9feebe4cff315ec779efadd08da11846bef5ba5b59b8f8"
+            "sha256": "36bfa45da00eb762ef9feebe4cff315ec779efadd08da11846bef5ba5b59b8f8",
+            "size_bytes": null
           }
         ],
         "auxiliary": [],
-        "metadata": {}
+        "metadata": {},
+        "format": "hf_weights",
+        "projector": null
       },
       "routes": [
         {
@@ -50,7 +53,8 @@
           "precision": null,
           "size": 670000000
         }
-      }
+      },
+      "runtime_profile": null
     },
     {
       "id": "ollama-mxbai-dense-v1.deployment",
@@ -71,11 +75,14 @@
         "weights": [
           {
             "path": "model",
-            "sha256": "819c2adf5ce6df2b6bd2ae4ca90d2a69f060afeb438d0c171db57daa02e39c3d"
+            "sha256": "819c2adf5ce6df2b6bd2ae4ca90d2a69f060afeb438d0c171db57daa02e39c3d",
+            "size_bytes": null
           }
         ],
         "auxiliary": [],
-        "metadata": {}
+        "metadata": {},
+        "format": "ollama_manifest",
+        "projector": null
       },
       "routes": [
         {
@@ -87,7 +94,8 @@
         "type": "ollama",
         "parameters": {}
       },
-      "metadata": {}
+      "metadata": {},
+      "runtime_profile": null
     }
   ],
   "profiles": [

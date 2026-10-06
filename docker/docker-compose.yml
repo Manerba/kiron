@@ -10,7 +10,7 @@ services:
     # `kiron_ollama_compat_models` (D11), nicht ueber Auto-Naming hier.
     container_name: kiron-ollama
     ports:
-      - "11435:11435"
+      - "127.0.0.1:11435:11435"
     volumes:
       - ollama_data:/root/.ollama
     # #506: Moderne Compose-Syntax statt legacy `runtime: nvidia` (nvidia-docker2-Paket).

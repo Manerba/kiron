@@ -496,7 +496,7 @@ function renderSystemMetrics(metrics) {
         html += '<td class="models-actions">';
         if (debertaRunning) {
             if (debertaHasModel) {
-                html += '<button class="action-btn" onclick="unloadDeberta()" data-kpi="gpu_mgr_deberta_model_action">Entladen</button>';
+                html += '<button class="action-btn" onclick="unloadDeberta(this)" data-model="' + escapeHtml(debertaModel) + '" data-kpi="gpu_mgr_deberta_model_action">Entladen</button>';
             } else if (debertaAvailable.length > 0) {
                 var defaultModel = debertaAvailable[0];
                 html += '<button class="action-btn primary" onclick="loadDeberta(\'' + escapeHtml(defaultModel) + '\')" data-kpi="gpu_mgr_deberta_model_action">Laden</button>';
@@ -720,8 +720,7 @@ async function loadDeberta(model) {
     btn.textContent = originalText;
 }
 
-async function unloadDeberta() {
-    var btn = event.target;
+async function unloadDeberta(btn) {
     var originalText = btn.textContent;
     btn.disabled = true;
     btn.textContent = 'Entlade...';
@@ -730,6 +729,7 @@ async function unloadDeberta() {
         var resp = await fetch('/api/deberta/unload', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({model: btn.dataset.model}),
         });
         var data = await resp.json();
         if (resp.ok) {

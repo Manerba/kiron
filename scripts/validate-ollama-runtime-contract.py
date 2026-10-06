@@ -47,14 +47,7 @@ def _has_expected_port_binding(port_bindings: Any) -> bool:
     bindings = port_bindings.get(EXPECTED_PORT)
     if not isinstance(bindings, list):
         return False
-    for item in bindings:
-        if not isinstance(item, dict):
-            continue
-        host_ip = item.get("HostIp", "")
-        host_port = item.get("HostPort")
-        if host_port == EXPECTED_HOST_PORT and host_ip in ("", "0.0.0.0", "::"):
-            return True
-    return False
+    return bindings == [{"HostIp": "127.0.0.1", "HostPort": EXPECTED_HOST_PORT}]
 
 
 def _unexpected_bound_ports(port_bindings: Any) -> list[str]:
@@ -143,7 +136,7 @@ def validate_contract(
 
     port_bindings = host_config.get("PortBindings")
     if not _has_expected_port_binding(port_bindings):
-        errors.append("PortBinding 11435/tcp -> HostPort 11435 fehlt oder ist nicht compose-konform")
+        errors.append("PortBinding 11435/tcp muss ausschließlich 127.0.0.1:11435 sein")
     unexpected_ports = _unexpected_bound_ports(port_bindings)
     if unexpected_ports:
         errors.append(f"Unerwartete Host-Portbindings: {', '.join(sorted(unexpected_ports))}")

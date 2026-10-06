@@ -644,7 +644,7 @@ class AppLoadModelIntegrationTests(unittest.IsolatedAsyncioTestCase):
             headers = {"content-type": "application/json"}
 
             def json(self):
-                return {}
+                return {"done": True}
 
         class _FakeHttp:
             async def __aenter__(self):
@@ -692,7 +692,7 @@ class AppLoadModelIntegrationTests(unittest.IsolatedAsyncioTestCase):
             headers = {"content-type": "application/json"}
 
             def json(self):
-                return {}
+                return {"done": True}
 
         class _FakeHttp:
             async def __aenter__(self):

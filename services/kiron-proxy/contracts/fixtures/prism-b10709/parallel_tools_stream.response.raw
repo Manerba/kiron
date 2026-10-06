@@ -1,0 +1,30 @@
+:
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"role":"assistant","content":null}}],"created":1790011186,"id":"chatcmpl-lcUYffyxxkUJRLzVNh2h3ybB9U3bCBo8","model":"bonsai-probe","system_fingerprint":"b10709-9a9394a89","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"tool_calls":[{"index":0,"id":"zIS7o9Fi0cjTVegpODOU90WXfYmoTF7o","type":"function","function":{"name":"weather","arguments":"{"}}]}}],"created":1790011196,"id":"chatcmpl-lcUYffyxxkUJRLzVNh2h3ybB9U3bCBo8","model":"bonsai-probe","system_fingerprint":"b10709-9a9394a89","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"city\":\""}}]}}],"created":1790011205,"id":"chatcmpl-lcUYffyxxkUJRLzVNh2h3ybB9U3bCBo8","model":"bonsai-probe","system_fingerprint":"b10709-9a9394a89","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"Berlin"}}]}}],"created":1790011206,"id":"chatcmpl-lcUYffyxxkUJRLzVNh2h3ybB9U3bCBo8","model":"bonsai-probe","system_fingerprint":"b10709-9a9394a89","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\""}}]}}],"created":1790011214,"id":"chatcmpl-lcUYffyxxkUJRLzVNh2h3ybB9U3bCBo8","model":"bonsai-probe","system_fingerprint":"b10709-9a9394a89","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"}"}}]}}],"created":1790011219,"id":"chatcmpl-lcUYffyxxkUJRLzVNh2h3ybB9U3bCBo8","model":"bonsai-probe","system_fingerprint":"b10709-9a9394a89","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"tool_calls":[{"index":1,"id":"1RQ3LAfpXTOyvhOF3VweaiR2bu2Q5dpt","type":"function","function":{"name":"weather","arguments":"{"}}]}}],"created":1790011235,"id":"chatcmpl-lcUYffyxxkUJRLzVNh2h3ybB9U3bCBo8","model":"bonsai-probe","system_fingerprint":"b10709-9a9394a89","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"tool_calls":[{"index":1,"function":{"arguments":"\"city\":\""}}]}}],"created":1790011243,"id":"chatcmpl-lcUYffyxxkUJRLzVNh2h3ybB9U3bCBo8","model":"bonsai-probe","system_fingerprint":"b10709-9a9394a89","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"tool_calls":[{"index":1,"function":{"arguments":"Paris"}}]}}],"created":1790011245,"id":"chatcmpl-lcUYffyxxkUJRLzVNh2h3ybB9U3bCBo8","model":"bonsai-probe","system_fingerprint":"b10709-9a9394a89","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"tool_calls":[{"index":1,"function":{"arguments":"\""}}]}}],"created":1790011252,"id":"chatcmpl-lcUYffyxxkUJRLzVNh2h3ybB9U3bCBo8","model":"bonsai-probe","system_fingerprint":"b10709-9a9394a89","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"tool_calls":[{"index":1,"function":{"arguments":"}"}}]}}],"created":1790011258,"id":"chatcmpl-lcUYffyxxkUJRLzVNh2h3ybB9U3bCBo8","model":"bonsai-probe","system_fingerprint":"b10709-9a9394a89","object":"chat.completion.chunk"}
+
+data: {"choices":[{"finish_reason":"tool_calls","index":0,"delta":{}}],"created":1790011261,"id":"chatcmpl-lcUYffyxxkUJRLzVNh2h3ybB9U3bCBo8","model":"bonsai-probe","system_fingerprint":"b10709-9a9394a89","object":"chat.completion.chunk"}
+
+data: {"choices":[],"created":1790011261,"id":"chatcmpl-lcUYffyxxkUJRLzVNh2h3ybB9U3bCBo8","model":"bonsai-probe","system_fingerprint":"b10709-9a9394a89","object":"chat.completion.chunk","usage":{"completion_tokens":52,"prompt_tokens":297,"total_tokens":349,"prompt_tokens_details":{"cached_tokens":0}},"timings":{"cache_n":0,"prompt_n":297,"prompt_ms":36640.795,"prompt_per_token_ms":123.36968013468012,"prompt_per_second":8.10571932186515,"predicted_n":52,"predicted_ms":74850.438,"predicted_per_token_ms":1467.6556470588234,"predicted_per_second":0.6813587383416514}}
+
+data: [DONE]
+

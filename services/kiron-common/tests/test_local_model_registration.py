@@ -9,6 +9,7 @@ import urllib.request
 import pytest
 
 from kiron_common.local_model_registry import (
+    GGUFLocalValidator,
     DEFAULT_HUGGINGFACE_MODEL_ROOT,
     DuplicateModelError,
     HuggingFaceLocalValidator,
@@ -17,7 +18,6 @@ from kiron_common.local_model_registry import (
     LoaderMetadataError,
     LocalLoaderMetadata,
     LocalModelNotFoundError,
-    LocalModelProvider,
     LocalValidationError,
     ModelRegistrationService,
     OllamaLocalValidator,
@@ -28,7 +28,7 @@ from kiron_common.local_model_registry import (
     read_model,
     register_model,
 )
-from kiron_common.model_catalog import LoaderType
+from kiron_common.model_catalog import ArtifactFormat, ArtifactType, BackendType, LoaderType
 
 
 def _validators(
@@ -40,6 +40,7 @@ def _validators(
 ) -> RegistrationValidators:
     listed = models if models is not None else {"models": []}
     return RegistrationValidators(
+        gguf=GGUFLocalValidator(),
         ollama=OllamaLocalValidator(
             list_models=lambda: listed,
             show_model=show or (lambda _name: {"details": {}}),
@@ -54,13 +55,15 @@ def _validators(
 
 def test_registry_entry_is_immutable_minimal_and_stably_identified() -> None:
     first = RegistryEntry.create(
-        provider=LocalModelProvider.OLLAMA,
+        runtime_provider=BackendType.OLLAMA,
+        artifact_origin=ArtifactType.OLLAMA, artifact_format=ArtifactFormat.OLLAMA_MANIFEST,
         reference="example/model:latest",
         display_name="example/model:latest",
         loader=LoaderType.OLLAMA,
     )
     second = RegistryEntry.create(
-        provider=LocalModelProvider.OLLAMA,
+        runtime_provider=BackendType.OLLAMA,
+        artifact_origin=ArtifactType.OLLAMA, artifact_format=ArtifactFormat.OLLAMA_MANIFEST,
         reference="example/model:latest",
         display_name="A different presentation",
         loader=LoaderType.OLLAMA,
@@ -68,15 +71,18 @@ def test_registry_entry_is_immutable_minimal_and_stably_identified() -> None:
 
     assert first.id == second.id
     assert first.id == (
-        "local.464204f04e7d95aae1f3ab7cce6ad099"
-        "4ef34f87d142b1c03b84827fbc7f6a76"
+        "local.ca9c6fc9832c410ce7eb8436c40bfbf76dd06ca59c3b0993f255dcab0edc1c4b"
     )
     assert first.to_dict() == {
         "id": first.id,
-        "provider": "ollama",
+        "runtime_provider": "ollama",
+        "artifact_origin": "ollama", "artifact_format": "ollama_manifest",
+        "sha256": None, "size_bytes": None, "projector": None, "runtime_profile": None,
+        "configuration_fingerprint": first.configuration_fingerprint, "capability_fingerprint": None,
         "reference": "example/model:latest",
         "display_name": "example/model:latest",
         "loader": "ollama",
+        "registered_at": first.registered_at.isoformat(timespec="microseconds").replace("+00:00", "Z"),
     }
     with pytest.raises(FrozenInstanceError):
         first.reference = "changed"  # type: ignore[misc]
@@ -95,20 +101,63 @@ def test_ollama_registers_only_an_exact_locally_listed_and_shown_model(
     entry = register_model(
         registry,
         _validators(
-            models={"models": [{"name": "example/model:Q4_0"}]},
+            models={"models": [{"name": "example/model:Q4_0", "digest": "a" * 64}]},
             show=show,
         ),
-        provider=" OLLAMA ",
+        runtime_provider=" OLLAMA ",
         reference=" EXAMPLE/MODEL:q4_0 ",
     )
 
-    assert entry.provider is LocalModelProvider.OLLAMA
+    assert entry.runtime_provider is BackendType.OLLAMA
     assert entry.reference == "example/model:Q4_0"
     assert entry.display_name == "example/model:Q4_0"
     assert entry.loader is LoaderType.OLLAMA
+    assert entry.sha256 == "a" * 64
     assert shown == ["example/model:Q4_0"]
     assert list_models(registry) == (entry,)
     assert read_model(registry, entry.id) == entry
+
+
+@pytest.mark.parametrize("digest", ["a" * 64, "sha256:" + "a" * 64, "A" * 64])
+def test_ollama_registration_binds_the_same_listed_manifest_around_show(digest):
+    calls = []
+    def tags():
+        calls.append("tags")
+        return {"models": [{"name": "local:latest", "digest": digest, "size": 12345}]}
+    def show(name):
+        calls.append(("show", name))
+        return {"details": {}}
+    entry = OllamaLocalValidator(list_models=tags, show_model=show).validate("LOCAL").to_entry()
+    assert calls == ["tags", ("show", "local:latest"), "tags"]
+    assert entry.sha256 == "a" * 64
+    assert entry.size_bytes is None  # Tags' total model size is not a manifest-file size.
+
+
+@pytest.mark.parametrize("digest", [None, "", "a" * 63, "g" * 64, "sha512:" + "a" * 64,
+                                  "sha256:" + "a" * 65, " " + "a" * 64, False])
+def test_ollama_registration_requires_a_valid_digest_even_when_discovery_has_a_name(digest):
+    shown = []
+    validator = OllamaLocalValidator(
+        list_models=lambda: {"models": [{"name": "local:latest", "digest": digest}]},
+        show_model=lambda name: shown.append(name))
+    assert validator.available_references() == ("local:latest",)
+    with pytest.raises(LocalValidationError):
+        validator.validate("local")
+    assert shown == []
+
+
+@pytest.mark.parametrize("after", [[], [{"name": "local:latest", "digest": "b" * 64}],
+                                  [{"name": "LOCAL:latest", "digest": "a" * 64}]])
+def test_ollama_observed_tag_change_during_show_prevents_persistence(tmp_path, after):
+    inventories = iter([{"models": [{"name": "local:latest", "digest": "a" * 64}]}, {"models": after}])
+    validators = _validators()
+    validators = type(validators)(ollama=OllamaLocalValidator(
+        list_models=lambda: next(inventories), show_model=lambda name: {"details": {}}),
+        huggingface=validators.huggingface, gguf=validators.gguf)
+    registry = RuntimeModelRegistry(tmp_path / "registry.json")
+    with pytest.raises(LocalValidationError):
+        register_model(registry, validators, runtime_provider="ollama", reference="local")
+    assert registry.list() == ()
 
 
 def test_ollama_missing_stops_before_show_and_does_not_persist(
@@ -121,10 +170,10 @@ def test_ollama_missing_stops_before_show_and_does_not_persist(
         register_model(
             registry,
             _validators(
-                models={"models": [{"name": "other:latest"}]},
+                models={"models": [{"name": "other:latest", "digest": "a" * 64}]},
                 show=lambda name: shown.append(name),
             ),
-            provider="ollama",
+            runtime_provider="ollama",
             reference="missing",
         )
 
@@ -149,6 +198,7 @@ def test_ollama_rejects_nonlocal_or_noncanonical_references_before_callbacks(
 ) -> None:
     calls: list[str] = []
     validators = RegistrationValidators(
+        gguf=GGUFLocalValidator(),
         ollama=OllamaLocalValidator(
             list_models=lambda: calls.append("list"),
             show_model=lambda _name: calls.append("show"),
@@ -162,7 +212,7 @@ def test_ollama_rejects_nonlocal_or_noncanonical_references_before_callbacks(
         register_model(
             RuntimeModelRegistry(tmp_path / "registry.json"),
             validators,
-            provider="ollama",
+            runtime_provider="ollama",
             reference=reference,
         )
     assert calls == []
@@ -173,8 +223,8 @@ def test_ollama_requires_closed_list_and_show_shapes(tmp_path: Path) -> None:
     with pytest.raises(LocalValidationError):
         register_model(
             registry,
-            _validators(models=[{"name": "model:latest"}]),
-            provider="ollama",
+            _validators(models=[{"name": "model:latest", "digest": "a" * 64}]),
+            runtime_provider="ollama",
             reference="model",
         )
 
@@ -182,20 +232,20 @@ def test_ollama_requires_closed_list_and_show_shapes(tmp_path: Path) -> None:
         register_model(
             registry,
             _validators(
-                models={"models": [{"name": "model:latest"}]},
+                models={"models": [{"name": "model:latest", "digest": "a" * 64}]},
                 show=lambda _name: {"model": "different:latest"},
             ),
-            provider="ollama",
+            runtime_provider="ollama",
             reference="model",
         )
     with pytest.raises(LocalValidationError):
         register_model(
             registry,
             _validators(
-                models={"models": [{"name": "model:latest"}]},
+                models={"models": [{"name": "model:latest", "digest": "a" * 64}]},
                 show=lambda _name: [],
             ),
-            provider="ollama",
+            runtime_provider="ollama",
             reference="model",
         )
 
@@ -215,12 +265,12 @@ def test_huggingface_canonicalizes_local_directory_and_checks_loader_metadata(
     entry = register_model(
         registry,
         _validators(loader_probe=inspect, model_root=model.parent),
-        provider="huggingface",
+        runtime_provider="kiron_embeddings",
         reference=f"{model.parent}/./demo-model",
         loader=" sentence_transformers ",
     )
 
-    assert entry.provider is LocalModelProvider.HUGGINGFACE
+    assert entry.runtime_provider is BackendType.KIRON_EMBEDDINGS
     assert entry.reference == str(model.resolve())
     assert entry.display_name == "Demo model"
     assert entry.loader is LoaderType.SENTENCE_TRANSFORMERS
@@ -235,7 +285,7 @@ def test_huggingface_uses_directory_name_as_minimal_display_fallback(
     entry = register_model(
         RuntimeModelRegistry(tmp_path / "registry.json"),
         _validators(model_root=tmp_path),
-        provider="huggingface",
+        runtime_provider="kiron_deberta",
         reference=str(model),
         loader=LoaderType.CROSS_ENCODER,
     )
@@ -268,7 +318,7 @@ def test_huggingface_rejects_missing_symlink_and_non_directory_before_loader(
         register_model(
             RuntimeModelRegistry(tmp_path / "registry.json"),
             validator,
-            provider="huggingface",
+            runtime_provider="kiron_deberta",
             reference=str(target),
             loader="cross_encoder",
         )
@@ -288,7 +338,7 @@ def test_huggingface_rejects_relative_url_ollama_loader_and_loader_failure(
             register_model(
                 registry,
                 _validators(model_root=tmp_path),
-                provider="huggingface",
+                runtime_provider="kiron_deberta",
                 reference=reference,
                 loader="cross_encoder",
             )
@@ -299,7 +349,7 @@ def test_huggingface_rejects_relative_url_ollama_loader_and_loader_failure(
         register_model(
             registry,
             _validators(model_root=tmp_path),
-            provider="huggingface",
+            runtime_provider="kiron_embeddings",
             reference=str(model),
             loader="ollama",
         )
@@ -312,7 +362,7 @@ def test_huggingface_rejects_relative_url_ollama_loader_and_loader_failure(
                 ),
                 model_root=tmp_path,
             ),
-            provider="huggingface",
+            runtime_provider="kiron_deberta",
             reference=str(model),
             loader="cross_encoder",
         )
@@ -325,19 +375,19 @@ def test_duplicate_semantics_use_provider_and_canonical_reference(
 ) -> None:
     registry = RuntimeModelRegistry(tmp_path / "registry.json")
     validators = _validators(
-        models={"models": [{"name": "demo:latest"}]}
+        models={"models": [{"name": "demo:latest", "digest": "a" * 64}]}
     )
     first = register_model(
         registry,
         validators,
-        provider="ollama",
+        runtime_provider="ollama",
         reference="DEMO",
     )
     with pytest.raises(DuplicateModelError) as caught:
         register_model(
             registry,
             validators,
-            provider="ollama",
+            runtime_provider="ollama",
             reference="demo:latest",
         )
     assert caught.value.code == "duplicate_model"
@@ -347,20 +397,20 @@ def test_duplicate_semantics_use_provider_and_canonical_reference(
 def test_bound_service_and_function_share_the_exact_use_case(tmp_path: Path) -> None:
     validators = _validators(
         models={"models": [
-            {"name": "functional:latest"},
-            {"name": "bound:latest"},
+            {"name": "functional:latest", "digest": "a" * 64},
+            {"name": "bound:latest", "digest": "a" * 64},
         ]}
     )
     registry = RuntimeModelRegistry(tmp_path / "registry.json")
     functional = register_model(
         registry,
         validators,
-        provider="ollama",
+        runtime_provider="ollama",
         reference="functional",
     )
     service = ModelRegistrationService(registry, validators)
     bound = service.register_model(
-        provider="ollama",
+        runtime_provider="ollama",
         reference="bound",
     )
 
@@ -385,10 +435,10 @@ def test_registration_candidates_are_local_sorted_and_exclude_registered(
     validators = _validators(
         models={
             "models": [
-                {"name": "Zulu:Q4_0"},
-                {"name": "registered:latest"},
-                {"name": "alpha:latest"},
-                {"name": "remote:cloud"},
+                {"name": "Zulu:Q4_0", "digest": "a" * 64},
+                {"name": "registered:latest", "digest": "a" * 64},
+                {"name": "alpha:latest", "digest": "a" * 64},
+                {"name": "remote:cloud", "digest": "a" * 64},
             ]
         },
         model_root=model_root,
@@ -397,30 +447,24 @@ def test_registration_candidates_are_local_sorted_and_exclude_registered(
         RuntimeModelRegistry(tmp_path / "registry.json"),
         validators,
     )
-    service.register_model(provider="ollama", reference="registered")
+    service.register_model(runtime_provider="ollama", reference="registered")
     service.register_model(
-        provider="huggingface",
+        runtime_provider="kiron_deberta",
         reference=str(registered_hf),
         loader="cross_encoder",
     )
 
-    assert [candidate.to_dict() for candidate in service.list_candidates()] == [
-        {
-            "provider": "huggingface",
-            "reference": str(available_hf),
-            "display_name": "available-hf",
-        },
-        {
-            "provider": "ollama",
-            "reference": "alpha:latest",
-            "display_name": "alpha:latest",
-        },
-        {
-            "provider": "ollama",
-            "reference": "Zulu:Q4_0",
-            "display_name": "Zulu:Q4_0",
-        },
+    discovery = service.list_candidates()
+    assert discovery.errors == {}
+    assert [(item.runtime_provider.value, item.reference) for item in discovery.candidates] == [
+        ("kiron_deberta", str(available_hf)),
+        ("kiron_embeddings", str(available_hf)),
+        ("kiron_embeddings", str(registered_hf)),
+        ("ollama", "alpha:latest"),
+        ("ollama", "Zulu:Q4_0"),
     ]
+    assert all(item.artifact_format is ArtifactFormat.HF_WEIGHTS
+               for item in discovery.candidates if item.runtime_provider is not BackendType.OLLAMA)
 
 
 def test_huggingface_registration_is_limited_to_direct_model_roots(
@@ -442,13 +486,13 @@ def test_huggingface_registration_is_limited_to_direct_model_roots(
     for forbidden in (model_root, nested, outside):
         with pytest.raises(InvalidReferenceError):
             service.register_model(
-                provider="huggingface",
+                runtime_provider="kiron_embeddings",
                 reference=str(forbidden),
                 loader="sentence_transformers",
             )
 
     registered = service.register_model(
-        provider="huggingface",
+        runtime_provider="kiron_embeddings",
         reference=str(direct),
         loader="sentence_transformers",
     )
@@ -463,13 +507,14 @@ def test_candidate_discovery_fails_closed_for_malformed_local_inventory(
     service = ModelRegistrationService(
         RuntimeModelRegistry(tmp_path / "registry.json"),
         _validators(
-            models={"models": [{"name": "duplicate"}, {"name": "DUPLICATE:latest"}]},
+            models={"models": [{"name": "duplicate", "digest": "a" * 64}, {"name": "DUPLICATE:latest", "digest": "a" * 64}]},
             model_root=model_root,
         ),
     )
 
-    with pytest.raises(LocalValidationError):
-        service.list_candidates()
+    result = service.list_candidates()
+    assert result.candidates == ()
+    assert result.errors == {BackendType.OLLAMA: "local_validation_failed"}
 
 
 def test_registration_executes_no_network_download_or_subprocess(
@@ -496,20 +541,20 @@ def test_registration_executes_no_network_download_or_subprocess(
     model.mkdir()
     registry = RuntimeModelRegistry(tmp_path / "registry.json")
     validators = _validators(
-        models={"models": [{"name": "local:latest"}]},
+        models={"models": [{"name": "local:latest", "digest": "a" * 64}]},
         model_root=tmp_path,
     )
 
     register_model(
         registry,
         validators,
-        provider="ollama",
+        runtime_provider="ollama",
         reference="local",
     )
     register_model(
         registry,
         validators,
-        provider="huggingface",
+        runtime_provider="kiron_embeddings",
         reference=str(model),
         loader="sentence_transformers",
     )

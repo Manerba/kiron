@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "canonical_model_id": "mankei-326m-reranker",
   "aliases": [
     "keyvan-ai/Mankei-326M-Reranker"
@@ -24,16 +24,20 @@
         "weights": [
           {
             "path": "model.safetensors",
-            "sha256": "34566de5240d16995f2830c00ea5981d5f3013f165b2c75a440100b7c49375d8"
+            "sha256": "34566de5240d16995f2830c00ea5981d5f3013f165b2c75a440100b7c49375d8",
+            "size_bytes": null
           }
         ],
         "auxiliary": [
           {
             "path": "head.pt",
-            "sha256": "ce0cf93891cbee260a7acfb9c5d66bf3d9c13c68e81fd9eb5cac99838b543edf"
+            "sha256": "ce0cf93891cbee260a7acfb9c5d66bf3d9c13c68e81fd9eb5cac99838b543edf",
+            "size_bytes": null
           }
         ],
-        "metadata": {}
+        "metadata": {},
+        "format": "hf_weights",
+        "projector": null
       },
       "routes": [
         {
@@ -63,9 +67,15 @@
           "display_order": 5,
           "labels": null,
           "rerank_label": null,
-          "size": 652890301
+          "size": 652890301,
+          "gpu_memory": {
+            "load_bytes": 805306368,
+            "request_bytes": 1073741824,
+            "headroom_bytes": 268435456
+          }
         }
-      }
+      },
+      "runtime_profile": null
     }
   ],
   "profiles": [

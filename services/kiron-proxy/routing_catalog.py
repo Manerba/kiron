@@ -8,6 +8,7 @@ from types import MappingProxyType
 from typing import Any
 
 from kiron_common.embedding_registry import MODEL_CATALOG
+from kiron_common.gpu_admission.native_contract import NativeMemoryBudget
 from kiron_common.model_catalog import (
     BackendType,
     LoaderType,
@@ -89,6 +90,7 @@ class ProxyRoute:
     backend: BackendType
     backend_model_name: str
     loader_type: LoaderType
+    gpu_memory: NativeMemoryBudget | None = None
 
     @property
     def input_names(self) -> tuple[str, ...]:
@@ -254,6 +256,14 @@ def _route_from_wire(wire: WireProfile) -> ProxyRoute:
             f"{path}/backend/parameters/model_name",
             "must be an exact canonical model ID or declared alias",
         )
+    gpu_memory = None
+    if wire.backend.type is BackendType.KIRON_DEBERTA:
+        try:
+            gpu_memory = NativeMemoryBudget.parse(
+                wire.deployment_metadata.get("service", {}).get("gpu_memory")
+            )
+        except (ValueError, AttributeError) as exc:
+            _fail(f"{path}/metadata/service/gpu_memory", str(exc))
     return ProxyRoute(
         canonical_model_id=wire.canonical_model_id,
         aliases=tuple(wire.aliases),
@@ -264,6 +274,7 @@ def _route_from_wire(wire: WireProfile) -> ProxyRoute:
         backend=wire.backend.type,
         backend_model_name=backend_model_name,
         loader_type=wire.loader.type,
+        gpu_memory=gpu_memory,
     )
 
 

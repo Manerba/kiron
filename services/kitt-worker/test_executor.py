@@ -4,7 +4,11 @@ import asyncio
 from pathlib import Path
 import sys
 import time
+import os
 from types import SimpleNamespace
+
+import pytest
+from kiron_common.gpu_admission import AdmissionStore, MemorySnapshot, RuntimeSecurity
 
 import executor
 import gpu_policy
@@ -14,6 +18,19 @@ import runners
 
 
 CAPABILITY_HASH = "a" * 64
+
+
+@pytest.fixture(autouse=True)
+def admission_runtime(tmp_path, monkeypatch):
+    root = tmp_path / "vram"
+    root.mkdir(mode=0o2770)
+    root.chmod(0o2770)
+    security = RuntimeSecurity(os.geteuid(), os.getegid(), frozenset({os.geteuid()}))
+    store = AdmissionStore(root, security=security, boot_id="test-boot")
+    monkeypatch.setattr(gpu_policy, "training_admission_store", lambda: store)
+    monkeypatch.setattr(gpu_policy, "measure_training_memory",
+                        lambda: MemorySnapshot(12 * 1024**3, 32 * 1024**3, time.monotonic()))
+    return store
 VALID_SPEC = {
     "schema_version": "kitt_job_spec_v1",
     "run_uid": "kitt-run-1",
@@ -886,3 +903,77 @@ def test_executor_running_cancel_request_becomes_canceled(tmp_path):
     assert job.state == "canceled"
     assert job.cancel_reason_code == "operator_requested"
     assert job.finished_at == job.terminal_at
+
+
+def test_atomic_training_admission_blocks_resident_prism_before_runner(tmp_path, admission_runtime):
+    async def run():
+        store = _store(tmp_path)
+        store.put_job(job_uid="job-admission", job_spec=VALID_SPEC, capability_hash_sha256=CAPABILITY_HASH)
+        started = []
+
+        def decision():
+            ticket = admission_runtime.reserve(operation_id="prism-load", owner="prism", generation="child",
+                deployment_id="bonsai", kind="load", gpu_bytes=0, host_bytes=0,
+                measure=gpu_policy.measure_training_memory)
+            admission_runtime.transition(ticket.operation_id, owner="prism", expected_generation="child", phase="resident")
+            return _allow()
+
+        worker = executor.KittWorkerExecutor(store=store, cfg=_cfg(tmp_path), policy_decider=decision,
+            capability_snapshot_fn=_ready_snapshot, runner_factory=lambda: started.append(True))
+        assert await worker.run_once()
+        assert not started
+        assert store.get_job("job-admission").state == "failed"
+        assert store.get_job("job-admission").last_failure_code == "policy_blocked"
+        assert [ticket.owner for ticket in admission_runtime.snapshot()] == ["prism"]
+    asyncio.run(run())
+
+
+def test_training_admission_heartbeats_and_releases_only_with_backend_proof(tmp_path, admission_runtime, monkeypatch):
+    async def run():
+        store = _store(tmp_path)
+        store.put_job(job_uid="job-heartbeat", job_spec=VALID_SPEC, capability_hash_sha256=CAPABILITY_HASH)
+        beats = []
+        original = admission_runtime.heartbeat
+        monkeypatch.setattr(admission_runtime, "heartbeat", lambda *args, **kwargs: (beats.append(True), original(*args, **kwargs))[1])
+        worker = executor.KittWorkerExecutor(store=store, cfg=_cfg(tmp_path, executor_renew_interval_seconds=0),
+            policy_decider=_allow, capability_snapshot_fn=_ready_snapshot,
+            runner_factory=lambda: runners.FakeRunner(delay_seconds=0.12))
+        assert await worker.run_once()
+        assert beats
+        assert admission_runtime.snapshot() == ()
+
+        class UnknownRunner:
+            async def run(self, _job, _cancel):
+                assert admission_runtime.snapshot()[0].kind == "training"
+                return runners.RunnerOutcome("succeeded")
+
+        store.put_job(job_uid="job-unknown", job_spec=VALID_SPEC, capability_hash_sha256=CAPABILITY_HASH)
+        worker.runner_factory = UnknownRunner
+        assert await worker.run_once()
+        assert admission_runtime.snapshot()[0].phase == "unknown"
+    asyncio.run(run())
+
+
+def test_executor_cancellation_preserves_unknown_backend_ticket(tmp_path, admission_runtime):
+    async def run():
+        store = _store(tmp_path)
+        store.put_job(job_uid="job-cancel-admission", job_spec=VALID_SPEC, capability_hash_sha256=CAPABILITY_HASH)
+        started = asyncio.Event()
+
+        class UnknownRunner:
+            backend_terminated = False
+            async def run(self, _job, cancel):
+                started.set()
+                await cancel.wait()
+                return runners.RunnerOutcome("canceled")
+
+        worker = executor.KittWorkerExecutor(store=store, cfg=_cfg(tmp_path), policy_decider=_allow,
+            capability_snapshot_fn=_ready_snapshot, runner_factory=UnknownRunner)
+        task = asyncio.create_task(worker.run_once())
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert admission_runtime.snapshot()[0].phase == "unknown"
+        assert worker.state.active_job_uid is None
+    asyncio.run(run())

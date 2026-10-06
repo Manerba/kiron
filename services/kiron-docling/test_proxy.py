@@ -67,6 +67,16 @@ def _reload_module():
     module._runtime_marker_file_owner_uids = lambda: frozenset({os.geteuid()})
     module._runtime_marker_group_gid = lambda: os.getegid()
     module._runtime_marker_dir_owner_uid = lambda: os.geteuid()
+    module._measure_admission_memory = lambda: module.MemorySnapshot(
+        12 * 1024**3, 32 * 1024**3, time.monotonic())
+    from kiron_common.gpu_admission.ollama_backend import BackendState
+    lifecycle = module.OllamaLifecycleOperation
+    def offline_lifecycle(**kwargs):
+        operation = lifecycle(**kwargs)
+        operation.backend_session.backend.inspect = mock.AsyncMock(return_value=BackendState(
+            "a" * 64, "2026-09-26T00:00:00Z", True, "running", 123))
+        return operation
+    module.OllamaLifecycleOperation = offline_lifecycle
     return module
 
 
@@ -290,7 +300,8 @@ class StateMachineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(ok)
         self.assertEqual(marker_seen_active, [True])
         _, active_after = p._marker_payload(p.STARTUP_MARKER_PATH)
-        self.assertTrue(active_after)
+        self.assertFalse(active_after)
+        self.assertEqual(p._admission_store().snapshot()[0].kind, "docling")
 
     async def test_warm_regate_shutdown_releases_waiters(self):
         p = self.proxy
@@ -1519,6 +1530,14 @@ class StartupShutdownTests(unittest.IsolatedAsyncioTestCase):
                  mock.patch.object(asyncio, "create_task", capture_task):
                 await p.on_startup()
             self.assertIs(p._state, p.State.RUNNING)
+            # A healthy container can still run an async job from the previous
+            # proxy. Its empty local task registry is no native idle proof.
+            self.assertTrue(p._admission_async_unknown)
+            self.assertNotEqual(p._admission_store().snapshot()[0].phase, "resident")
+            with self.assertRaises(p.AdmissionError):
+                p._admission_store().reserve(operation_id="other", owner="prism", generation="new",
+                    deployment_id="bonsai", kind="load", gpu_bytes=0, host_bytes=0,
+                    measure=p._measure_admission_memory)
         finally:
             # idle_watcher-Task abbrechen, damit der Loop sauber endet
             if p._idle_watcher_task is not None:
@@ -3803,6 +3822,104 @@ class MarkerPermissionContractTests(unittest.TestCase):
         with open(p.STARTUP_MARKER_PATH, encoding="utf-8") as fh:
             data = json.load(fh)
         self.assertEqual(data["token"], "replacement")
+
+
+class SharedAdmissionTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.proxy = _reload_module()
+
+    def resident_docling(self):
+        p = self.proxy
+        p._state = p.State.RUNNING
+        marker = p._write_vram_marker("startup")
+        p._reserve_docling_admission(marker, resident=True)
+        p._clear_vram_marker("startup", marker)
+
+    async def test_cold_admission_precedes_docker_start_and_publishes_residency(self):
+        p = self.proxy
+        p._state = p.State.STARTING
+
+        def start():
+            ticket, = p._admission_store().snapshot()
+            self.assertEqual(ticket.kind, "docling")
+            self.assertEqual(ticket.phase, "reserved")
+            self.assertEqual(ticket.gpu_bytes, 7 * 1024**3)
+            return True
+
+        with mock.patch.object(p, "_call_prepare_vram_for_docling", mock.AsyncMock()), \
+             mock.patch.object(p, "_start", start), \
+             mock.patch.object(p, "_wait_healthy", mock.AsyncMock(return_value=True)):
+            self.assertTrue(await p._start_supervisor())
+        self.assertEqual(p._admission_store().snapshot()[0].phase, "resident")
+        self.assertFalse(p.STARTUP_MARKER_PATH.exists())
+
+    async def test_prism_residency_blocks_before_existing_ollama_eviction(self):
+        p = self.proxy
+        p._admission_store().reserve(operation_id="prism", owner="prism", generation="child",
+            deployment_id="bonsai", kind="load", gpu_bytes=0, host_bytes=0,
+            measure=p._measure_admission_memory)
+        p._admission_store().transition("prism", owner="prism", expected_generation="child", phase="resident")
+        prepare = mock.AsyncMock()
+        with mock.patch.object(p, "_call_prepare_vram_for_docling", prepare), mock.patch.object(p, "_start") as start:
+            self.assertFalse(await p._start_supervisor())
+        prepare.assert_not_called()
+        start.assert_not_called()
+        self.assertEqual(p._admission_store().snapshot()[0].owner, "prism")
+
+    async def test_insufficient_post_eviction_memory_fails_before_docker_start(self):
+        p = self.proxy
+        p._measure_admission_memory = lambda: p.MemorySnapshot(1, 1024**3, time.monotonic())
+        with mock.patch.object(p, "_call_prepare_vram_for_docling", mock.AsyncMock()), \
+             mock.patch.object(p, "_start") as start:
+            self.assertFalse(await p._start_supervisor())
+        start.assert_not_called()
+        self.assertEqual(p._admission_store().snapshot(), ())
+        self.assertFalse(p.STARTUP_MARKER_PATH.exists())
+
+    async def test_warm_idle_allows_inference_but_warm_start_requires_exclusive_admission(self):
+        p = self.proxy
+        self.resident_docling()
+        async with p._state_lock:
+            await p._sync_docling_admission_locked()
+        store = p._admission_store()
+        store.reserve(operation_id="request", owner="proxy", generation="ollama",
+            deployment_id="chat", kind="request", gpu_bytes=0, host_bytes=0, measure=p._measure_admission_memory)
+        prepare = mock.AsyncMock()
+        with mock.patch.object(p, "_call_prepare_vram_for_docling", prepare):
+            self.assertIsNone(await p.ensure_running())
+        prepare.assert_not_called()
+        store.release("request", owner="proxy", generation="ollama", confirmed_terminated=True)
+        with mock.patch.object(p, "_call_prepare_vram_for_docling", prepare):
+            token = await p.ensure_running()
+        self.assertIsNotNone(token)
+        self.assertEqual(store.snapshot()[0].phase, "active")
+        await p._release_slot(token, ok=True, backend_failed=False)
+        self.assertEqual(store.snapshot()[0].phase, "resident")
+        self.assertFalse(p.STARTUP_MARKER_PATH.exists())
+
+    async def test_transport_end_and_failed_stop_preserve_admission_until_confirmed_stop(self):
+        p = self.proxy
+        self.resident_docling()
+        p._active_requests = 1
+        await p._release_slot(p._slot_generation, ok=False, backend_failed=False)
+        self.assertNotEqual(p._admission_store().snapshot()[0].phase, "resident")
+        async with p._state_lock:
+            self.assertTrue(await p._vram_lease_active())
+        with mock.patch.object(p, "_is_running_for_dirty", lambda: True):
+            await p._finalize_stop(False)
+        self.assertEqual(p._admission_store().snapshot()[0].phase, "unknown")
+        await p._finalize_stop(True)
+        self.assertEqual(p._admission_store().snapshot(), ())
+
+    async def test_unobserved_async_work_cannot_expire_into_resident_idle(self):
+        p = self.proxy
+        self.resident_docling()
+        await p._register_task_from_response("/v1/convert/source/async", b'{"task_id":"unfinished"}')
+        p._tasks["unfinished"].last_poll_monotonic = -p.TASK_MAX_AGE_S - 1
+        async with p._state_lock:
+            await p._sync_docling_admission_locked()
+        self.assertTrue(p._admission_async_unknown)
+        self.assertNotEqual(p._admission_store().snapshot()[0].phase, "resident")
 
 
 def _future(value):

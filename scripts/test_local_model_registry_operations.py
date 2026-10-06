@@ -17,9 +17,9 @@ def _read(relative: str) -> str:
 def test_tmpfiles_declares_shared_directory_and_optional_registry_policy() -> None:
     lines = set(_read("system/tmpfiles.d/kiron-runtime.conf").splitlines())
 
-    assert "d /usr/lib/kiron/data/shared 2750 kiron-proxy kiron-config -" in lines
-    assert f"z {REGISTRY} 0640 kiron-proxy kiron-config -" in lines
-    assert f"z {LOCK} 0640 kiron-proxy kiron-config -" in lines
+    assert "d /usr/lib/kiron/data/shared 2750 kiron-proxy kiron-common -" in lines
+    assert f"z {REGISTRY} 0640 kiron-proxy kiron-common -" in lines
+    assert f"z {LOCK} 0640 kiron-proxy kiron-common -" in lines
     assert f"d {MODEL_ROOT} 2750 root kiron-common -" in lines
     assert not any(line.startswith(f"f {REGISTRY} ") for line in lines)
 
@@ -32,7 +32,7 @@ def test_deploy_preserves_and_normalizes_registry_and_lock() -> None:
     assert "check_local_model_registry_paths" in script
     assert "apply_local_model_registry_permissions" in script
     assert 'for file in "$MODEL_REGISTRY_FILE" "$MODEL_REGISTRY_LOCK_FILE"; do' in script
-    assert 'chown kiron-proxy:kiron-config "$file"' in script
+    assert 'chown kiron-proxy:kiron-common "$file"' in script
     assert 'chmod 0640 "$file"' in script
     assert 'stat -c \'%h\' "$file"' in script
     assert script.rindex("check_local_model_registry_paths") < script.index(
@@ -49,8 +49,8 @@ def test_system_config_install_verifies_optional_registry_file_contract() -> Non
     assert "verify_optional_regular_file" in script
     assert f"verify_optional_regular_file {REGISTRY}" in script
     assert f"verify_optional_regular_file {LOCK}" in script
-    assert f'verify_optional_path_stat {REGISTRY} "kiron-proxy:kiron-config 640"' in script
-    assert f'verify_optional_path_stat {LOCK} "kiron-proxy:kiron-config 640"' in script
+    assert f'verify_optional_path_stat {REGISTRY} "kiron-proxy:kiron-common 640"' in script
+    assert f'verify_optional_path_stat {LOCK} "kiron-proxy:kiron-common 640"' in script
     assert f'verify_path_stat {MODEL_ROOT} "root:kiron-common 2750"' in script
     first_host_mutation = script.index("ensure_kiron_identities\n")
     assert script.index(f"verify_optional_regular_file {REGISTRY}") < first_host_mutation
@@ -128,7 +128,7 @@ def test_operator_and_api_docs_cover_the_complete_local_registration_contract() 
         "kiron-model-registry list",
         REGISTRY,
         LOCK,
-        "kiron-proxy:kiron-config",
+        "kiron-proxy:kiron-common",
         "0640",
         "sentence_transformers",
         "transformers_last_token",

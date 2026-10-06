@@ -47,13 +47,12 @@ class LastTokenEmbeddingModel:
         self.backbone = backbone
         self.max_seq_length = max_seq_length
 
-    def half(self) -> "LastTokenEmbeddingModel":
-        self.backbone = self.backbone.to(dtype=torch.bfloat16)
-        return self
-
     def to(self, device: str | torch.device) -> "LastTokenEmbeddingModel":
         self.backbone = self.backbone.to(device)
         return self
+
+    def forward(self, encoded):
+        return self.backbone(**encoded)
 
     def encode(
         self,
@@ -81,10 +80,16 @@ class LastTokenEmbeddingModel:
             encoded = {key: value.to(device) for key, value in encoded.items()}
             with torch.inference_mode():
                 if device.type == "cuda":
-                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                        hidden = self.backbone(**encoded).last_hidden_state
+                    # Preserve declared FP32 weights and computation even inside
+                    # the service's outer mixed-precision context. Keep masked
+                    # batches and single inputs on the same SDPA backend.
+                    with (
+                        torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.MATH),
+                        torch.amp.autocast("cuda", enabled=False),
+                    ):
+                        hidden = self.forward(encoded).last_hidden_state
                 else:
-                    hidden = self.backbone(**encoded).last_hidden_state
+                    hidden = self.forward(encoded).last_hidden_state
             last_token = encoded["attention_mask"].sum(dim=1) - 1
             pooled = hidden[
                 torch.arange(hidden.size(0), device=device),
@@ -107,6 +112,19 @@ def _artifact_coordinates(model: EmbeddingServiceModel) -> tuple[str, str]:
     return repository, revision
 
 
+def _use_safetensors(model: EmbeddingServiceModel) -> bool:
+    """Select precisely the declared weight file, never prefer another format."""
+    names = tuple(item.path for item in model.artifact.weights)
+    if names == ("model.safetensors",):
+        return True
+    if names == ("pytorch_model.bin",):
+        return False
+    raise EmbeddingServiceCatalogError(
+        f"/service/models/{model.model_name}/artifact/weights",
+        "Dense loader requires one explicitly selected native weight file",
+    )
+
+
 def load_sentence_transformers_cpu(model: EmbeddingServiceModel) -> object:
     parameters = model.loader_parameters
     if not isinstance(parameters, SentenceTransformersLoaderParameters):
@@ -122,6 +140,7 @@ def load_sentence_transformers_cpu(model: EmbeddingServiceModel) -> object:
         trust_remote_code=model.artifact.trust_remote_code,
         revision=revision,
         local_files_only=True,
+        model_kwargs={"use_safetensors": _use_safetensors(model)},
     )
 
 
@@ -133,13 +152,14 @@ def load_transformers_last_token_cpu(model: EmbeddingServiceModel) -> object:
             "transformers_last_token loader received incompatible parameters",
         )
     repository, revision = _artifact_coordinates(model)
-    dtype_by_name = {"bfloat16": torch.bfloat16}
+    dtype_by_name = {"float32": torch.float32}
     torch_dtype = dtype_by_name[parameters.torch_dtype]
     tokenizer = AutoTokenizer.from_pretrained(
         repository,
         revision=revision,
         local_files_only=True,
         use_fast=parameters.tokenizer_use_fast,
+        trust_remote_code=False,
     )
     profile = model.require_profile(ModelEndpoint.EMBED)
     if profile.padding_side is None:
@@ -153,6 +173,8 @@ def load_transformers_last_token_cpu(model: EmbeddingServiceModel) -> object:
         revision=revision,
         local_files_only=True,
         torch_dtype=torch_dtype,
+        use_safetensors=_use_safetensors(model),
+        trust_remote_code=False,
     ).eval()
     max_seq_length = max(
         profile.document_max_tokens,

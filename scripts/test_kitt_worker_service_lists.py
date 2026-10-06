@@ -26,7 +26,7 @@ def _extract_shell_function(text: str, name: str) -> str:
 def test_deploy_local_knows_kitt_worker_everywhere():
     text = _read("scripts/deploy-local.sh")
 
-    assert "KIRON_SERVICES=(kiron-proxy kiron-docling kiron-embeddings kiron-deberta kitt-worker)" in text
+    assert "KIRON_SERVICES=(kiron-proxy kiron-docling kiron-embeddings kiron-deberta kiron-prism kitt-worker)" in text
     assert '"$SRC/services/$svc/requirements.txt"' in text
     assert "check_kitt_worker_restart_prereqs" in text
     assert "check_kitt_worker_auth_restart_preflight" in text
@@ -115,7 +115,7 @@ def test_setup_venvs_runs_kitt_worker_smoke_as_service_user():
         "\"$DST/services/kitt-worker/venv.new/bin/python\" -c 'import auth, config, contract, job_stubs, queue_store, artifact_staging, capabilities, gpu_policy, runners, sft_command, sft_trainer, executor, monitoring, main, v1, healthcheck')"
     )
 
-    assert "SERVICES=(kiron-proxy kiron-docling kiron-embeddings kiron-deberta kitt-worker)" in text
+    assert "SERVICES=(kiron-proxy kiron-docling kiron-embeddings kiron-deberta kiron-prism kitt-worker)" in text
     assert "check_kitt_worker_prereqs" in text
     assert 'if [ -x "$venv_new/bin/python" ] && [ -f "$DST/services/kitt-worker/main.py" ]; then' not in text
     assert 'if [ ! -x "$venv_new/bin/python" ]; then' in text

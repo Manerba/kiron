@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "canonical_model_id": "mankei-326m-embedder:latest",
   "aliases": [
     "mankei-326m-embedder"
@@ -24,11 +24,30 @@
         "weights": [
           {
             "path": "model.safetensors",
-            "sha256": "bbfe289c78cad5ef7d64b0dd5cc547380a274a82823207e7ee4fcf44f49264d8"
+            "sha256": "bbfe289c78cad5ef7d64b0dd5cc547380a274a82823207e7ee4fcf44f49264d8",
+            "size_bytes": null
           }
         ],
-        "auxiliary": [],
-        "metadata": {}
+        "auxiliary": [
+          {
+            "path": "config.json",
+            "sha256": "66fae0acb91c8a1364a6cbadab57f65ef17debb9cd332f3ca4979d0c6cf07c6f",
+            "size_bytes": 715
+          },
+          {
+            "path": "tokenizer.json",
+            "sha256": "275f92d2c8a9939443301e8181736d75ba5ec757dedbbe27138be0b84b4b88db",
+            "size_bytes": 2382054
+          },
+          {
+            "path": "tokenizer_config.json",
+            "sha256": "b62cb945e1c70878f0dfc2e9e770923a3bf202f3dca9c7f6295d192aef9e9a36",
+            "size_bytes": 315
+          }
+        ],
+        "metadata": {},
+        "format": "hf_weights",
+        "projector": null
       },
       "routes": [
         {
@@ -40,7 +59,7 @@
         "type": "transformers_last_token",
         "parameters": {
           "tokenizer_use_fast": true,
-          "torch_dtype": "bfloat16"
+          "torch_dtype": "float32"
         }
       },
       "metadata": {
@@ -48,10 +67,11 @@
           "family": "llama",
           "format": "safetensors",
           "parameter_size": "326M",
-          "precision": "BF16",
+          "precision": "F32",
           "size": 652884384
         }
-      }
+      },
+      "runtime_profile": null
     }
   ],
   "profiles": [
@@ -116,17 +136,20 @@
             "dtype": "float32",
             "scope": "vector"
           },
-          "parameters": {}
+          "parameters": {
+            "torch_dtype": "float32"
+          }
         },
         "verification": {
           "status": "verified",
           "evidence": [
             "hf-readme:keyvan-ai/Mankei-326M-Embedder@86f562cf94d5510175b546e6e9156f99bbd790b5",
             "local-weight-sha256:bbfe289c78cad5ef7d64b0dd5cc547380a274a82823207e7ee4fcf44f49264d8",
-            "runtime-pipeline:kiron-mankei-bfloat16-last-token-fp32-l2"
+            "runtime-pipeline:kiron-mankei-fp32-last-token-fp32-l2"
           ],
           "blocking_reasons": []
-        }
+        },
+        "created": 1790035200
       }
     }
   ],

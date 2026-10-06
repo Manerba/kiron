@@ -17,6 +17,8 @@ from typing import Any, Callable, Mapping, Protocol
 import urllib.error
 import urllib.request
 
+from kiron_common.gpu_admission import AdmissionStore
+
 import artifact_staging
 import config as worker_config
 import sft_command
@@ -103,11 +105,11 @@ _TRAINER_PACKAGES = (
 _TRAINING_PHASES = ("sft", "dpo", "cp")
 _FEATURES = ("sft", "qlora", "dpo", "cp", "checkpoint_resume")
 _DEFAULT_MARKER_PATHS = {
-    "gpu_service_loading": Path("/run/kiron/gpu-service-loading.json"),
-    "startup": Path("/run/kiron/docling-vram-startup.json"),
-    "shutdown": Path("/run/kiron/docling-vram-shutdown.json"),
+    "gpu_service_loading": Path("/run/kiron/vram/gpu-service-loading.json"),
+    "startup": Path("/run/kiron/vram/docling-vram-startup.json"),
+    "shutdown": Path("/run/kiron/vram/docling-vram-shutdown.json"),
 }
-_DEFAULT_MAINTENANCE_PATH = Path("/usr/lib/kiron/data/maintenance_mode.json")
+_DEFAULT_MAINTENANCE_PATH = Path("/usr/lib/kiron/data/kiron-proxy/maintenance_mode.json")
 _DEFAULT_OLLAMA_PS_URL = "http://127.0.0.1:11435/api/ps"
 
 
@@ -231,6 +233,7 @@ class InferenceConflictProbe:
         timeout_seconds: float = 0.25,
         urlopen: Callable[..., Any] | None = None,
         wall_time_fn: Callable[[], float] = time.time,
+        admission_store: AdmissionStore | None = None,
     ) -> None:
         self._marker_paths = dict(_DEFAULT_MARKER_PATHS if marker_paths is None else marker_paths)
         self._maintenance_path = maintenance_path
@@ -238,6 +241,7 @@ class InferenceConflictProbe:
         self._timeout_seconds = timeout_seconds
         self._urlopen = urllib.request.urlopen if urlopen is None else urlopen
         self._wall_time_fn = wall_time_fn
+        self._admission_store = AdmissionStore() if admission_store is None else admission_store
 
     def probe(self) -> ConflictProbeResult:
         warnings: list[str] = []
@@ -271,6 +275,15 @@ class InferenceConflictProbe:
                 maintenance=maintenance,
                 measurement_warnings=tuple(warnings),
             )
+
+        try:
+            tickets = self._admission_store.snapshot()
+        except Exception:
+            return ConflictProbeResult("unknown", "unknown", maintenance,
+                                       (*warnings, "gpu_admission_unreadable"))
+        if tickets:
+            return ConflictProbeResult("gpu_marker_active", _combine_source_status(source_statuses),
+                                       maintenance, (*warnings, "gpu_admission_reserved"))
 
         ollama_status, ollama_source, ollama_warnings = self._read_ollama_ps()
         source_statuses.append(ollama_source)

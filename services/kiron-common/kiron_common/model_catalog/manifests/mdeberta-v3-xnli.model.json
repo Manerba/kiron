@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "canonical_model_id": "mdeberta-v3-xnli",
   "aliases": [
     "MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7"
@@ -24,11 +24,14 @@
         "weights": [
           {
             "path": "model.safetensors",
-            "sha256": "7c8e29f1115986d032e92b0fbaa0bdef1062a46f658b08705f237c05014a8541"
+            "sha256": "7c8e29f1115986d032e92b0fbaa0bdef1062a46f658b08705f237c05014a8541",
+            "size_bytes": null
           }
         ],
         "auxiliary": [],
-        "metadata": {}
+        "metadata": {},
+        "format": "hf_weights",
+        "projector": null
       },
       "routes": [
         {
@@ -56,9 +59,15 @@
             "contradiction"
           ],
           "rerank_label": "entailment",
-          "size": 557652046
+          "size": 557652046,
+          "gpu_memory": {
+            "load_bytes": 805306368,
+            "request_bytes": 1073741824,
+            "headroom_bytes": 268435456
+          }
         }
-      }
+      },
+      "runtime_profile": null
     }
   ],
   "profiles": [

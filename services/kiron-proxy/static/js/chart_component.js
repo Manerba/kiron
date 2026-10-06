@@ -15,6 +15,7 @@ class TimeSeriesChart {
         this.canvasId = canvasId;
         this.config = config;
         this.chart = null;
+        this.xAxisMode = 'time';
         this._createChart();
     }
 
@@ -25,6 +26,54 @@ class TimeSeriesChart {
             grid: style.getPropertyValue('--border-color').trim() || '#ddd',
             bg: style.getPropertyValue('--bg-secondary').trim() || '#f5f5f5',
         };
+    }
+
+    _timeXAxis(theme) {
+        return {
+            type: 'time',
+            time: {
+                tooltipFormat: 'dd.MM.yyyy HH:mm:ss',
+                displayFormats: {
+                    second: 'HH:mm:ss',
+                    minute: 'HH:mm',
+                    hour: 'HH:mm',
+                    day: 'dd.MM.',
+                },
+            },
+            ticks: { color: theme.text, maxTicksLimit: 8 },
+            grid: { color: theme.grid + '40' },
+        };
+    }
+
+    _relativeSecondsXAxis(theme, windowSeconds) {
+        const useMinuteTicks = windowSeconds >= 600;
+        return {
+            type: 'linear',
+            min: 0,
+            max: windowSeconds,
+            reverse: true,
+            ticks: {
+                color: theme.text,
+                stepSize: useMinuteTicks ? 120 : 10,
+                autoSkip: false,
+                callback: value => useMinuteTicks
+                    ? `${(Number(value) / 60).toFixed(0)} min`
+                    : `${Number(value).toFixed(0)} s`,
+            },
+            grid: { color: theme.grid + '40' },
+        };
+    }
+
+    _setXAxisMode(relativeWindowSeconds) {
+        const isRelative = Number.isFinite(relativeWindowSeconds) && relativeWindowSeconds > 0;
+        const nextMode = isRelative ? `relative:${relativeWindowSeconds}` : 'time';
+        if (!this.chart || this.xAxisMode === nextMode) return;
+
+        const theme = this._getThemeColors();
+        this.chart.options.scales.x = isRelative
+            ? this._relativeSecondsXAxis(theme, relativeWindowSeconds)
+            : this._timeXAxis(theme);
+        this.xAxisMode = nextMode;
     }
 
     _createChart() {
@@ -51,20 +100,7 @@ class TimeSeriesChart {
 
         // Y-Achsen
         const scales = {
-            x: {
-                type: 'time',
-                time: {
-                    tooltipFormat: 'dd.MM.yyyy HH:mm:ss',
-                    displayFormats: {
-                        second: 'HH:mm:ss',
-                        minute: 'HH:mm',
-                        hour: 'HH:mm',
-                        day: 'dd.MM.',
-                    },
-                },
-                ticks: { color: theme.text, maxTicksLimit: 8 },
-                grid: { color: theme.grid + '40' },
-            },
+            x: this._timeXAxis(theme),
         };
 
         (yAxes || [{ id: 'y', label: '%', position: 'left' }]).forEach(axis => {
@@ -115,16 +151,27 @@ class TimeSeriesChart {
      * Neue Daten setzen und Chart aktualisieren.
      * @param {number[]} timestamps - Unix-Timestamps
      * @param {object} seriesData - {key: [values]}
+     * @param {object} options - optional: {relativeWindowSeconds: number}
      */
-    update(timestamps, seriesData) {
+    update(timestamps, seriesData, options = {}) {
         if (!this.chart) return;
 
-        const dates = timestamps.map(ts => new Date(ts * 1000));
+        const relativeWindowSeconds = Number(options.relativeWindowSeconds);
+        const isRelative = Number.isFinite(relativeWindowSeconds) && relativeWindowSeconds > 0;
+        this._setXAxisMode(isRelative ? relativeWindowSeconds : null);
+
+        let xValues;
+        if (isRelative) {
+            const latestTimestamp = timestamps.length ? timestamps[timestamps.length - 1] : 0;
+            xValues = timestamps.map(ts => latestTimestamp - ts);
+        } else {
+            xValues = timestamps.map(ts => new Date(ts * 1000));
+        }
 
         this.config.series.forEach((s, i) => {
             const values = seriesData[s.key] || [];
-            this.chart.data.datasets[i].data = dates.map((d, idx) => ({
-                x: d,
+            this.chart.data.datasets[i].data = xValues.map((x, idx) => ({
+                x,
                 y: values[idx] != null ? values[idx] : null,
             }));
         });

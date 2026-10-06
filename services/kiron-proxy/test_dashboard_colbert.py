@@ -9,8 +9,8 @@ import tempfile
 import unittest
 from unittest import mock
 
-from kiron_common.local_model_registry import LocalModelProvider, RegistryEntry
-from kiron_common.model_catalog import LoaderType
+from kiron_common.local_model_registry import RegistryEntry
+from kiron_common.model_catalog import ArtifactFormat, ArtifactType, BackendType, LoaderType
 
 
 PROXY_DIR = Path(__file__).resolve().parent
@@ -156,7 +156,9 @@ class _EmptyRegistrationService:
 class _QwenRegistrationService:
     def __init__(self):
         self._entry = RegistryEntry.create(
-            provider=LocalModelProvider.OLLAMA,
+            runtime_provider=BackendType.OLLAMA,
+            artifact_origin=ArtifactType.OLLAMA,
+            artifact_format=ArtifactFormat.OLLAMA_MANIFEST,
             reference="qwen3:8b",
             display_name="qwen3:8b",
             loader=LoaderType.OLLAMA,
@@ -288,6 +290,37 @@ class DashboardColbertTests(unittest.IsolatedAsyncioTestCase):
         rows = {item["name"]: item for item in resp["models"]}
         self.assertFalse(rows["colbert-xm"]["embedding_active"])
         self.assertEqual(resp["embedding_service"]["loaded_models"], [])
+
+    async def test_local_models_keeps_stopped_service_rows_as_unknown(self):
+        health = {
+            "status": "no_model",
+            "loaded_models": [],
+            "loading_model": None,
+        }
+        with mock.patch.object(self.app_mod.httpx, "AsyncClient", _FakeOllamaClient), \
+             mock.patch.object(
+                 self.app_mod,
+                 "get_cached_payload",
+                 return_value=_metrics_cache(health),
+             ), \
+             mock.patch.object(
+                 self.app_mod,
+                 "service_huggingface_inventory",
+                 return_value=frozenset(),
+             ) as inventory:
+            resp = await self.app_mod.get_local_models()
+
+        row = next(
+            item
+            for item in resp["models"]
+            if item["backend"] == BackendType.KIRON_DEBERTA.value
+        )
+        self.assertIsNone(row["installed"])
+        self.assertEqual(row["runtime_state"], "unknown")
+        self.assertEqual(
+            inventory.call_args.kwargs["reachable_backends"],
+            (BackendType.KIRON_EMBEDDINGS,),
+        )
 
     async def test_local_models_separates_native_and_runtime_ollama_context(self):
         _FakeOllamaModelDetailsClient.show_calls = []

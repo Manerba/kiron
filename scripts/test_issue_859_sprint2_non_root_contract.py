@@ -40,6 +40,7 @@ def _assert_common_model_unit_contract(
     *,
     user: str,
     groups: set[str],
+    writable_paths: str,
 ) -> None:
     settings = _unit_settings(relpath)
     env = _env(settings)
@@ -61,7 +62,7 @@ def _assert_common_model_unit_contract(
     assert settings["PrivateTmp"] == ["true"]
     assert settings["ProtectHome"] == ["true"]
     assert settings["ProtectSystem"] == ["strict"]
-    assert settings["ReadWritePaths"] == [HF_HOME]
+    assert settings["ReadWritePaths"] == [writable_paths]
     assert settings["RestrictSUIDSGID"] == ["true"]
     assert settings["LockPersonality"] == ["true"]
     assert settings["NoNewPrivileges"] == ["true"]
@@ -79,7 +80,8 @@ def test_embeddings_unit_matches_sprint2_non_root_contract():
     _assert_common_model_unit_contract(
         "systemd/kiron-embeddings.service",
         user="kiron-embeddings",
-        groups={"kiron-models", "kiron-config", "kiron-common", "video", "render"},
+        groups={"kiron-models", "kiron-config", "kiron-common", "kiron-runtime", "video", "render"},
+        writable_paths=HF_HOME + " /run/kiron/vram",
     )
 
 
@@ -88,6 +90,7 @@ def test_deberta_unit_matches_sprint2_non_root_contract():
         "systemd/kiron-deberta.service",
         user="kiron-deberta",
         groups={"kiron-models", "kiron-common", "video", "render"},
+        writable_paths=HF_HOME,
     )
 
 

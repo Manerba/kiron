@@ -19,6 +19,7 @@ from kiron_common.catalog_consistency import check_catalog_digests
 from kiron_common.ollama_compat import is_real_int
 
 from routing_catalog import PROXY_ROUTING_VIEW
+from service_memory import SERVICE_BACKENDS, build_service_memory
 
 logger = logging.getLogger(__name__)
 
@@ -550,6 +551,8 @@ GPU_PROCESS_FIELDS = {
     "label": "classified owner: ollama, docling, embedding, deberta, other",
     "vram_mb": "GPU memory in MiB, null when nvidia-smi cannot parse it",
     "vram_state": "known or unknown",
+    "service": "exact KIron systemd service from the process cgroup, or null",
+    "rss_bytes": "resident host memory of that service process in bytes, or null",
 }
 
 GPU_PROCESS_STATES = {
@@ -655,6 +658,24 @@ def _classify_gpu_process_label(process_name: str, pid: int) -> str:
     return "other"
 
 
+def _gpu_process_host_info(pid: int) -> dict:
+    """Read service ownership and RSS without guessing from the executable name."""
+    try:
+        with open(f"/proc/{pid}/cgroup", encoding="utf-8") as fh:
+            units = {component for line in fh for component in line.strip().split(":", 2)[-1].split("/")}
+    except OSError:
+        return {"service": None, "rss_bytes": None}
+    owners = [service for service in SERVICE_BACKENDS if service + ".service" in units]
+    service = owners[0] if len(owners) == 1 else None
+    rss = None
+    if service is not None:
+        try:
+            rss = psutil.Process(pid).memory_info().rss
+        except (psutil.Error, OSError):
+            pass
+    return {"service": service, "rss_bytes": rss}
+
+
 def get_gpu_process_metrics() -> dict:
     """Collect per-process GPU memory usage via nvidia-smi.
 
@@ -718,6 +739,7 @@ def get_gpu_process_metrics() -> dict:
             "label": label,
             "vram_mb": vram_mb,
             "vram_state": vram_state,
+            **_gpu_process_host_info(pid),
         })
     if not processes and malformed_lines > 0:
         return _gpu_processes_error_payload(
@@ -1302,6 +1324,9 @@ async def get_all_metrics() -> dict:
         "gpu": results.get("gpu"),
         "ollama": results.get("ollama"),
         "gpu_processes": gpu_processes_payload,
+        "service_memory": build_service_memory(
+            gpu_processes_payload, embedding=embedding_status, deberta=deberta_status,
+        ),
         "gpu_process_vram_unknown_count": gpu_process_vram_unknown_count,
         "docling": results.get("docling"),
         "embedding": embedding_status,

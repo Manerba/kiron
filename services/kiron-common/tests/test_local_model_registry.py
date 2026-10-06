@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import ast
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 import grp
 import json
 import multiprocessing
@@ -17,7 +19,6 @@ import pytest
 from kiron_common.local_model_registry import (
     DEFAULT_REGISTRY_PATH,
     DuplicateModelError,
-    LocalModelProvider,
     RegistryAccessError,
     RegistryCorruptionError,
     RegistryEntry,
@@ -25,16 +26,17 @@ from kiron_common.local_model_registry import (
     RuntimeModelRegistry,
     stable_registry_id,
 )
-from kiron_common.model_catalog import LoaderType
+from kiron_common.model_catalog import ArtifactFormat, ArtifactType, BackendType, LoaderType
 
 
 def _entry(index: int) -> RegistryEntry:
-    return RegistryEntry.create(
-        provider=LocalModelProvider.OLLAMA,
+    return replace(RegistryEntry.create(
+        runtime_provider=BackendType.OLLAMA,
+        artifact_origin=ArtifactType.OLLAMA, artifact_format=ArtifactFormat.OLLAMA_MANIFEST,
         reference=f"example/model-{index}:latest",
         display_name=f"model-{index}",
         loader=LoaderType.OLLAMA,
-    )
+    ), registered_at=datetime(2026, 9, 21, 12, 30, 40, 123456, tzinfo=timezone.utc))
 
 
 def _process_add(registry_path: str, index: int) -> None:
@@ -58,7 +60,7 @@ def _service_registry_call(
         os.setgroups([])
         os.setgid(gid)
         os.setuid(uid)
-        registry = RuntimeModelRegistry(Path(registry_path))
+        registry = RuntimeModelRegistry(Path(registry_path), readonly=operation == "readonly")
         if operation == "add":
             assert index is not None
             registry.add(_entry(index))
@@ -90,10 +92,9 @@ def _service_identity() -> tuple[int, int, int]:
     except KeyError:
         pytest.skip("KIron service identities are not installed")
     assert service.pw_uid != 0
-    assert shared_group.gr_gid not in os.getgrouplist(
-        service.pw_name,
-        service.pw_gid,
-    )
+    # The child explicitly clears supplementary groups. Host membership is
+    # irrelevant here; the deployed proxy now legitimately uses kiron-config.
+    assert shared_group.gr_gid != service.pw_gid
     return service.pw_uid, service.pw_gid, shared_group.gr_gid
 
 
@@ -159,7 +160,7 @@ def test_registry_round_trip_is_closed_deterministic_and_restart_persistent(
     assert payload.endswith(b"\n")
     document = json.loads(payload)
     assert document == {
-        "version": 1,
+        "version": 2,
         "entries": [
             item.to_dict()
             for item in sorted((high, low), key=lambda entry: entry.id)
@@ -169,6 +170,53 @@ def test_registry_round_trip_is_closed_deterministic_and_restart_persistent(
         sorted((high, low), key=lambda entry: entry.id)
     )
     assert path.stat().st_mode & 0o777 == 0o640
+
+
+def test_registration_timestamp_is_persisted_without_changing_artifact_or_configuration(tmp_path):
+    from kiron_common.local_model_registry.codec import decode_registry, encode_registry
+    entry = _entry(7)
+    later = replace(entry, registered_at=entry.registered_at + timedelta(days=2))
+    assert later.id == entry.id
+    assert later.definition() == entry.definition()
+    assert later.configuration_fingerprint == entry.configuration_fingerprint
+    assert later.capability_fingerprint == entry.capability_fingerprint
+    assert entry.to_dict()["registered_at"] == "2026-09-21T12:30:40.123456Z"
+    path = tmp_path / "timestamp-registry.json"
+    RuntimeModelRegistry(path).add(entry)
+    restored = RuntimeModelRegistry(path).get(entry.id)
+    assert restored.registered_at == entry.registered_at
+    assert decode_registry(encode_registry((restored,))) == (entry,)
+
+
+def test_create_records_current_utc_time():
+    before = datetime.now(timezone.utc)
+    entry = RegistryEntry.create(runtime_provider=BackendType.OLLAMA, artifact_origin=ArtifactType.OLLAMA,
+        artifact_format=ArtifactFormat.OLLAMA_MANIFEST, reference="fixture:latest", display_name="fixture",
+        loader=LoaderType.OLLAMA)
+    assert before <= entry.registered_at <= datetime.now(timezone.utc)
+    assert entry.registered_at.tzinfo is timezone.utc
+
+
+@pytest.mark.parametrize("value", [None, "2026-09-21T00:00:00Z", datetime(2026, 9, 21),
+    datetime(2026, 9, 21, tzinfo=timezone(timedelta(hours=2))),
+    datetime(1969, 12, 31, tzinfo=timezone.utc)])
+def test_registry_timestamp_requires_nonnegative_utc_datetime(value):
+    with pytest.raises(ValueError, match="registered_at"):
+        replace(_entry(1), registered_at=value)
+
+
+@pytest.mark.parametrize("value", [None, 0, "2026-09-21", "2026-09-21T12:30:40.123456+02:00",
+    "2026-09-21T12:30:40.123456+00:00", "2026-09-21T12:30:40Z",
+    "1969-12-31T23:59:59.999999Z", "2026-02-30T12:30:40.123456Z"])
+def test_registry_codec_rejects_noncanonical_timestamps_and_missing_field(value):
+    from kiron_common.local_model_registry.codec import decode_registry
+    row = _entry(1).to_dict()
+    row["registered_at"] = value
+    with pytest.raises(RegistryCorruptionError):
+        decode_registry(json.dumps({"version": 2, "entries": [row]}).encode())
+    del row["registered_at"]
+    with pytest.raises(RegistryCorruptionError):
+        decode_registry(json.dumps({"version": 2, "entries": [row]}).encode())
 
 
 def test_root_first_preserves_dashboard_read_and_write_access() -> None:
@@ -270,11 +318,11 @@ def test_absent_registry_reads_as_empty_and_unknown_id_reads_none(
         b"",
         b"not json",
         b"\xff",
-        b'{"version":1,"entries":[],"extra":true}\n',
+        b'{"version":2,"entries":[],"extra":true}\n',
         b'{"version":true,"entries":[]}\n',
-        b'{"version":1,"entries":{},"entries":[]}\n',
-        b'{"version":1,"entries":[{"id":"local.0000000000000000000000000000000000000000000000000000000000000000","provider":"ollama","reference":"model:latest","display_name":"\\ud800","loader":"ollama"}]}\n',
-        b'{"version":1,"entries":[{"id":"local.0000000000000000000000000000000000000000000000000000000000000000","provider":"ollama","reference":"model:latest","display_name":"model","loader":"ollama","extra":"x"}]}\n',
+        b'{"version":2,"entries":{},"entries":[]}\n',
+        b'{"version":2,"entries":[{"id":"local.0000000000000000000000000000000000000000000000000000000000000000","runtime_provider":"ollama","reference":"model:latest","display_name":"\\ud800","loader":"ollama"}]}\n',
+        b'{"version":2,"entries":[{"id":"local.0000000000000000000000000000000000000000000000000000000000000000","runtime_provider":"ollama","reference":"model:latest","display_name":"model","loader":"ollama","extra":"x"}]}\n',
     ),
 )
 def test_corrupt_registry_is_rejected_without_fallback(
@@ -295,12 +343,12 @@ def test_registry_rejects_wrong_stable_id_duplicate_identity_and_unsorted_rows(
     second = _entry(2)
     documents = (
         {
-            "version": 1,
+            "version": 2,
             "entries": [{**first.to_dict(), "id": "local." + "0" * 64}],
         },
-        {"version": 1, "entries": [first.to_dict(), first.to_dict()]},
+        {"version": 2, "entries": [first.to_dict(), first.to_dict()]},
         {
-            "version": 1,
+            "version": 2,
             "entries": [
                 item.to_dict()
                 for item in sorted(
@@ -323,7 +371,8 @@ def test_registry_rejects_noncanonical_references_even_with_matching_ids(
 ) -> None:
     invalid = (
         RegistryEntry.create(
-            provider=LocalModelProvider.OLLAMA,
+            runtime_provider=BackendType.OLLAMA,
+        artifact_origin=ArtifactType.OLLAMA, artifact_format=ArtifactFormat.OLLAMA_MANIFEST,
             reference="model:latest",
             display_name="model",
             loader=LoaderType.OLLAMA,
@@ -331,13 +380,13 @@ def test_registry_rejects_noncanonical_references_even_with_matching_ids(
     )
     invalid["reference"] = "model"
     invalid["id"] = stable_registry_id(
-        LocalModelProvider.OLLAMA,
+        BackendType.OLLAMA,
         invalid["reference"],
     )
     path = tmp_path / "noncanonical.json"
     _write_registry_fixture(
         path,
-        json.dumps({"version": 1, "entries": [invalid]}).encode("utf-8"),
+        json.dumps({"version": 2, "entries": [invalid]}).encode("utf-8"),
     )
     with pytest.raises(RegistryCorruptionError):
         RuntimeModelRegistry(path).list()
@@ -464,10 +513,10 @@ def test_hostile_existing_registry_types_fail_closed(
     path = tmp_path / "registry.json"
     source = tmp_path / "hostile-registry-source"
     if kind == "symlink":
-        _write_registry_fixture(source, b'{"version":1,"entries":[]}\n')
+        _write_registry_fixture(source, b'{"version":2,"entries":[]}\n')
         path.symlink_to(source)
     elif kind == "hardlink":
-        _write_registry_fixture(source, b'{"version":1,"entries":[]}\n')
+        _write_registry_fixture(source, b'{"version":2,"entries":[]}\n')
         os.link(source, path)
     elif kind == "directory":
         path.mkdir()
@@ -562,3 +611,36 @@ def test_registry_package_has_no_network_download_or_process_capability() -> Non
                 assert node.id.lower() not in forbidden_names
             elif isinstance(node, ast.Attribute):
                 assert node.attr.lower() not in forbidden_names
+
+
+def test_readonly_registry_requires_existing_files_and_cannot_mutate(tmp_path):
+    path = tmp_path / "registry.json"
+    reader = RuntimeModelRegistry(path, readonly=True)
+    with pytest.raises(RegistryAccessError):
+        reader.list()
+    assert list(tmp_path.iterdir()) == []
+    RuntimeModelRegistry(path).add(_entry(1))
+    before = path.read_bytes()
+    assert reader.list() == (_entry(1),)
+    with pytest.raises(RegistryAccessError):
+        reader.add(_entry(2))
+    assert path.read_bytes() == before
+    path.unlink()
+    with pytest.raises(RegistryAccessError):
+        reader.list()
+
+
+def test_readonly_registry_is_accessible_to_group_only_reader():
+    if os.geteuid() != 0:
+        pytest.skip("cross-user check requires root")
+    reader = pwd.getpwnam("nobody")
+    directory = _cross_user_directory(uid=0, gid=reader.pw_gid)
+    path = directory / "registry.json"
+    try:
+        RuntimeModelRegistry(path).add(_entry(1))
+        assert _run_as_service(path, uid=reader.pw_uid, gid=reader.pw_gid,
+                               operation="readonly") == (_entry(1).reference,)
+        _assert_policy(path, uid=0, gid=reader.pw_gid)
+        _assert_policy(path.with_name("registry.json.lock"), uid=0, gid=reader.pw_gid)
+    finally:
+        shutil.rmtree(directory)

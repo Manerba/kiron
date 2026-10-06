@@ -31,6 +31,9 @@ import uuid
 from pathlib import Path
 
 import httpx
+
+from kiron_common.gpu_admission import AdmissionError, AdmissionStore, MemorySnapshot, RuntimeSecurity, Ticket, runtime_lock
+from kiron_common.gpu_admission.ollama_lifecycle import OllamaLifecycleOperation
 import uvicorn
 from starlette.applications import Starlette
 from starlette.datastructures import MutableHeaders
@@ -89,6 +92,10 @@ STARTUP_MARKER_PATH = RUNTIME_MARKER_DIR / "docling-vram-startup.json"
 SHUTDOWN_MARKER_PATH = RUNTIME_MARKER_DIR / "docling-vram-shutdown.json"
 GPU_SERVICE_LOADING_MARKER_PATH = RUNTIME_MARKER_DIR / "gpu-service-loading.json"
 MARKER_TTL_S = 300.0
+DOCLING_GPU_RESERVATION_BYTES = 7 * 1024**3  # Existing Docling VRAM policy.
+_docling_ticket: Ticket | None = None
+_admission_heartbeat_task: asyncio.Task | None = None
+_admission_async_unknown = False
 _ASYNC_TRIGGER_PATHS: frozenset[str] = frozenset({
     "/v1alpha/convert/source/async",
     "/v1alpha/convert/file/async",
@@ -643,6 +650,149 @@ def _open_marker_lock(path: Path) -> int:
 def _write_vram_marker(
     kind: str = "startup", ttl_s: float = MARKER_TTL_S, token: str | None = None,
 ) -> str:
+    path = _marker_path(kind)
+    path.parent.mkdir(parents=True, mode=RUNTIME_MARKER_DIR_MODE, exist_ok=True)
+    try:
+        with runtime_lock(path.parent, security=_admission_security()):
+            return _write_vram_marker_locked(kind, ttl_s=ttl_s, token=token)
+    except AdmissionError as exc:
+        raise VramGateError(str(exc)) from exc
+
+
+def _clear_vram_marker(kind: str = "startup", token: str | None = None) -> None:
+    if token is None:
+        return
+    path = _marker_path(kind)
+    try:
+        with runtime_lock(path.parent, security=_admission_security()):
+            _clear_vram_marker_locked(kind, token)
+    except AdmissionError as exc:
+        raise VramGateError(str(exc)) from exc
+
+
+def _admission_security() -> RuntimeSecurity:
+    gid = _runtime_marker_group_gid()
+    if gid is None:
+        raise AdmissionError("resource_unknown", "runtime marker group missing")
+    # The global lock may be created by any participating runtime service.
+    system_writers = RuntimeSecurity.system().writer_uids
+    return RuntimeSecurity(_runtime_marker_dir_owner_uid(), gid,
+                           _runtime_marker_file_owner_uids() | system_writers)
+
+
+def _admission_store() -> AdmissionStore:
+    return AdmissionStore(RUNTIME_MARKER_DIR, security=_admission_security())
+
+
+def _measure_admission_memory() -> MemorySnapshot:
+    try:
+        result = subprocess.run(["nvidia-smi", "--query-gpu=memory.free",
+                                 "--format=csv,noheader,nounits"],
+                                capture_output=True, text=True, timeout=0.5, check=True)
+        rows = result.stdout.strip().splitlines()
+        if len(rows) != 1:
+            raise ValueError("one GPU required")
+        free = int(rows[0]) * 1024**2
+        values = dict(line.split(":", 1) for line in Path("/proc/meminfo").read_text().splitlines())
+        host = int(values["MemAvailable"].split()[0]) * 1024
+        if free < 0 or host <= 0:
+            raise ValueError("invalid free memory")
+        return MemorySnapshot(free, host, time.monotonic())
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
+        raise AdmissionError("resource_unknown", "Docling memory measurement unavailable") from exc
+
+
+def _check_docling_admission_clear() -> None:
+    """Called after the startup overlay, before any existing Ollama eviction."""
+    try:
+        tickets = _admission_store().snapshot()
+        if _docling_ticket is not None and not tickets:
+            raise AdmissionError("resource_unknown", "Docling admission ticket disappeared")
+        for ticket in tickets:
+            if (_docling_ticket is None or ticket.operation_id != _docling_ticket.operation_id
+                    or ticket.generation != _docling_ticket.generation or ticket.phase == "unknown"):
+                raise AdmissionError("resource_conflict", "another GPU operation blocks Docling")
+    except AdmissionError as exc:
+        raise VramGateError(str(exc)) from exc
+
+
+def _reserve_docling_admission(marker_token: str, *, resident: bool = False) -> None:
+    global _docling_ticket, _admission_heartbeat_task
+    store = _admission_store()
+    overlays = {STARTUP_MARKER_PATH.name: marker_token}
+    try:
+        if _docling_ticket is not None:
+            ticket = _docling_ticket
+            _docling_ticket = store.activate_docling(ticket.operation_id, owner=ticket.owner,
+                                                     generation=ticket.generation, owned_overlays=overlays)
+        else:
+            # Already resident memory is included in measured free memory.
+            # Host demand is unmeasured; 0 claims no additional RAM estimate.
+            _docling_ticket = store.reserve(
+                operation_id=uuid.uuid4().hex, owner="kiron-docling", generation=uuid.uuid4().hex,
+                deployment_id=CONTAINER_NAME, kind="docling", exclusive=True,
+                gpu_bytes=0 if resident else DOCLING_GPU_RESERVATION_BYTES,
+                host_bytes=0, measure=_measure_admission_memory, ttl_seconds=MARKER_TTL_S,
+                owned_overlays=overlays,
+            )
+        if _admission_heartbeat_task is None or _admission_heartbeat_task.done():
+            _admission_heartbeat_task = asyncio.create_task(_docling_admission_heartbeat())
+    except AdmissionError as exc:
+        raise VramGateError(str(exc)) from exc
+
+
+def _release_docling_admission(*, confirmed: bool) -> None:
+    global _docling_ticket, _admission_async_unknown
+    ticket = _docling_ticket
+    if ticket is None:
+        return
+    try:
+        _admission_store().release(ticket.operation_id, owner=ticket.owner,
+                                   generation=ticket.generation, confirmed_terminated=confirmed)
+        if confirmed:
+            _docling_ticket = None
+            _admission_async_unknown = False
+    except AdmissionError as exc:
+        _journal_log(JOURNAL_ERR, f"Docling admission cleanup unconfirmed: {exc}")
+
+
+async def _sync_docling_admission_locked() -> None:
+    """Caller holds state_lock; retain exclusivity for unconfirmed work."""
+    global _docling_ticket
+    ticket = _docling_ticket
+    if ticket is None:
+        return
+    store = _admission_store()
+    active = await _vram_lease_active()
+    if _state == State.RUNNING and not active and not _admission_async_unknown:
+        _docling_ticket = store.transition(ticket.operation_id, owner=ticket.owner,
+                                           expected_generation=ticket.generation, phase="resident")
+    store.heartbeat(ticket.operation_id, owner=ticket.owner, generation=ticket.generation)
+
+
+async def _docling_admission_heartbeat() -> None:
+    global _backend_failed
+    while _docling_ticket is not None:
+        await asyncio.sleep(30)
+        try:
+            async with _state_lock:
+                await _sync_docling_admission_locked()
+        except AdmissionError as exc:
+            _backend_failed = True
+            _release_docling_admission(confirmed=False)
+            _journal_log(JOURNAL_ERR, f"Docling admission heartbeat failed: {exc}")
+            return
+
+
+async def _warm_prepare_with_admission(token: SlotToken, marker_token: str) -> None:
+    _check_docling_admission_clear()
+    _reserve_docling_admission(marker_token, resident=True)
+    await _call_prepare_vram_for_docling(token)
+
+
+def _write_vram_marker_locked(
+    kind: str = "startup", ttl_s: float = MARKER_TTL_S, token: str | None = None,
+) -> str:
     token = token or uuid.uuid4().hex
     path = _marker_path(kind)
     path.parent.mkdir(parents=True, mode=RUNTIME_MARKER_DIR_MODE, exist_ok=True)
@@ -700,7 +850,7 @@ def _write_vram_marker(
     return token
 
 
-def _clear_vram_marker(kind: str = "startup", token: str | None = None) -> None:
+def _clear_vram_marker_locked(kind: str = "startup", token: str | None = None) -> None:
     if token is None:
         return
     path = _marker_path(kind)
@@ -837,6 +987,8 @@ async def _vram_lease_active() -> bool:
     if _state in (State.STARTING, State.STOPPED_DIRTY, State.STOPPING):
         return True
     if _state == State.RUNNING:
+        if _admission_async_unknown:
+            return True
         if _active_requests > 0:
             return True
         if await _has_nonterminal_tasks():
@@ -900,6 +1052,7 @@ def _gc_tasks_locked(now: float) -> None:
 
     Caller must hold `_tasks_lock`.
     """
+    global _admission_async_unknown
     evict = []
     for task_id, entry in _tasks.items():
         ref = entry.created_monotonic if entry.terminal else entry.last_poll_monotonic
@@ -908,6 +1061,8 @@ def _gc_tasks_locked(now: float) -> None:
     for task_id in evict:
         entry = _tasks.pop(task_id, None)
         if entry is not None and not entry.terminal:
+            if entry.generation == _slot_generation:
+                _admission_async_unknown = True
             age = now - entry.last_poll_monotonic
             _journal_log(
                 JOURNAL_WARNING,
@@ -929,6 +1084,7 @@ async def _register_task_from_response(path: str, body_bytes: bytes, token: Slot
     Gleiche Konvention in `_mark_result_task_success`, `_refresh_task_from_poll`,
     `_has_nonterminal_tasks`.
     """
+    global _admission_async_unknown
     if token is None:
         token = _slot_generation
     if token != _slot_generation:
@@ -938,9 +1094,11 @@ async def _register_task_from_response(path: str, body_bytes: bytes, token: Slot
     try:
         data = json.loads(body_bytes)
     except (ValueError, json.JSONDecodeError):
+        _admission_async_unknown = True
         return
     task_id = data.get("task_id") if isinstance(data, dict) else None
     if not isinstance(task_id, str) or not task_id:
+        _admission_async_unknown = True
         return
     now = time.monotonic()
     async with _tasks_lock:
@@ -1213,6 +1371,7 @@ async def _dirty_retry_loop() -> None:
             )
             still = True
         if not still:
+            _release_docling_admission(confirmed=True)
             async with _state_lock:
                 if _state == State.STOPPED_DIRTY:
                     _invalidate_generation_locked()
@@ -1270,7 +1429,7 @@ async def _free_vram_for_docling(guard=None) -> None:
             name = item.get("name")
             vram = item.get("size_vram")
             if not isinstance(name, str) or not name:
-                continue
+                raise VramGateError("VRAM /api/ps Modellname unbekannt")
             if not _real_int(vram):
                 raise VramGateError(f"VRAM size_vram fuer {name} unbekannt")
             models.append({"name": name, "size_vram": vram})
@@ -1291,65 +1450,82 @@ async def _free_vram_for_docling(guard=None) -> None:
         if not to_unload:
             return
 
-        for name in to_unload:
-            await _guard()
-            try:
-                side_effects_started = True
-                r = await c.post(
-                    "/api/generate",
-                    json={"model": name, "keep_alive": 0, "stream": False},
-                    timeout=15.0,
-                )
-                r.raise_for_status()
-            except Exception as e:
-                raise VramGateError(
-                    f"Unload {name} fehlgeschlagen: {e}",
-                    side_effects_started=side_effects_started,
-                ) from e
-
-        deadline = time.monotonic() + VRAM_VERIFY_TIMEOUT_S
-        remaining_names = set(to_unload)
-        consecutive_errors = 0
-        while time.monotonic() < deadline:
-            await _guard()
-            try:
-                r = await c.get("/api/ps")
-                r.raise_for_status()
-                verify_data = r.json()
-                if not isinstance(verify_data, dict) or not isinstance(verify_data.get("models"), list):
-                    raise VramGateError(
-                        "VRAM-Verify Shape unbekannt",
-                        side_effects_started=side_effects_started,
-                    )
-                loaded = set()
-                for item in verify_data.get("models", []):
-                    if not isinstance(item, dict):
-                        raise VramGateError(
-                            "VRAM-Verify models[] Shape unbekannt",
-                            side_effects_started=side_effects_started,
+        operation_id = uuid.uuid4().hex
+        try:
+            async with OllamaLifecycleOperation(store=_admission_store(), owner="kiron-docling-unload",
+                    generation="docling-unload:" + operation_id, operation_id=operation_id,
+                    deployment_id="docling-unload:" + operation_id,
+                    deadline_monotonic=time.monotonic() + GPU_INFLIGHT_DRAIN_TIMEOUT_S
+                        + VRAM_VERIFY_TIMEOUT_S + 15) as lifecycle:
+                for name in to_unload:
+                    await _guard()
+                    try:
+                        if not side_effects_started:
+                            lifecycle.mark_started()
+                        side_effects_started = True
+                        r = await c.post(
+                            "/api/generate",
+                            json={"model": name, "keep_alive": 0, "stream": False},
+                            timeout=15.0,
                         )
-                    name = item.get("name")
-                    if isinstance(name, str):
-                        loaded.add(name)
-                remaining_names = remaining_names & loaded
-                if not remaining_names:
-                    return
-                consecutive_errors = 0
-            except VramGateError:
-                raise
-            except Exception as e:
-                consecutive_errors += 1
-                if consecutive_errors >= 3:
-                    raise VramGateError(
-                        f"VRAM-Verify abgebrochen nach 3 Fehlern: {e}",
-                        side_effects_started=side_effects_started,
-                    ) from e
-            await asyncio.sleep(1.0)
+                        r.raise_for_status()
+                    except Exception as e:
+                        raise VramGateError(
+                            f"Unload {name} fehlgeschlagen: {e}",
+                            side_effects_started=side_effects_started,
+                        ) from e
 
-        raise VramGateError(
-            f"VRAM-Verify: {len(remaining_names)} Modelle noch geladen nach {VRAM_VERIFY_TIMEOUT_S}s",
-            side_effects_started=side_effects_started,
-        )
+                deadline = time.monotonic() + VRAM_VERIFY_TIMEOUT_S
+                remaining_names = set(to_unload)
+                consecutive_errors = 0
+                while time.monotonic() < deadline:
+                    await _guard()
+                    try:
+                        r = await c.get("/api/ps")
+                        r.raise_for_status()
+                        verify_data = r.json()
+                        if not isinstance(verify_data, dict) or not isinstance(verify_data.get("models"), list):
+                            raise VramGateError(
+                                "VRAM-Verify Shape unbekannt",
+                                side_effects_started=side_effects_started,
+                            )
+                        loaded = set()
+                        for item in verify_data.get("models", []):
+                            if not isinstance(item, dict):
+                                raise VramGateError(
+                                    "VRAM-Verify models[] Shape unbekannt",
+                                    side_effects_started=side_effects_started,
+                                )
+                            name = item.get("name")
+                            if not isinstance(name, str) or not name:
+                                raise VramGateError(
+                                    "VRAM-Verify Modellname unbekannt",
+                                    side_effects_started=side_effects_started,
+                                )
+                            loaded.add(name)
+                        remaining_names = set(to_unload) & loaded
+                        if not remaining_names:
+                            lifecycle.confirm_end()
+                            return
+                        consecutive_errors = 0
+                    except VramGateError:
+                        raise
+                    except Exception as e:
+                        consecutive_errors += 1
+                        if consecutive_errors >= 3:
+                            raise VramGateError(
+                                f"VRAM-Verify abgebrochen nach 3 Fehlern: {e}",
+                                side_effects_started=side_effects_started,
+                            ) from e
+                    await asyncio.sleep(1.0)
+
+                raise VramGateError(
+                    f"VRAM-Verify: {len(remaining_names)} Modelle noch geladen nach {VRAM_VERIFY_TIMEOUT_S}s",
+                    side_effects_started=side_effects_started,
+                )
+        except AdmissionError as exc:
+            raise VramGateError("Ollama lifecycle coordination denied: " + str(exc),
+                side_effects_started=side_effects_started) from exc
 
 
 def _start() -> bool:
@@ -1552,6 +1728,10 @@ async def _start_supervisor() -> bool:
     clear_startup_marker = False
     vram_gate_passed = False
     marker_token: str | None = None
+    start_attempted = False
+    start_returned = False
+    termination_confirmed = False
+    admission_acquired = False
     try:
         try:
             marker_token = _write_vram_marker("startup", ttl_s=MARKER_TTL_S)
@@ -1562,6 +1742,7 @@ async def _start_supervisor() -> bool:
             )
             return False
         try:
+            _check_docling_admission_clear()
             await _call_prepare_vram_for_docling(None)
         except VramGateError as e:
             _journal_log(
@@ -1574,10 +1755,19 @@ async def _start_supervisor() -> bool:
             _journal_log(JOURNAL_ERR, f"VRAM-Gate unerwarteter Fehler: {e}")
             return False
         vram_gate_passed = True
+        try:
+            _reserve_docling_admission(marker_token)
+        except VramGateError as exc:
+            _journal_log(JOURNAL_ERR, f"Docling admission denied before Docker start: {exc}")
+            clear_startup_marker = True
+            return False
+        admission_acquired = True
 
         # Docker-Start + Health
         try:
+            start_attempted = True
             started = await _to_thread(_start)
+            start_returned = True
         except Exception as e:
             _journal_log(JOURNAL_WARNING, f"_start Exception: {e}")
             started = False
@@ -1616,6 +1806,7 @@ async def _start_supervisor() -> bool:
                             f"Exception: {e}",
                         )
                         target_dirty = True
+                termination_confirmed = stop_ok or not target_dirty
     except BaseException:
         # Cleanup nur beobachten, danach re-raise (F95).
         # Das finally-Block setzt den State — hier nur Container aufraeumen.
@@ -1650,6 +1841,16 @@ async def _start_supervisor() -> bool:
                     pass
         raise
     finally:
+        if not success and admission_acquired:
+            if not start_attempted:
+                termination_confirmed = True
+            elif start_returned and not termination_confirmed:
+                try:
+                    termination_confirmed = await asyncio.shield(_run_stop_once())
+                except BaseException:
+                    termination_confirmed = False
+                target_dirty = not termination_confirmed
+            _release_docling_admission(confirmed=termination_confirmed)
         # Finale State-Transition mit SHUTDOWN-Gate (F31)
         async with _state_lock:
             if _state == State.SHUTDOWN:
@@ -1673,27 +1874,17 @@ async def _start_supervisor() -> bool:
                 if count_start_failure:
                     _record_start_failure_locked()
             _state_changed.notify_all()
-        # Marker erst nach State-Transition verwalten (#563): Auf dem
-        # Erfolgspfad bleibt zwischen RUNNING-Set und der ersten
-        # Slot-Reservation in ensure_running ein kurzes Fenster mit
-        # state=RUNNING + active=0 bestehen, in dem der Lifecycle-Lease
-        # False meldet. Den Marker mit Kurz-TTL refreshen ueberbrueckt
-        # dieses Fenster ueber das Overlay; Auto-Expiry deckt Edge-
-        # Cases (Cold-Start-Caller-Cancel, no further callers) ab.
-        if marker_token is not None:
             if success:
                 try:
-                    _write_vram_marker(
-                        "startup",
-                        ttl_s=GPU_SERVICE_MARKER_SHORT_TTL_S,
-                        token=marker_token,
-                    )
-                except Exception as e:
-                    _journal_log(
-                        JOURNAL_WARNING,
-                        f"Startup-Marker-Refresh fehlgeschlagen: {e}",
-                    )
-                    _clear_vram_marker("startup", marker_token)
+                    await _sync_docling_admission_locked()
+                except AdmissionError:
+                    _backend_failed = True
+                    success = False
+        # The published admission ticket now protects the lifecycle window.
+        # Expiry alone cannot clear a shared admission overlay.
+        if marker_token is not None:
+            if success:
+                _clear_vram_marker("startup", marker_token)
             elif clear_startup_marker:
                 _clear_vram_marker("startup", marker_token)
             elif vram_gate_passed and not target_dirty:
@@ -1724,6 +1915,7 @@ async def _finalize_stop(stop_ok: bool) -> None:
         except Exception as e:
             _journal_log(JOURNAL_WARNING, f"Dirty-Inspect Exception: {e}")
             still_running = True
+    _release_docling_admission(confirmed=not still_running)
     async with _state_lock:
         if _state == State.SHUTDOWN:
             _state_changed.notify_all()
@@ -1876,7 +2068,7 @@ async def ensure_running() -> SlotToken | None:
                         _state_changed.notify_all()
                     return None
             regate_task = asyncio.create_task(
-                _call_prepare_vram_for_docling(regate_token)
+                _warm_prepare_with_admission(regate_token, marker_token)
             )
 
             async def _finish_regate(release_slot: bool) -> bool:
@@ -1893,23 +2085,15 @@ async def ensure_running() -> SlotToken | None:
                         _active_requests = max(0, _active_requests - 1)
                     _warm_regate_done.set()
                     _state_changed.notify_all()
+                    try:
+                        await _sync_docling_admission_locked()
+                    except AdmissionError:
+                        _release_docling_admission(confirmed=False)
+                        keep_slot = False
                     return keep_slot
 
             try:
                 await asyncio.shield(regate_task)
-                if marker_token is not None:
-                    try:
-                        _write_vram_marker(
-                            "startup",
-                            ttl_s=GPU_SERVICE_MARKER_SHORT_TTL_S,
-                            token=marker_token,
-                        )
-                    except Exception as e:
-                        _journal_log(
-                            JOURNAL_WARNING,
-                            "Warm-Regate Startup-Marker-Refresh "
-                            f"fehlgeschlagen: {e}",
-                        )
             except asyncio.CancelledError:
                 try:
                     await asyncio.shield(regate_task)
@@ -1934,7 +2118,7 @@ async def ensure_running() -> SlotToken | None:
                     _clear_vram_marker("startup", marker_token)
                 return None
             keep = await _finish_regate(release_slot=False)
-            if not keep and marker_token is not None:
+            if marker_token is not None:
                 _clear_vram_marker("startup", marker_token)
             return regate_token if keep else None
 
@@ -2080,7 +2264,7 @@ async def _release_slot(
     `backend_failed=True`: lokalen Backend-Fehler als global markieren;
     wenn danach keine aktiven Slots mehr laufen, Drain-Cleanup uebernehmen.
     """
-    global _state, _active_requests, _last_request_time, _backend_failed
+    global _state, _active_requests, _last_request_time, _backend_failed, _admission_async_unknown
 
     do_drain = False
     marker_token: str | None = None
@@ -2091,6 +2275,10 @@ async def _release_slot(
             print(f"  INFO: stale Slot-Release ignoriert token={token} current={_slot_generation}")
             return
         _active_requests = max(0, _active_requests - 1)
+        if not ok:
+            # Client/transport cancellation does not prove the container's
+            # GPU work ended. Keep admission until a confirmed container stop.
+            _admission_async_unknown = True
         if backend_failed:
             _backend_failed = True
         if ok and not _backend_failed and _state != State.SHUTDOWN:
@@ -2129,6 +2317,11 @@ async def _release_slot(
             _state = State.STOPPING
             do_drain = True
         _state_changed.notify_all()
+        try:
+            await _sync_docling_admission_locked()
+        except AdmissionError as exc:
+            _release_docling_admission(confirmed=False)
+            _journal_log(JOURNAL_ERR, f"Docling admission release unconfirmed: {exc}")
 
     if do_drain:
         async def _drain_cleanup() -> None:
@@ -2794,7 +2987,7 @@ async def on_startup() -> None:
     erfolgreichen VRAM-Marker, damit ein nach Crash-Restart laufender
     Container nicht unmanaged bleibt (#805).
     """
-    global _idle_watcher_task, _state, _last_request_time
+    global _idle_watcher_task, _state, _last_request_time, _admission_async_unknown
 
     marker_token: str | None = None
     try:
@@ -2847,10 +3040,23 @@ async def on_startup() -> None:
                             )
                             healthy = False
             if healthy:
+                try:
+                    if marker_token is None:
+                        raise VramGateError("takeover requires owned startup overlay")
+                    _check_docling_admission_clear()
+                    _reserve_docling_admission(marker_token, resident=True)
+                    # A proxy restart loses its async-task registry. Health is
+                    # not proof of native idle; retain exclusivity until stop.
+                    _admission_async_unknown = True
+                except VramGateError as exc:
+                    _journal_log(JOURNAL_ERR, f"Takeover admission blocked: {exc}")
+                    healthy = False
+            if healthy:
                 async with _state_lock:
                     _state = State.RUNNING
                     _last_request_time = time.monotonic()
                     _state_changed.notify_all()
+                    await _sync_docling_admission_locked()
                 print(f"Uebernehme laufenden Container {CONTAINER_NAME}")
             else:
                 try:
@@ -3030,6 +3236,7 @@ async def on_shutdown() -> None:
         raise
     finally:
         _warm_regate_done.set()
+        _release_docling_admission(confirmed=stop_clean)
         if stop_clean and marker_token is not None:
             _clear_vram_marker("shutdown", marker_token)
         elif not stop_clean:

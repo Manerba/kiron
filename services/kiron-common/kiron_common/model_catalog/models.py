@@ -14,17 +14,26 @@ class BackendType(str, Enum):
     KIRON_EMBEDDINGS = "kiron_embeddings"
     KIRON_DEBERTA = "kiron_deberta"
     OLLAMA = "ollama"
+    PRISM = "prism"
 
 
 class ArtifactType(str, Enum):
     HUGGINGFACE = "huggingface"
     OLLAMA = "ollama"
+    LOCAL = "local"
+
+
+class ArtifactFormat(str, Enum):
+    HF_WEIGHTS = "hf_weights"
+    OLLAMA_MANIFEST = "ollama_manifest"
+    GGUF = "gguf"
 
 
 class ModelTask(str, Enum):
     EMBEDDING = "embedding"
     RERANK = "rerank"
     NLI = "nli"
+    CHAT = "chat"
 
 
 class ModelEndpoint(str, Enum):
@@ -33,6 +42,8 @@ class ModelEndpoint(str, Enum):
     EMBED_COLBERT = "/api/embed_colbert"
     RERANK = "/api/rerank"
     SCORE = "/api/score"
+    CHAT_COMPLETIONS = "/v1/chat/completions"
+    RESPONSES = "/v1/responses"
 
 
 REQUEST_DEFAULT_ENDPOINTS = frozenset(
@@ -47,26 +58,30 @@ class LoaderType(str, Enum):
     CROSS_ENCODER = "cross_encoder"
     MANKEI_LAST_TOKEN = "mankei_last_token"
     OLLAMA = "ollama"
+    PRISM_GGUF = "prism_gguf"
 
 
 @dataclass(frozen=True, slots=True)
 class ArtifactFile:
     path: str
     sha256: str
+    size_bytes: int | None
 
-    def to_dict(self) -> dict[str, str]:
-        return {"path": self.path, "sha256": self.sha256}
+    def to_dict(self) -> dict[str, Any]:
+        return {"path": self.path, "sha256": self.sha256, "size_bytes": self.size_bytes}
 
 
 @dataclass(frozen=True, slots=True)
 class Artifact:
     type: ArtifactType
+    format: ArtifactFormat
     repository: str | None
     revision: str | None
     manifest_digest: str | None
     trust_remote_code: bool
     weights: tuple[ArtifactFile, ...]
     auxiliary: tuple[ArtifactFile, ...]
+    projector: ArtifactFile | None
     metadata: FrozenJSONMapping = field(
         default_factory=lambda: MappingProxyType({})
     )
@@ -81,12 +96,14 @@ class Artifact:
     def to_dict(self) -> dict[str, Any]:
         return {
             "type": self.type.value,
+            "format": self.format.value,
             "repository": self.repository,
             "revision": self.revision,
             "manifest_digest": self.manifest_digest,
             "trust_remote_code": self.trust_remote_code,
             "weights": [item.to_dict() for item in self.weights],
             "auxiliary": [item.to_dict() for item in self.auxiliary],
+            "projector": self.projector.to_dict() if self.projector is not None else None,
             "metadata": thaw_json(self.metadata),
         }
 
@@ -149,6 +166,7 @@ class Deployment:
     artifact: Artifact
     routes: tuple[Route, ...]
     loader: Loader
+    runtime_profile: str | None
     metadata: FrozenJSONMapping = field(
         default_factory=lambda: MappingProxyType({})
     )
@@ -168,6 +186,7 @@ class Deployment:
             "artifact": self.artifact.to_dict(),
             "routes": [route.to_dict() for route in self.routes],
             "loader": self.loader.to_dict(),
+            "runtime_profile": self.runtime_profile,
             "metadata": thaw_json(self.metadata),
         }
 

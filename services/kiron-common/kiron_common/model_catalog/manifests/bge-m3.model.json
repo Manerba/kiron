@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "canonical_model_id": "bge-m3:latest",
   "aliases": [
     "bge-m3"
@@ -24,11 +24,14 @@
         "weights": [
           {
             "path": "pytorch_model.bin",
-            "sha256": "b5e0ce3470abf5ef3831aa1bd5553b486803e83251590ab7ff35a117cf6aad38"
+            "sha256": "b5e0ce3470abf5ef3831aa1bd5553b486803e83251590ab7ff35a117cf6aad38",
+            "size_bytes": null
           }
         ],
         "auxiliary": [],
-        "metadata": {}
+        "metadata": {},
+        "format": "hf_weights",
+        "projector": null
       },
       "routes": [
         {
@@ -50,7 +53,8 @@
           "precision": null,
           "size": 1136000000
         }
-      }
+      },
+      "runtime_profile": null
     },
     {
       "id": "ollama-bge-m3-dense-v1.deployment",
@@ -71,11 +75,14 @@
         "weights": [
           {
             "path": "model",
-            "sha256": "daec91ffb5dd0c27411bd71f29932917c49cf529a641d0168496c3a501e3062c"
+            "sha256": "daec91ffb5dd0c27411bd71f29932917c49cf529a641d0168496c3a501e3062c",
+            "size_bytes": null
           }
         ],
         "auxiliary": [],
-        "metadata": {}
+        "metadata": {},
+        "format": "ollama_manifest",
+        "projector": null
       },
       "routes": [
         {
@@ -87,7 +94,8 @@
         "type": "ollama",
         "parameters": {}
       },
-      "metadata": {}
+      "metadata": {},
+      "runtime_profile": null
     }
   ],
   "profiles": [
@@ -161,7 +169,8 @@
             "runtime-pipeline:kiron-embeddings-role-independent-cls-fp32-l2"
           ],
           "blocking_reasons": []
-        }
+        },
+        "created": 1790035200
       }
     },
     {

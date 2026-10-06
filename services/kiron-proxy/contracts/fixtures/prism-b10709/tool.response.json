@@ -1,0 +1,15 @@
+{
+  "status": 200,
+  "headers": {
+    "Server": "llama.cpp",
+    "Access-Control-Allow-Origin": "",
+    "Content-Type": "application/json; charset=utf-8",
+    "Content-Length": "773",
+    "Keep-Alive": "timeout=5, max=100"
+  },
+  "error": null,
+  "elapsed_s": 147.748274,
+  "case": "tool",
+  "prefix": "01-tool",
+  "response_bytes": 773
+}

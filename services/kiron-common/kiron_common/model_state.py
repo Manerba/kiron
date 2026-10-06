@@ -17,6 +17,8 @@ from typing import Any
 
 from .model_catalog import (
     Artifact,
+    ArtifactFile,
+    ArtifactFormat,
     ArtifactType,
     BackendType,
     ModelCatalog,
@@ -34,6 +36,8 @@ class RuntimeState(str, Enum):
     UNLOADED = "unloaded"
     LOADING = "loading"
     LOADED = "loaded"
+    UNLOADING = "unloading"
+    FAILED = "failed"
 
 
 @dataclass(frozen=True, slots=True, order=True)
@@ -48,6 +52,7 @@ class LocalModelInventory:
 
     huggingface_revisions: frozenset[HuggingFaceRevision] = frozenset()
     ollama_tags: frozenset[str] = frozenset()
+    gguf_files: frozenset[ArtifactFile] = frozenset()
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -56,6 +61,9 @@ class LocalModelInventory:
             frozenset(self.huggingface_revisions),
         )
         object.__setattr__(self, "ollama_tags", frozenset(self.ollama_tags))
+        object.__setattr__(self, "gguf_files", frozenset(self.gguf_files))
+        if any(type(item) is not ArtifactFile or item.size_bytes is None for item in self.gguf_files):
+            raise ValueError("GGUF inventory requires exact file hashes and sizes")
         if any(type(tag) is not str or not tag for tag in self.ollama_tags):
             raise ValueError("Ollama inventory tags must be non-empty strings")
 
@@ -67,18 +75,23 @@ class BackendRuntimeSnapshot:
     known: bool
     loaded_names: frozenset[str] = frozenset()
     loading_names: frozenset[str] = frozenset()
+    unloading_names: frozenset[str] = frozenset()
+    failed_names: frozenset[str] = frozenset()
 
     def __post_init__(self) -> None:
         if type(self.known) is not bool:
             raise TypeError("known must be a bool")
         loaded = frozenset(self.loaded_names)
         loading = frozenset(self.loading_names)
-        if any(type(name) is not str or not name for name in (*loaded, *loading)):
+        unloading, failed = frozenset(self.unloading_names), frozenset(self.failed_names)
+        if any(type(name) is not str or not name for name in (*loaded, *loading, *unloading, *failed)):
             raise ValueError("runtime model names must be non-empty strings")
-        if not self.known and (loaded or loading):
+        if not self.known and (loaded or loading or unloading or failed):
             raise ValueError("unknown runtime snapshots must not carry model names")
         object.__setattr__(self, "loaded_names", loaded)
         object.__setattr__(self, "loading_names", loading)
+        object.__setattr__(self, "unloading_names", unloading)
+        object.__setattr__(self, "failed_names", failed)
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,7 +141,7 @@ class ManagedModelDefinition:
 
     @property
     def huggingface_revision(self) -> HuggingFaceRevision | None:
-        if self.artifact.type is not ArtifactType.HUGGINGFACE:
+        if self.artifact.type is not ArtifactType.HUGGINGFACE or self.artifact.format is not ArtifactFormat.HF_WEIGHTS:
             return None
         repository = self.artifact.repository
         revision = self.artifact.revision
@@ -239,6 +252,10 @@ def _is_installed(
     definition: ManagedModelDefinition,
     inventory: LocalModelInventory,
 ) -> bool:
+    if definition.artifact.format is ArtifactFormat.GGUF:
+        required = (*definition.artifact.weights,
+                    *((definition.artifact.projector,) if definition.artifact.projector else ()))
+        return all(item in inventory.gguf_files for item in required)
     hf_revision = definition.huggingface_revision
     if hf_revision is not None:
         return hf_revision in inventory.huggingface_revisions
@@ -254,6 +271,10 @@ def _runtime_state(
     if not snapshot.known:
         return RuntimeState.UNKNOWN
     names = frozenset(definition.input_names)
+    if names & snapshot.failed_names:
+        return RuntimeState.FAILED
+    if names & snapshot.unloading_names:
+        return RuntimeState.UNLOADING
     if names & snapshot.loading_names:
         return RuntimeState.LOADING
     if names & snapshot.loaded_names:
@@ -341,6 +362,9 @@ def _definition_metadata(
         embedding_kind = None
     elif ModelTask.NLI in tasks:
         model_type = "nli"
+        embedding_kind = None
+    elif ModelTask.CHAT in tasks:
+        model_type = "chat"
         embedding_kind = None
     else:
         model_type = "managed"
@@ -450,7 +474,8 @@ def build_model_state_view(catalog: ModelCatalog) -> ModelStateView:
                 )),
                 artifact=artifact,
                 required_files=tuple(sorted(
-                    {item.path for item in (*artifact.weights, *artifact.auxiliary)}
+                    {item.path for item in (*artifact.weights, *artifact.auxiliary,
+                                           *((artifact.projector,) if artifact.projector else ()))}
                 )),
                 family=metadata["family"],
                 format=metadata["format"],

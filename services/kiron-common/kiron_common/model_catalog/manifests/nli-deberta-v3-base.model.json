@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "canonical_model_id": "nli-deberta-v3-base",
   "aliases": [
     "cross-encoder/nli-deberta-v3-base"
@@ -24,11 +24,14 @@
         "weights": [
           {
             "path": "model.safetensors",
-            "sha256": "d8148c6d49e0a7925134294c56326c71fe0ab1dc390e37355e00c7efbb488afa"
+            "sha256": "d8148c6d49e0a7925134294c56326c71fe0ab1dc390e37355e00c7efbb488afa",
+            "size_bytes": null
           }
         ],
         "auxiliary": [],
-        "metadata": {}
+        "metadata": {},
+        "format": "hf_weights",
+        "projector": null
       },
       "routes": [
         {
@@ -56,9 +59,15 @@
             "neutral"
           ],
           "rerank_label": "entailment",
-          "size": 748850969
+          "size": 748850969,
+          "gpu_memory": {
+            "load_bytes": 805306368,
+            "request_bytes": 1073741824,
+            "headroom_bytes": 268435456
+          }
         }
-      }
+      },
+      "runtime_profile": null
     }
   ],
   "profiles": [

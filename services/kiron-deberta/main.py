@@ -1,6 +1,7 @@
 """Kiron DeBERTa Cross-Encoder Service mit Reranking- und NLI-API."""
 
 import asyncio
+import gc
 import logging
 import threading
 import time
@@ -12,7 +13,7 @@ import torch
 import uvicorn
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, StringConstraints
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 from kiron_common.embedding_registry import (
     MODEL_CATALOG as SHARED_MODEL_CATALOG,
@@ -33,6 +34,8 @@ from catalog_view import (
     build_deberta_service_view,
 )
 from loaders import LOADER_REGISTRY
+from operation_tracking import OperationLedger, tracked_route_class
+from kiron_common.gpu_admission.native_contract import OPERATION_PATH
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -120,6 +123,19 @@ def _gpu_error_response(error: str, exc: BaseException) -> JSONResponse:
     )
 
 
+class GPUCapacityError(Exception):
+    def __init__(self, required_bytes: int, free_bytes: int):
+        self.required_bytes = required_bytes
+        self.free_bytes = free_bytes
+        super().__init__("Nicht genuegend freier GPU-Speicher fuer das Modell.")
+
+
+def _capacity_error_response(exc: GPUCapacityError) -> JSONResponse:
+    return JSONResponse({"error": str(exc), "code": "resource_exhausted",
+                         "required_bytes": exc.required_bytes,
+                         "free_bytes": exc.free_bytes}, status_code=503)
+
+
 async def _shielded_to_thread(func, /, *args, on_cancel_error=None, **kwargs):
     """asyncio.to_thread-Variante, die bei Cancellation auf Thread-Ende wartet (#835).
 
@@ -192,6 +208,11 @@ class ScoreRequest(BaseModel):
     pairs: list[Any] = Field(max_length=256)
 
 
+class UnloadRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    model: str = Field(min_length=1)
+
+
 # --- Model Manager ---
 
 class ModelManager:
@@ -232,8 +253,18 @@ class ModelManager:
                 and self.model is not None
                 and self.config is not None
             ):
+                self._check_memory(self.config, loading=False)
                 return self.model, self.config
         return await _shielded_to_thread(self._load_model, short_name)
+
+    def _check_memory(self, config: DebertaServiceModel, *, loading: bool) -> None:
+        # Fresh device-wide free memory includes allocations by unmanaged apps.
+        # The old resident remains accounted for during transactional replacement.
+        free, _total = torch.cuda.mem_get_info()
+        budget = config.gpu_memory
+        required = budget.additional_bytes(loading=loading) + budget.headroom_bytes
+        if free < required:
+            raise GPUCapacityError(required, free)
 
     def _load_model(
         self, short_name: str
@@ -244,6 +275,7 @@ class ModelManager:
             if not torch.cuda.is_available():
                 raise RuntimeError("CUDA nicht verfuegbar - DeBERTa Service benoetigt GPU")
             config = self._service_view.require_runtime_model(short_name)
+            self._check_memory(config, loading=True)
 
             # Transactional: neues Modell laden, altes erst nach erfolgreichem Load freigeben (#438)
             hf_name = config.artifact.repository
@@ -283,15 +315,22 @@ class ModelManager:
             with self._state_lock:
                 self.loading_model = None
 
-    async def unload(self) -> bool:
+    async def unload(self, expected_model: str | None = None) -> bool:
         async with self._lock:
-            return self._unload_locked()
+            # Check the target under the inference/load lock. A model switch
+            # after dashboard discovery must never unload the replacement.
+            with self._state_lock:
+                if expected_model is not None and self.current_model_name != expected_model:
+                    return False
+            return await _shielded_to_thread(self._unload_locked)
 
     def _unload_locked(self) -> bool:
         """Modell entladen - Caller MUSS _lock halten."""
         with self._state_lock:
             if self.model is None:
                 return False
+            if torch.cuda.is_initialized():
+                torch.cuda.synchronize()
             old_model = self.model
             old_name = self.current_model_name
             self.model = None
@@ -300,6 +339,9 @@ class ModelManager:
             self.loading_model = None
         logger.info(f"Entlade {old_name}...")
         del old_model
+        # Transformers can retain cyclic Python references. Collect them before
+        # releasing the CUDA allocator cache, while the inference lock is held.
+        gc.collect()
         torch.cuda.empty_cache()
         logger.info("Modell entladen, VRAM freigegeben.")
         return True
@@ -338,6 +380,31 @@ async def lifespan(app):
 
 
 app = FastAPI(title="Kiron DeBERTa Cross-Encoder", lifespan=lifespan)
+operation_ledger = OperationLedger()
+
+
+async def _confirm_operation_end() -> bool:
+    # All model work uses _shielded_to_thread, including cancellation. Acquire
+    # the same lock before confirming that no GPU work remains in this process.
+    async with model_manager._lock:
+        if torch.cuda.is_initialized():
+            try:
+                await _shielded_to_thread(torch.cuda.synchronize)
+            except Exception:
+                logger.exception("Native operation end could not be confirmed")
+                return False
+        return True
+
+
+app.router.route_class = tracked_route_class(operation_ledger, _confirm_operation_end)
+
+
+@app.get(OPERATION_PATH + "{operation_id}")
+async def operation_status(operation_id: str):
+    snapshot = operation_ledger.snapshot(operation_id)
+    if snapshot is None:
+        return JSONResponse({"error": "operation unknown"}, status_code=404)
+    return JSONResponse(snapshot, headers={"Cache-Control": "no-store"})
 
 
 # --- Reranking-Endpoint ---
@@ -377,6 +444,8 @@ async def rerank(req: RerankRequest):
     async with model_manager._lock:
         try:
             model, config = await model_manager.get_model(resolved)
+        except GPUCapacityError as exc:
+            return _capacity_error_response(exc)
         except OSError:
             logger.exception(f"OSError beim Laden von Modell '{resolved}'")
             return JSONResponse(
@@ -555,6 +624,8 @@ async def score(req: ScoreRequest):
     async with model_manager._lock:
         try:
             model, config = await model_manager.get_model(resolved)
+        except GPUCapacityError as exc:
+            return _capacity_error_response(exc)
         except OSError:
             logger.exception(f"OSError beim Laden von Modell '{resolved}'")
             return JSONResponse(
@@ -748,6 +819,8 @@ async def load_model_endpoint(body: dict):
         try:
             await model_manager.get_model(resolved)
             return {"status": "ok", "model": resolved}
+        except GPUCapacityError as exc:
+            return _capacity_error_response(exc)
         except OSError:
             logger.exception(f"OSError beim Laden von Modell '{resolved}'")
             return JSONResponse(
@@ -778,12 +851,17 @@ async def load_model_endpoint(body: dict):
 
 
 @app.post("/api/unload")
-async def unload_model_endpoint():
-    """Modell entladen und VRAM freigeben."""
-    unloaded = await model_manager.unload()
-    if unloaded:
-        return {"status": "unloaded"}
-    return {"status": "no_model_loaded"}
+async def unload_model_endpoint(req: UnloadRequest):
+    """Genau das angegebene Modell entladen; wiederholte Aufrufe sind harmlos."""
+    resolved = normalize_model_name(req.model)
+    if resolved is None:
+        return JSONResponse({"error": f"Modell '{req.model}' nicht unterstuetzt."}, status_code=400)
+    try:
+        unloaded = await model_manager.unload(expected_model=resolved)
+        return {"status": "unloaded", "model": resolved, "already": not unloaded}
+    except Exception:
+        logger.exception("[%s] Fehler beim Entladen", resolved)
+        return JSONResponse({"error": f"Modell '{resolved}' konnte nicht entladen werden."}, status_code=500)
 
 
 @app.get("/api/tags")

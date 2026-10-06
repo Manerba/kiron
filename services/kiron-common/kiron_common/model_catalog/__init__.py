@@ -14,6 +14,7 @@ from .errors import (
 from .models import (
     Artifact,
     ArtifactFile,
+    ArtifactFormat,
     ArtifactType,
     Backend,
     BackendType,
@@ -39,6 +40,7 @@ from .resources import (
 __all__ = [
     "Artifact",
     "ArtifactFile",
+    "ArtifactFormat",
     "ArtifactType",
     "Backend",
     "BackendType",

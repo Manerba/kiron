@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "demo_repository": "https://github.com/PrismML-Eng/Bonsai-demo",
+  "demo_commit": "23da1365df0364ef9e98d1cd18db6b0c06295751",
+  "source_repository": "https://github.com/PrismML-Eng/llama.cpp",
+  "source_commit": "9a9394a895b96003ca842a6041cb28ac49a108f7",
+  "release_tag": "prism-b10709-9a9394a",
+  "archive": {
+    "url": "https://github.com/PrismML-Eng/llama.cpp/releases/download/prism-b10709-9a9394a/llama-prism-b10709-9a9394a-bin-linux-cuda-12.8-x64.tar.gz",
+    "bytes": 167241119,
+    "sha256": "8aec67eb023b251712c7e6490f367b5671bf587eced1436a9b85f4a90c3b7d3d",
+    "platform": "linux-x86_64",
+    "cuda": "12.8"
+  },
+  "source_license": {
+    "spdx": "MIT",
+    "url": "https://raw.githubusercontent.com/PrismML-Eng/llama.cpp/9a9394a895b96003ca842a6041cb28ac49a108f7/LICENSE",
+    "bytes": 1078,
+    "sha256": "94f29bbed6a22c35b992c5c6ebf0e7c92f13b836b90f36f461c9cf2f0f1d010d",
+    "verified_date": "2026-09-21",
+    "scope": "Pinned upstream source LICENSE; bundled third-party libraries retain their own licenses."
+  }
+}

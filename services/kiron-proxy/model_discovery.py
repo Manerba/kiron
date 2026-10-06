@@ -6,9 +6,10 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from kiron_common.catalog_consistency import check_catalog_digests
-from kiron_common.local_model_registry import LocalModelProvider, RegistryEntry
+from kiron_common.local_model_registry import RegistryEntry
 from kiron_common.local_model_registry.models import canonical_ollama_reference
-from kiron_common.model_catalog import BackendType, LoaderType, ModelTask
+from kiron_common.embedding_registry import build_embedding_registry
+from kiron_common.model_catalog import ArtifactFormat, BackendType, LoaderType, ModelTask
 from kiron_common.model_state import (
     BackendRuntimeSnapshot,
     HuggingFaceRevision,
@@ -138,14 +139,24 @@ def build_runtime_inventory(
 def service_huggingface_inventory(
     state_view: ModelStateView,
     health_by_backend: Mapping[BackendType, object],
+    *,
+    reachable_backends: Sequence[BackendType],
 ) -> frozenset[HuggingFaceRevision]:
-    """Validate service-reported exact HF inventory against the local Catalog."""
+    """Validate exact HF inventory reported by currently reachable services."""
 
     if not isinstance(health_by_backend, Mapping):
         raise TypeError("health_by_backend must be a mapping")
+    selected_backends = tuple(reachable_backends)
+    if any(backend not in _SERVICE_BACKENDS for backend in selected_backends):
+        raise ValueError("reachable_backends contains an unsupported backend")
+    if len(set(selected_backends)) != len(selected_backends):
+        raise ValueError("reachable_backends must not contain duplicates")
+    if not selected_backends:
+        return frozenset()
+
     payloads: dict[BackendType, Mapping[str, Any]] = {}
     reported_digests: dict[str, object] = {}
-    for backend in _SERVICE_BACKENDS:
+    for backend in selected_backends:
         raw = health_by_backend.get(backend)
         payload = raw if isinstance(raw, Mapping) else {}
         payloads[backend] = payload
@@ -154,13 +165,13 @@ def service_huggingface_inventory(
     digest_report = check_catalog_digests(
         state_view.catalog_digest,
         reported_digests,
-        required_services=tuple(backend.value for backend in _SERVICE_BACKENDS),
+        required_services=tuple(backend.value for backend in selected_backends),
     )
     if not digest_report.consistent:
         raise ServiceInventoryError("; ".join(digest_report.errors))
 
     installed: set[HuggingFaceRevision] = set()
-    for backend in _SERVICE_BACKENDS:
+    for backend in selected_backends:
         path = f"/{backend.value}/model_states"
         rows = payloads[backend].get("model_states")
         if not isinstance(rows, list):
@@ -281,6 +292,27 @@ def _catalog_token_limits(
     return limits
 
 
+def _embedding_profiles(registry, definition: ManagedModelDefinition) -> list[dict[str, Any]]:
+    group = registry.resolve(definition.canonical_model_id)
+    if group is None:
+        return []
+    return [
+        {
+            "profile_id": profile["profile_id"],
+            "kind": profile["kind"],
+            "endpoint": profile["endpoint"],
+            "verification": {
+                "status": profile["verification"]["status"],
+                "blocking_reasons": list(profile["verification"]["blocking_reasons"]),
+            },
+            "index_compatibility_id": profile["index_compatibility_id"],
+            "query_compatibility_id": profile["query_compatibility_id"],
+        }
+        for profile in group.capabilities["profiles"]
+        if profile["profile_id"] in definition.profile_ids
+    ]
+
+
 def _ollama_native_context_length(payload: object) -> int | None:
     if not isinstance(payload, Mapping):
         return None
@@ -311,7 +343,10 @@ def _managed_local_row(
     ollama_show_rows: Mapping[str, Mapping[str, Any]],
     *,
     catalog_token_limits: list[dict[str, Any]],
+    embedding_profiles: list[dict[str, Any]],
     catalog_digest: str,
+    installation_known: bool,
+    service_memory: object,
 ) -> dict[str, Any]:
     definition = state.definition
     runtime_row = (
@@ -335,9 +370,16 @@ def _managed_local_row(
     elif runtime_row is not None and is_real_int(total) and is_real_int(vram):
         vram_gb = _gb_or_none(vram)
         ram_gb = round(max(0, total - vram) / (1024 ** 3), 2)
-    else:
+    elif state.runtime_state is RuntimeState.UNLOADED:
         vram_gb = 0.0
         ram_gb = 0.0
+    else:
+        vram_gb = None
+        ram_gb = None
+    memory = service_memory.get(definition.backend.value) if isinstance(service_memory, dict) else None
+    if (not state.loaded or not isinstance(memory, dict)
+            or definition.backend_model_name not in memory.get("loaded_models", [])):
+        memory = None
     service_embedding = definition.backend is BackendType.KIRON_EMBEDDINGS
     embedding_capable = (
         service_embedding and ModelTask.EMBEDDING in definition.tasks
@@ -353,7 +395,7 @@ def _managed_local_row(
         "endpoints": [endpoint.value for endpoint in definition.endpoints],
         "catalog_digest": catalog_digest,
         "configured": state.configured,
-        "installed": state.installed,
+        "installed": state.installed if installation_known else None,
         "runtime_state": state.runtime_state.value,
         "loaded": state.loaded,
         "loading": state.loading,
@@ -369,6 +411,7 @@ def _managed_local_row(
         "embedding_loading": service_embedding and state.loading,
         "vram_gb": vram_gb,
         "ram_gb": ram_gb,
+        "service_memory": memory,
         "native_context_length": _ollama_native_context_length(show_row),
         "runtime_context_length": (
             runtime_row.get("context_length")
@@ -377,8 +420,11 @@ def _managed_local_row(
             and runtime_row["context_length"] > 0
             else None
         ),
+        "runtime_device": ("cpu" if runtime_row["size_vram"] == 0 else "gpu")
+        if runtime_row is not None and is_real_int(runtime_row.get("size_vram")) and runtime_row["size_vram"] >= 0 else None,
         "catalog_context_length": definition.context_length,
         "catalog_token_limits": catalog_token_limits,
+        "embedding_profiles": embedding_profiles,
         "expires_at": runtime_row.get("expires_at") if runtime_row else None,
         "embedding_only": service_embedding,
         "managed_service": definition.backend is not BackendType.OLLAMA,
@@ -387,7 +433,7 @@ def _managed_local_row(
         "catalog_managed": True,
         "locally_registered": False,
         "registry_id": None,
-        "provider": None,
+        "runtime_provider": None,
         "reference": None,
         "loader": None,
     }
@@ -420,9 +466,12 @@ def _generic_local_row(
     elif is_real_int(total) and is_real_int(vram):
         vram_gb = _gb_or_none(vram)
         ram_gb = round(max(0, total - vram) / (1024 ** 3), 2)
-    else:
+    elif runtime_state is RuntimeState.UNLOADED:
         vram_gb = 0.0
         ram_gb = 0.0
+    else:
+        vram_gb = None
+        ram_gb = None
     return {
         "name": name,
         "configured": False,
@@ -442,6 +491,7 @@ def _generic_local_row(
         "profile_ids": [],
         "deployment_ids": [],
         "size_gb": _gb_or_none(row.get("size")),
+        "runtime_device": ("cpu" if vram == 0 else "gpu") if is_real_int(vram) and vram >= 0 else None,
         "embedding_capable": False,
         "embedding_active": False,
         "embedding_loading": False,
@@ -465,7 +515,9 @@ def _generic_local_row(
         "catalog_managed": False,
         "locally_registered": True,
         "registry_id": registration.id,
-        "provider": registration.provider.value,
+        "runtime_provider": registration.runtime_provider.value,
+        "artifact_origin": registration.artifact_origin.value,
+        "artifact_format": registration.artifact_format.value,
         "reference": registration.reference,
         "display_name": registration.display_name,
         "loader": registration.loader.value,
@@ -484,7 +536,7 @@ def _registered_huggingface_row(registration: RegistryEntry) -> dict[str, Any]:
         "name": registration.display_name,
         "configured": False,
         "installed": True,
-        "backend": LocalModelProvider.HUGGINGFACE.value,
+        "backend": registration.runtime_provider.value,
         "runtime_state": RuntimeState.UNKNOWN.value,
         "loaded": False,
         "loading": False,
@@ -512,11 +564,13 @@ def _registered_huggingface_row(registration: RegistryEntry) -> dict[str, Any]:
         "embedding_only": False,
         "managed_service": False,
         "embedding_kind": None,
-        "source": LocalModelProvider.HUGGINGFACE.value,
+        "source": "local_registry",
         "catalog_managed": False,
         "locally_registered": True,
         "registry_id": registration.id,
-        "provider": registration.provider.value,
+        "runtime_provider": registration.runtime_provider.value,
+        "artifact_origin": registration.artifact_origin.value,
+        "artifact_format": registration.artifact_format.value,
         "reference": registration.reference,
         "display_name": registration.display_name,
         "loader": registration.loader.value,
@@ -528,7 +582,9 @@ def _apply_registration(row: dict[str, Any], registration: RegistryEntry) -> Non
         {
             "locally_registered": True,
             "registry_id": registration.id,
-            "provider": registration.provider.value,
+            "runtime_provider": registration.runtime_provider.value,
+        "artifact_origin": registration.artifact_origin.value,
+        "artifact_format": registration.artifact_format.value,
             "reference": registration.reference,
             "display_name": registration.display_name,
             "loader": registration.loader.value,
@@ -540,6 +596,7 @@ def build_local_models_payload(
     *,
     state_view: ModelStateView,
     huggingface_revisions: frozenset[HuggingFaceRevision],
+    unavailable_huggingface_backends: frozenset[BackendType],
     ollama_tag_rows: object,
     ollama_ps: object,
     embedding_health: object,
@@ -548,9 +605,17 @@ def build_local_models_payload(
     deberta_reachable: bool,
     registrations: Sequence[RegistryEntry],
     ollama_show_by_name: Mapping[str, Mapping[str, Any]],
+    service_memory: object,
 ) -> dict[str, Any]:
     """Build the complete local model wire from injected observations."""
 
+    if type(unavailable_huggingface_backends) is not frozenset or any(
+        backend not in _SERVICE_BACKENDS
+        for backend in unavailable_huggingface_backends
+    ):
+        raise TypeError(
+            "unavailable_huggingface_backends must be a frozenset of service backends"
+        )
     native_rows = _native_rows(ollama_tag_rows, path="/ollama/tags/models")
     native_names = frozenset(row["name"] for row in native_rows)
     if not isinstance(registrations, Sequence) or any(
@@ -585,6 +650,7 @@ def build_local_models_payload(
                 "/ollama/show contains duplicate canonical names"
             )
         ollama_show_rows[key] = payload
+    embedding_registry = build_embedding_registry(state_view.catalog)
     rows = [
         _managed_local_row(
             state,
@@ -595,6 +661,11 @@ def build_local_models_payload(
                 state.definition,
             ),
             catalog_digest=state_view.catalog_digest,
+            embedding_profiles=_embedding_profiles(embedding_registry, state.definition),
+            installation_known=(
+                state.definition.backend not in unavailable_huggingface_backends
+            ),
+            service_memory=service_memory,
         )
         for state in managed_states
     ]
@@ -616,9 +687,19 @@ def build_local_models_payload(
 
     ollama_runtime = runtime.for_backend(BackendType.OLLAMA)
     for registration in registrations:
-        if registration.provider is LocalModelProvider.HUGGINGFACE:
+        if registration.artifact_format is ArtifactFormat.HF_WEIGHTS:
             rows.append(_registered_huggingface_row(registration))
             continue
+        if registration.runtime_provider is BackendType.PRISM:
+            row = _registered_huggingface_row(registration)
+            row.update(model_type="llm", embedding_capable=False, installed=None,
+                       installation_known=False, deployment_ids=[registration.id],
+                       size_gb=_gb_or_none(registration.size_bytes),
+                       format=registration.artifact_format.value)
+            rows.append(row)
+            continue
+        if registration.runtime_provider is not BackendType.OLLAMA:
+            raise InventoryShapeError("unsupported registration provider")
         definition = state_view.resolve(
             registration.reference,
             BackendType.OLLAMA,

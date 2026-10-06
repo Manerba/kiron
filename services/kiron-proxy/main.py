@@ -10,6 +10,7 @@ import socket
 import sys
 import threading
 from pathlib import Path
+from uuid import uuid4
 
 import time
 
@@ -18,12 +19,27 @@ import uvicorn
 
 from request_store import RequestStore
 from proxy import create_proxy_app
-from app import app as dashboard_app, set_store, set_metrics_db, set_db_work_tracker, set_api_key_store, restore_maintenance_state, OLLAMA_BASE_URL
+from app import (
+    OLLAMA_BASE_URL,
+    app as dashboard_app,
+    restore_maintenance_state,
+    set_api_key_store,
+    set_db_work_tracker,
+    set_high_res_history_service,
+    set_metrics_db,
+    set_store,
+    _verify_model_unloaded,
+)
 from history_db import MetricsDB
+from high_res_history import HighResHistoryService
 import metrics
 from api_key_store import ApiKeyStore
 from openai_api import create_openai_api_app
 import vram_lease
+from runtime_composition import build_runtime_service
+from native_admission import make_store as ollama_admission_store
+from native_admission import native_operation_reconciler
+from kiron_common.gpu_admission.ollama_lifecycle import OllamaLifecycleOperation
 
 _SERVER_BACKLOG = 2048
 _SERVER_BINDINGS = (
@@ -354,9 +370,10 @@ async def metrics_writer(db: MetricsDB, db_work: DBWorkTracker | None = None):
 async def _promote_cpu_resident_models() -> int:
     """Unloaded alle Ollama-Modelle die vollstaendig auf CPU liegen.
 
-    Pro entladetes Modell sendet diese Funktion `keep_alive=0` an /api/generate.
-    Ollama stellt den Befehl hinter laufende Requests in die Queue — keine
-    Disruption. Der naechste Chat-Request zum entladenen Modell triggert
+    Pro entladetes Modell sendet diese Funktion `keep_alive=0` an /api/generate,
+    nachdem die gemeinsame Ollama-Lifecyclesperre aktive Anfragen drainiert hat.
+    Unklare Arbeit oder verwaltete Residenttickets verhindern die Promotion.
+    Der naechste Chat-Request zum entladenen Modell triggert
     Ollama's Lazy-Load; weil der VRAM-Lease inaktiv ist, kein num_gpu=0
     mehr injiziert wird, landet das Modell dann auf GPU.
 
@@ -406,12 +423,27 @@ async def _promote_cpu_resident_models() -> int:
             unloaded = 0
             for name in cpu_models:
                 try:
-                    r = await client.post("/api/generate",
-                                          json={"model": name, "keep_alive": 0, "stream": False})
-                    if r.status_code == 200:
+                    operation_id = uuid4().hex
+                    async with OllamaLifecycleOperation(store=ollama_admission_store(),
+                            owner="kiron-proxy-promote", generation="promote:" + operation_id,
+                            operation_id=operation_id, deployment_id="promote:" + operation_id,
+                            deadline_monotonic=time.monotonic() + 30) as lifecycle:
+                        lifecycle.mark_started()
+                        try:
+                            r = await client.post("/api/generate",
+                                json={"model": name, "keep_alive": 0, "stream": False})
+                        except (httpx.ConnectError, httpx.PoolTimeout):
+                            lifecycle.confirm_end()  # No backend request was sent.
+                            raise
+                        if r.status_code != 200:
+                            log.warning("promote: unload %s → HTTP %s", name, r.status_code)
+                            continue
+                        verify_error = await _verify_model_unloaded(client, name)
+                        if verify_error is not None:
+                            log.warning("promote: unload %s konnte nicht bestaetigt werden", name)
+                            continue
+                        lifecycle.confirm_end()
                         unloaded += 1
-                    else:
-                        log.warning("promote: unload %s → HTTP %s", name, r.status_code)
                 except Exception:
                     log.exception("promote: unload %s fehlgeschlagen", name)
             return unloaded
@@ -654,6 +686,12 @@ async def main():
 
     _, pending_metrics_initial_task = await _run_initial_producer_tick(store)
 
+    # Eigenstaendige 250-ms-RAM-Historie. Sie teilt weder Cache noch SQLite-
+    # Writer mit dem bestehenden Metrikpfad.
+    high_res_history = HighResHistoryService()
+    set_high_res_history_service(high_res_history)
+    high_res_history.start()
+
     # Metrics-Producer, Metrics-Writer und Retention als Background-Tasks
     background_tasks = [
         asyncio.create_task(disk_io_sampler()),
@@ -662,11 +700,17 @@ async def main():
         asyncio.create_task(metrics_writer(db, db_work)),
         asyncio.create_task(daily_retention(db, retention_cancel, db_work)),
         asyncio.create_task(lease_release_watcher()),
+        asyncio.create_task(native_operation_reconciler()),
     ]
 
+    runtime_service = None
     try:
         # VRAM-Lease: shared httpx-Client zu Docling-Lifecycle (#285)
         async with vram_lease.lifespan_client():
+            runtime_service = build_runtime_service()
+            proxy_app.state.local_inference = runtime_service
+            dashboard_app.state.local_inference = runtime_service
+            openai_app.state.local_inference = runtime_service
             # Alle Server parallel starten
             await asyncio.gather(
                 proxy_server.serve(sockets=[server_sockets["proxy"]]),
@@ -674,6 +718,11 @@ async def main():
                 openai_server.serve(sockets=[server_sockets["openai"]]),
             )
     finally:
+        if runtime_service is not None:
+            try:
+                await runtime_service.aclose()
+            except Exception:
+                log.exception("Local runtime cleanup failed; unconfirmed admission remains blocked")
         retention_cancel.set()
         for task in background_tasks:
             task.cancel()
@@ -684,6 +733,8 @@ async def main():
             )
         except asyncio.TimeoutError:
             log.warning("Shutdown timeout: background tasks did not complete within 30s")
+        await high_res_history.stop()
+        set_high_res_history_service(None)
         drained = await db_work.drain(timeout=30.0)
         if not drained:
             # #713: db.close() schliesst Connections cross-thread - laeuft ein

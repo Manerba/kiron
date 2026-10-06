@@ -20,7 +20,7 @@ def test_tmpfiles_models_issue_859_runtime_data_and_cache_paths():
         "d /usr/lib/kiron 0755 root root -",
         "d /usr/lib/kiron/data 0755 root root -",
         "d /usr/lib/kiron/data/kiron-proxy 0750 kiron-proxy kiron-proxy -",
-        "d /usr/lib/kiron/data/shared 2750 kiron-proxy kiron-config -",
+        "d /usr/lib/kiron/data/shared 2750 kiron-proxy kiron-common -",
         "d /usr/lib/kiron/data/local-models 2750 root kiron-common -",
         "d /var/cache/kiron 0755 root root -",
         "d /var/cache/kiron/huggingface 2770 root kiron-models -",
@@ -45,14 +45,14 @@ def test_install_system_configs_creates_identities_helpers_sudoers_and_tmpfiles(
 
     assert "ensure_kiron_service_identity kiron-proxy docker kiron-runtime kiron-common" in script
     assert "ensure_kiron_service_identity kiron-docling docker kiron-runtime kiron-common" in script
-    assert "ensure_kiron_service_identity kiron-embeddings kiron-models kiron-config kiron-common video render" in script
+    assert "ensure_kiron_service_identity kiron-embeddings kiron-models kiron-config kiron-common kiron-runtime video render" in script
     assert "ensure_kiron_service_identity kiron-deberta kiron-models kiron-common video render" in script
-    assert "verify_service_identity kiron-embeddings kiron-models kiron-config kiron-common video render" in script
+    assert "verify_service_identity kiron-embeddings kiron-models kiron-config kiron-common kiron-runtime video render" in script
     assert "verify_service_identity kiron-deberta kiron-models kiron-common video render" in script
     assert 'usermod -G "$csv" "$user"' in script
     assert 'groups="$(id -nG "$user" | tr ' in script
     assert "ensure_kitt_worker_identity" in script
-    assert '[ "$groups" = "kitt-worker" ]' in script
+    assert '[ "$groups" = "kiron-runtime kitt-worker" ]' in script
     assert "ensure_kiron_dashboard_env_contract" in script
     assert "verify_not_symlink /etc/kiron/dashboard.env" in script
     assert "[ -f /etc/kiron/dashboard.env ]" in script
@@ -155,7 +155,7 @@ def test_deploy_local_applies_code_common_and_data_owner_model_without_restart_c
     assert "/etc/kiron/dashboard.env muss root:root 0600 sein" in script
     assert "apply_code_permissions" in script
     assert "apply_data_permissions" in script
-    assert "COMMON_CONSUMERS=(kiron-proxy kiron-docling kiron-embeddings kiron-deberta)" in script
+    assert "COMMON_CONSUMERS=(kiron-proxy kiron-docling kiron-embeddings kiron-deberta kiron-prism kitt-worker)" in script
     assert 'for svc in "${COMMON_CONSUMERS[@]}"; do' in script
     assert 'kiron_common fehlt im $svc venv' in script
     assert 'kiron_common.catalog_consistency, kiron_common.model_state' in script
@@ -165,7 +165,7 @@ def test_deploy_local_applies_code_common_and_data_owner_model_without_restart_c
     assert 'apply_readonly_tree_permissions "$DST/services/$svc" "$group"' in script
     assert 'chown kiron-proxy:kiron-proxy "$PROXY_DATA_DIR"' in script
     assert 'chmod 0750 "$PROXY_DATA_DIR"' in script
-    assert 'chown kiron-proxy:kiron-config "$SHARED_DATA_DIR"' in script
+    assert 'chown kiron-proxy:kiron-common "$SHARED_DATA_DIR"' in script
     assert 'chmod 2750 "$SHARED_DATA_DIR"' in script
     assert 'chown root:kiron-proxy "$DST/data/db_config.json"' in script
     assert 'chmod 0640 "$DST/data/db_config.json"' in script

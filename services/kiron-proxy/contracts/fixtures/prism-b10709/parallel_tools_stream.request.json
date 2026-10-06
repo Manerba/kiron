@@ -1,0 +1,49 @@
+{
+  "url": "http://127.0.0.1:18089/v1/chat/completions",
+  "method": "POST",
+  "json": {
+    "model": "bonsai-probe",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Call weather for Berlin and Paris, once each, in parallel."
+      }
+    ],
+    "temperature": 0,
+    "max_tokens": 128,
+    "reasoning_format": "deepseek",
+    "reasoning_effort": "none",
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "weather",
+          "strict": true,
+          "description": "Return the temperature for the requested city.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "city": {
+                "type": "string",
+                "enum": [
+                  "Berlin",
+                  "Paris"
+                ]
+              }
+            },
+            "required": [
+              "city"
+            ],
+            "additionalProperties": false
+          }
+        }
+      }
+    ],
+    "tool_choice": "required",
+    "parallel_tool_calls": true,
+    "stream": true,
+    "stream_options": {
+      "include_usage": true
+    }
+  }
+}

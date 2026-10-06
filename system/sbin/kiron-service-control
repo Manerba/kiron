@@ -13,6 +13,9 @@ unit="$2"
 
 case "$verb $unit" in
     "restart kiron-proxy.service" | \
+    "start kiron-prism.service" | \
+    "stop kiron-prism.service" | \
+    "restart kiron-prism.service" | \
     "start kiron-embeddings.service" | \
     "stop kiron-embeddings.service" | \
     "restart kiron-embeddings.service" | \

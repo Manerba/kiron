@@ -24,7 +24,7 @@ MANIFEST_ROOT = (
 )
 VALIDATOR_PATH = ROOT / "scripts" / "validate-model-catalog.py"
 EXPECTED_DIGEST = (
-    "sha256:c91229d7ea472b49d87f6344dbfb640fc760f43e8cace398421d5b364452e6f6"
+    "sha256:be10f0dca76de099a561f53ba77adab9e4c9b9e7238ae10ac6d8b506206f4fc0"
 )
 
 if str(COMMON_SOURCE) not in sys.path:
@@ -32,10 +32,11 @@ if str(COMMON_SOURCE) not in sys.path:
 
 from kiron_common.embedding_registry import build_embedding_registry  # noqa: E402
 from kiron_common.local_model_registry import (  # noqa: E402
-    LocalModelProvider,
     RegistryEntry,
 )
 from kiron_common.model_catalog import (  # noqa: E402
+    ArtifactFormat,
+    ArtifactType,
     BackendType,
     LoaderType,
     ModelEndpoint,
@@ -151,6 +152,8 @@ def test_operational_validator_is_stable_complete_and_read_only(monkeypatch):
         "/api/embed_colbert": 1,
         "/api/rerank": 5,
         "/api/score": 5,
+        "/v1/chat/completions": 0,
+        "/v1/responses": 0,
     }
 
 
@@ -664,7 +667,9 @@ def test_registered_ollama_inventory_stays_outside_managed_catalog_metadata():
     )
     payload = discovery.build_local_models_payload(
         state_view=state_view,
+        service_memory=None,
         huggingface_revisions=frozenset(),
+        unavailable_huggingface_backends=frozenset(),
         ollama_tag_rows=[
             {
                 "name": "qwen3:8b",
@@ -679,7 +684,9 @@ def test_registered_ollama_inventory_stays_outside_managed_catalog_metadata():
         deberta_reachable=True,
         registrations=(
             RegistryEntry.create(
-                provider=LocalModelProvider.OLLAMA,
+                runtime_provider=BackendType.OLLAMA,
+                artifact_origin=ArtifactType.OLLAMA,
+                artifact_format=ArtifactFormat.OLLAMA_MANIFEST,
                 reference="qwen3:8b",
                 display_name="qwen3:8b",
                 loader=LoaderType.OLLAMA,
@@ -782,9 +789,24 @@ def test_missing_required_group_stops_before_mutation_stop_or_venv_build(
     env, log = _instrumented_env(tmp_path, validator_fails=False)
     real_id = shutil.which("id")
     assert real_id is not None
-    id_wrapper = Path(env["PATH"].split(":", 1)[0]) / "id"
+    bin_dir = Path(env["PATH"].split(":", 1)[0])
+    real_getent = shutil.which("getent")
+    assert real_getent is not None
+    _write_wrapper(
+        bin_dir / "getent",
+        'if [ "${1:-}" = "group" ]; then echo "${2}:x:1000:"; exit 0; fi\n'
+        f'exec "{real_getent}" "$@"\n',
+    )
+    id_wrapper = bin_dir / "id"
     _write_wrapper(
         id_wrapper,
+        'if [ "${1:-}" = "-u" ] && [ -n "${2:-}" ]; then echo 1000; exit 0; fi\n'
+        'if [ "${1:-}" = "-nG" ]; then\n'
+        '  case "${2:-}" in\n'
+        '    kiron-proxy) echo "kiron-proxy docker kiron-runtime kiron-common kiron-config kiron-prism-control"; exit 0;;\n'
+        '    kiron-docling) echo "kiron-docling docker kiron-runtime kiron-common"; exit 0;;\n'
+        '  esac\n'
+        'fi\n'
         'if [ "${1:-}" = "-nG" ] && [ "${2:-}" = "kiron-embeddings" ]; then\n'
         '  echo "kiron-embeddings kiron-models kiron-config video render"\n'
         "  exit 0\n"

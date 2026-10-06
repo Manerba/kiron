@@ -117,10 +117,6 @@ class _BackendResponse:
         pass
 
 
-async def _pass_options(_options):
-    return openai_api.vram_lease.LeaseOutcome.PASS
-
-
 class LazyOverlayMarkerTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         _configure_runtime(proxy.vram_lease)
@@ -160,34 +156,43 @@ class LazyOverlayMarkerTests(unittest.IsolatedAsyncioTestCase):
         finally:
             proxy.vram_lease.clear_overlay_marker("startup", token)
 
-    async def test_openai_already_loaded_fast_path_blocks_startup_marker(self):
-        token = openai_api.vram_lease.write_overlay_marker("startup", ttl_s=60)
-        store = _Store()
-        ollama_client = _BackendClient(ps={
-            "models": [{"name": "qwen3:8b", "size_vram": 123}],
-        })
+    async def test_openai_resident_model_cannot_bypass_shared_admission(self):
+        """The new API delegates admission to RuntimeService, without Ollama shortcuts."""
+        import time
+        from kiron_common.gpu_admission import AdmissionError, AdmissionStore, MemorySnapshot
+        from kiron_common.local_inference import ErrorCode, LocalInferenceError, RuntimeFailure
+        from kiron_common.model_catalog import BackendType
+        from test_openai_runtime_api import FakeRuntime
 
+        admission = AdmissionStore(proxy.vram_lease.RUNTIME_MARKER_DIR,
+                                   security=proxy.vram_lease._admission_security())
+        class RuntimeWithAdmission(FakeRuntime):
+            async def chat(self, request):
+                try:
+                    admission.reserve(operation_id=request.context.request_id, owner="test-api",
+                        generation="fixture-generation", deployment_id=request.model.deployment.id,
+                        kind="request", gpu_bytes=0, host_bytes=0,
+                        measure=lambda: MemorySnapshot(100,100,time.monotonic()))
+                except AdmissionError:
+                    raise LocalInferenceError(RuntimeFailure(ErrorCode.CONFLICT,"resource busy")) from None
+                raise AssertionError("startup overlay must block before inference")
+
+        runtime = RuntimeWithAdmission(BackendType.OLLAMA)
+        token = proxy.vram_lease.write_overlay_marker("startup", ttl_s=60)
         try:
-            with mock.patch.object(openai_api.httpx, "AsyncClient", return_value=ollama_client):
-                app = openai_api.create_openai_api_app(store, _ApiKeys())
-
-            transport = httpx.ASGITransport(app=app)
-            with mock.patch.object(openai_api.vram_lease, "apply_options_dict", new=_pass_options):
-                async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
-                    resp = await client.post(
-                        "/v1/chat/completions",
-                        headers={"Authorization": "Bearer test"},
-                        json={
-                            "model": "qwen3:8b",
-                            "messages": [{"role": "user", "content": "hi"}],
-                            "stream": False,
-                        },
-                    )
-
-            self.assertEqual(resp.status_code, 409)
-            self.assertEqual(ollama_client.sent, [])
+            app = openai_api.create_openai_api_app(_Store(), _ApiKeys())
+            app.state.local_inference = runtime
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url="http://testserver") as client:
+                response = await client.post("/v1/chat/completions",
+                    headers={"Authorization":"Bearer test"},
+                    json={"model":"alias","messages":[{"role":"user","content":"hi"}]})
+            self.assertEqual(response.status_code,503)
+            self.assertEqual(response.json()["error"]["code"],"resource_busy")
+            self.assertNotIn("events",runtime.calls)
+            self.assertEqual(admission.snapshot(),())
+            self.assertTrue(proxy.vram_lease.STARTUP_MARKER_PATH.exists())
         finally:
-            openai_api.vram_lease.clear_overlay_marker("startup", token)
+            proxy.vram_lease.clear_overlay_marker("startup",token)
 
     async def test_ollama_unreachable_does_not_leak_loading_marker(self):
         """Regression: Ollama-Transport-Fehler beim already_loaded-Check darf

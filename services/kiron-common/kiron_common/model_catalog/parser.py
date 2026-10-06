@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from pathlib import PurePosixPath
 from collections.abc import Mapping
 from typing import TypeVar
 
@@ -11,6 +12,7 @@ from .errors import CatalogValidationError
 from .models import (
     Artifact,
     ArtifactFile,
+    ArtifactFormat,
     ArtifactType,
     Backend,
     BackendType,
@@ -27,7 +29,7 @@ from .models import (
 )
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _STABLE_ID = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
 _HF_REVISION = re.compile(r"^[0-9a-f]{40}$")
@@ -44,6 +46,7 @@ _ENDPOINTS_FOR_TASK = {
     ),
     ModelTask.RERANK: frozenset((ModelEndpoint.RERANK,)),
     ModelTask.NLI: frozenset((ModelEndpoint.SCORE,)),
+    ModelTask.CHAT: frozenset((ModelEndpoint.CHAT_COMPLETIONS, ModelEndpoint.RESPONSES)),
 }
 
 EnumT = TypeVar("EnumT")
@@ -171,7 +174,7 @@ def _artifact_files(
         item = _object(
             raw,
             path=item_path,
-            required=("path", "sha256"),
+            required=("path", "sha256", "size_bytes"),
             source=source,
         )
         artifact_path = _literal_string(
@@ -187,7 +190,10 @@ def _artifact_files(
         if artifact_path in paths:
             _fail(path, f"duplicate artifact path {artifact_path!r}", source)
         paths.add(artifact_path)
-        items.append(ArtifactFile(path=artifact_path, sha256=digest))
+        size = item["size_bytes"]
+        if size is not None and (type(size) is not int or size <= 0):
+            _fail(f"{item_path}/size_bytes", "must be a positive integer or null", source)
+        items.append(ArtifactFile(path=artifact_path, sha256=digest, size_bytes=size))
     return tuple(sorted(items, key=lambda item: item.path))
 
 
@@ -202,12 +208,14 @@ def _parse_artifact(
         path=path,
         required=(
             "type",
+            "format",
             "repository",
             "revision",
             "manifest_digest",
             "trust_remote_code",
             "weights",
             "auxiliary",
+            "projector",
             "metadata",
         ),
         source=source,
@@ -215,6 +223,7 @@ def _parse_artifact(
     artifact_type = _enum(
         artifact["type"], ArtifactType, path=f"{path}/type", source=source
     )
+    artifact_format = _enum(artifact["format"], ArtifactFormat, path=f"{path}/format", source=source)
     repository = artifact["repository"]
     revision = artifact["revision"]
     manifest_digest = artifact["manifest_digest"]
@@ -246,6 +255,10 @@ def _parse_artifact(
     auxiliary = _artifact_files(
         artifact["auxiliary"], path=f"{path}/auxiliary", source=source
     )
+    projector = (None if artifact["projector"] is None else
+                 _artifact_files([artifact["projector"]], path=f"{path}/projector", source=source)[0])
+    if projector is not None and projector.path in {item.path for item in (*weights, *auxiliary)}:
+        _fail(f"{path}/projector", "projector must be a distinct file", source)
     overlap = {item.path for item in weights}.intersection(
         item.path for item in auxiliary
     )
@@ -286,7 +299,7 @@ def _parse_artifact(
             )
         if not weights:
             _fail(f"{path}/weights", "must contain at least one weight", source)
-    else:
+    elif artifact_type is ArtifactType.OLLAMA:
         if repository is not None or revision is not None:
             _fail(
                 path,
@@ -307,18 +320,42 @@ def _parse_artifact(
             )
         if not weights:
             _fail(f"{path}/weights", "must contain at least one model blob", source)
+    elif artifact_type is ArtifactType.LOCAL:
+        if repository is not None or revision is not None or manifest_digest is not None or trust_remote_code:
+            _fail(path, "local artifacts require null repository/revision/manifest and no remote code", source)
+        if not weights:
+            _fail(f"{path}/weights", "must contain at least one weight", source)
+    else:
+        _fail(path, "unsupported artifact origin", source)
+
+    if artifact_type is ArtifactType.OLLAMA and artifact_format is not ArtifactFormat.OLLAMA_MANIFEST:
+        _fail(f"{path}/format", "Ollama origin requires ollama_manifest format", source)
+    if artifact_format is ArtifactFormat.OLLAMA_MANIFEST and artifact_type is not ArtifactType.OLLAMA:
+        _fail(f"{path}/type", "ollama_manifest requires Ollama origin", source)
+    if artifact_format is ArtifactFormat.GGUF:
+        if len(weights) != 1 or trust_remote_code:
+            _fail(path, "GGUF requires exactly one primary file and no remote code", source)
+        for item in (*weights, *((projector,) if projector else ())):
+            candidate = PurePosixPath(item.path)
+            if (not candidate.is_absolute() or str(candidate) != item.path or ".." in candidate.parts
+                    or candidate.suffix != ".gguf" or item.size_bytes is None):
+                _fail(path, "GGUF files require canonical absolute paths, SHA256 and size", source)
+    elif projector is not None:
+        _fail(f"{path}/projector", "projector requires GGUF format", source)
 
     metadata = freeze_json_mapping(
         artifact["metadata"], path=f"{path}/metadata", source=source
     )
     return Artifact(
         type=artifact_type,
+        format=artifact_format,
         repository=repository,
         revision=revision,
         manifest_digest=manifest_digest,
         trust_remote_code=trust_remote_code,
         weights=weights,
         auxiliary=auxiliary,
+        projector=projector,
         metadata=metadata,
     )
 
@@ -407,7 +444,7 @@ def _parse_deployment(
     raw = _object(
         value,
         path=path,
-        required=("id", "backend", "artifact", "routes", "loader", "metadata"),
+        required=("id", "backend", "artifact", "routes", "loader", "runtime_profile", "metadata"),
         source=source,
     )
     deployment_id = _stable_id(raw["id"], path=f"{path}/id", source=source)
@@ -416,6 +453,8 @@ def _parse_deployment(
         raw["artifact"], path=f"{path}/artifact", source=source
     )
     loader = _parse_loader(raw["loader"], path=f"{path}/loader", source=source)
+    runtime_profile = (None if raw["runtime_profile"] is None else
+                       _stable_id(raw["runtime_profile"], path=f"{path}/runtime_profile", source=source))
     raw_routes = _array(raw["routes"], path=f"{path}/routes", source=source)
     if not raw_routes:
         _fail(f"{path}/routes", "must contain at least one route", source)
@@ -439,19 +478,35 @@ def _parse_deployment(
                 "the Ollama backend requires the ollama loader ID",
                 source,
             )
-    else:
-        if artifact.type is not ArtifactType.HUGGINGFACE:
+    elif backend.type in (BackendType.KIRON_EMBEDDINGS, BackendType.KIRON_DEBERTA):
+        if artifact.type is not ArtifactType.HUGGINGFACE or artifact.format is not ArtifactFormat.HF_WEIGHTS:
             _fail(
                 f"{path}/artifact/type",
                 "KIron service backends require a HuggingFace artifact",
                 source,
             )
-        if loader.type is LoaderType.OLLAMA:
+        allowed_loaders = {
+            BackendType.KIRON_EMBEDDINGS: (LoaderType.SENTENCE_TRANSFORMERS,
+                LoaderType.TRANSFORMERS_LAST_TOKEN, LoaderType.COLBERT_XMOD),
+            BackendType.KIRON_DEBERTA: (LoaderType.CROSS_ENCODER, LoaderType.MANKEI_LAST_TOKEN),
+        }
+        if loader.type not in allowed_loaders[backend.type]:
             _fail(
                 f"{path}/loader/type",
-                "the ollama loader ID is restricted to the Ollama backend",
+                "loader is not supported by the selected runtime backend",
                 source,
             )
+    elif backend.type is BackendType.PRISM:
+        if artifact.format is not ArtifactFormat.GGUF or loader.type is not LoaderType.PRISM_GGUF:
+            _fail(path, "Prism requires GGUF and prism_gguf loader", source)
+        if runtime_profile is None:
+            _fail(f"{path}/runtime_profile", "Prism requires a runtime profile", source)
+        if any(route.task is not ModelTask.CHAT for route in routes):
+            _fail(f"{path}/routes", "Prism currently supports only declared Chat routes", source)
+    else:
+        _fail(path, "unsupported runtime backend", source)
+    if backend.type is not BackendType.PRISM and runtime_profile is not None:
+        _fail(f"{path}/runtime_profile", "runtime profile is currently restricted to Prism", source)
 
     return Deployment(
         id=deployment_id,
@@ -459,6 +514,7 @@ def _parse_deployment(
         artifact=artifact,
         routes=routes,
         loader=loader,
+        runtime_profile=runtime_profile,
         metadata=freeze_json_mapping(
             raw["metadata"], path=f"{path}/metadata", source=source
         ),

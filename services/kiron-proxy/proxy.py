@@ -14,11 +14,15 @@ from starlette.routing import Route, Mount
 
 from request_store import RequestStore, RequestRecord
 import vram_lease
+from native_admission import NativeRequestOperation, NativeStreamingResponse
+from ollama_embedding import EmbeddingRequestError, prepare_request as prepare_ollama_embedding
+from kiron_common.gpu_admission import AdmissionError
 
 from kiron_common.embedding_contract import EmbeddingContractError
 from kiron_common.embedding_registry import (
     EMBEDDING_REGISTRY,
     attach_show_capabilities,
+    build_embedding_registry,
     input_type_error_payload,
     merge_discovery_tags,
     resolve_profile_input_type,
@@ -282,6 +286,7 @@ def create_proxy_app(
     # Mandatory startup validator: discovery must never start with an
     # inconsistent, duplicated, or hash-invalid profile registry.
     EMBEDDING_REGISTRY.validate()
+    request_embedding_registry = build_embedding_registry(routing_view.catalog)
 
     # #299: Request-Logging-Fehler duerfen den Proxy-Erfolg nicht kippen.
     # Wenn MariaDB nach dem Start ausfaellt oder update_request wirft, bekommt der
@@ -293,12 +298,20 @@ def create_proxy_app(
             import logging
             logging.getLogger("proxy").exception("request_store.add_request fehlgeschlagen")
 
+    log_updates = set()
+
     async def _safe_log_update(request_id, **kwargs):
-        try:
-            await request_store.update_request(request_id, **kwargs)
-        except Exception:
-            import logging
-            logging.getLogger("proxy").exception("request_store.update_request fehlgeschlagen")
+        async def update():
+            try:
+                await request_store.update_request(request_id, **kwargs)
+            except Exception:
+                import logging
+                logging.getLogger("proxy").exception("request_store.update_request fehlgeschlagen")
+        # A cancelled ASGI scope must not cancel the final database update.
+        pending = asyncio.create_task(update())
+        log_updates.add(pending)
+        pending.add_done_callback(log_updates.discard)
+        await asyncio.shield(pending)
 
     # Langlebiger httpx Client mit Connection-Pooling
     http_client = httpx.AsyncClient(
@@ -343,17 +356,60 @@ def create_proxy_app(
         ),
         follow_redirects=False,
     )
+    client_backends = {id(http_client): "ollama", id(embed_client): "kiron_embeddings",
+                       id(deberta_client): "kiron_deberta"}
 
-    def _gpu_gate_response(decision: vram_lease.GPUGateDecision) -> Response:
+    def _native_request_operation(client, record, target_url, body, gpu_op, method):
+        return NativeRequestOperation(backend=client_backends[id(client)], endpoint=target_url,
+            model=extract_model_from_body(body) or record.model, body=body, gpu_operation=gpu_op,
+            method=method, routing_view=routing_view)
+
+    async def _admission_error_response(error, record, start_time):
+        status = 409 if error.code == "resource_conflict" else 503
+        detail = " " + json.dumps(error.details, sort_keys=True) if error.details is not None else ""
+        response = _gpu_gate_response(vram_lease.GPUGateDecision(
+            False, error.code, status_code=status, lease_state="admission"), error.details)
+        await _safe_log_update(record.id, state="error", status_code=status,
+            duration_ms=round((time.monotonic() - start_time) * 1000, 1),
+            error_message=f"GPU admission blocked: {error.code}{detail}",
+            response_body=response.body.decode("utf-8"))
+        return response
+
+    def _gpu_gate_response(decision: vram_lease.GPUGateDecision, admission_details=None) -> Response:
+        exhausted = decision.reason == "resource_exhausted"
+        payload = {
+            "error": "Nicht genuegend freier GPU-Speicher" if exhausted else "GPU-Operation blockiert",
+            "hint": ("Speicher freigeben und die Anfrage erneut senden." if exhausted else
+                     "Eine andere GPU-Operation laeuft oder ihr Abschluss ist unklar."),
+            "vram_lease": "active",
+            "reason": decision.reason,
+            "marker_kind": decision.marker_kind,
+            "lease_state": decision.lease_state,
+        }
+        if admission_details is not None and exhausted:
+            memory = {key: admission_details[key] for key in (
+                "gpu_free_bytes", "gpu_requested_bytes", "headroom_bytes", "gpu_pending_bytes",
+                "host_available_bytes", "host_requested_bytes", "host_pending_bytes",
+            )}
+            memory["gpu_required_bytes"] = (memory["gpu_requested_bytes"] + memory["headroom_bytes"]
+                                            + memory["gpu_pending_bytes"])
+            memory["host_required_bytes"] = memory["host_requested_bytes"] + memory["host_pending_bytes"]
+            gpu_short = memory["gpu_required_bytes"] > memory["gpu_free_bytes"]
+            host_short = memory["host_required_bytes"] > memory["host_available_bytes"]
+            resource = "GPU- und Host-Speicher" if gpu_short and host_short else (
+                "GPU-Speicher" if gpu_short else "Host-Speicher")
+            free = memory["gpu_free_bytes"] if gpu_short else memory["host_available_bytes"]
+            required = memory["gpu_required_bytes"] if gpu_short else memory["host_required_bytes"]
+            pending = memory["gpu_pending_bytes"] if gpu_short else memory["host_pending_bytes"]
+            payload.update(
+                error=(f"{resource}: Admission vor Inferenzstart abgelehnt. "
+                       f"{free / 1024**2:g} MiB frei, {required / 1024**2:g} MiB erforderlich "
+                       f"(davon {pending / 1024**2:g} MiB offene Reservierungen)."),
+                code="resource_exhausted", stage="admission", inference_started=False,
+                vram_lease="not_acquired", memory=memory,
+            )
         return Response(
-            content=json.dumps({
-                "error": "GPU-Operation blockiert",
-                "hint": "Eine andere GPU-Operation laeuft oder ihr Abschluss ist unklar.",
-                "vram_lease": "active",
-                "reason": decision.reason,
-                "marker_kind": decision.marker_kind,
-                "lease_state": decision.lease_state,
-            }),
+            content=json.dumps(payload),
             status_code=decision.status_code,
             media_type="application/json",
             headers={"X-Kiron-VRAM-Lease": "blocked"},
@@ -582,6 +638,8 @@ def create_proxy_app(
         request_body: bytes,
         managed_route: ProxyRoute | None,
     ) -> vram_lease.GPUServiceOperation | None:
+        if vram_lease.is_native_unload(request_body, request_path):
+            return None
         is_managed_ollama_embedding = (
             managed_route is not None
             and managed_route.endpoint is ModelEndpoint.EMBED
@@ -820,6 +878,7 @@ def create_proxy_app(
                     managed_route.canonical_model_id,
                     managed_endpoint.value,
                     request_data.get("input_type"),
+                    registry=request_embedding_registry,
                 )
                 if input_decision is not None and not input_decision.accepted:
                     request_body_text = body.decode("utf-8", errors="replace")
@@ -852,6 +911,31 @@ def create_proxy_app(
                         media_type="application/json",
                     )
 
+                if managed_route.backend is BackendType.OLLAMA and input_decision is not None:
+                    profile = request_embedding_registry.profile(managed_route.profile_id)
+                    try:
+                        prepared = prepare_ollama_embedding(
+                            request_data, profile, input_decision.canonical_input_type,
+                        )
+                    except EmbeddingRequestError as exc:
+                        record = RequestRecord(
+                            client_ip=client_ip, method=method, path=path,
+                            model=requested_model, request_size=len(body),
+                            is_streaming=is_streaming, state="active",
+                            request_body=_truncate_for_log(body.decode("utf-8", errors="replace")),
+                        )
+                        await _safe_log_add(record)
+                        await _safe_log_update(
+                            record.id, state="error", status_code=400,
+                            duration_ms=round((time.monotonic() - start_time) * 1000, 1),
+                            error_message=exc.payload["error"]["code"],
+                        )
+                        return Response(
+                            content=json.dumps(exc.payload), status_code=400,
+                            media_type="application/json",
+                        )
+                    body = json.dumps(prepared, ensure_ascii=False).encode("utf-8")
+
         if managed_route is not None:
             body = _replace_model_in_body(
                 body,
@@ -862,12 +946,14 @@ def create_proxy_app(
         # VRAM-Lease Intercept (#285): Docling beansprucht GPU waehrend
         # STARTING/RUNNING+active/STOPPED_DIRTY. Bytes-Helper entscheidet
         # anhand Policy (block/force_cpu/pass) ueber Outcome.
-        body, lease_outcome = await vram_lease.apply_bytes(
-            body,
-            path,
-            model,
-            routing_view,
-        )
+        lease_outcome = vram_lease.LeaseOutcome.PASS
+        if method == "POST":
+            body, lease_outcome = await vram_lease.apply_bytes(
+                body,
+                path,
+                model,
+                routing_view,
+            )
         # #611: Warnung NACH apply_bytes, damit FORCE_CPU (num_gpu=0) den
         # irrefuehrenden GPU-Partial-Offload-Hinweis korrekt unterdrueckt.
         perf_warning = check_num_ctx_warning(body, path)
@@ -934,8 +1020,8 @@ def create_proxy_app(
             and managed_route.backend is BackendType.KIRON_DEBERTA
         ):
             resolved_deberta = managed_route.backend_model_name
-            gpu_op = await _begin_deberta_lazy_operation(resolved_deberta)
-            if not gpu_op.allowed:
+            gpu_op = await _begin_deberta_lazy_operation(resolved_deberta) if method == "POST" else None
+            if gpu_op is not None and not gpu_op.allowed:
                 duration_ms = (time.monotonic() - start_time) * 1000
                 await _safe_log_update(
                     record.id,
@@ -1050,8 +1136,8 @@ def create_proxy_app(
                 raise AssertionError("managed ColBERT route disappeared")
             gpu_op = await _begin_embedding_lazy_operation(
                 managed_route.backend_model_name
-            )
-            if not gpu_op.allowed:
+            ) if method == "POST" else None
+            if gpu_op is not None and not gpu_op.allowed:
                 duration_ms = (time.monotonic() - start_time) * 1000
                 await _safe_log_update(
                     record.id,
@@ -1159,8 +1245,8 @@ def create_proxy_app(
 
             if managed_route.backend is BackendType.KIRON_EMBEDDINGS:
                 # Kleine Modelle → Embedding-Service (schnell, FP16)
-                gpu_op = await _begin_embedding_lazy_operation(normalized)
-                if not gpu_op.allowed:
+                gpu_op = await _begin_embedding_lazy_operation(normalized) if method == "POST" else None
+                if gpu_op is not None and not gpu_op.allowed:
                     duration_ms = (time.monotonic() - start_time) * 1000
                     await _safe_log_update(
                         record.id,
@@ -1310,7 +1396,7 @@ def create_proxy_app(
             )
 
         gpu_op = None
-        if standard_client is http_client:
+        if standard_client is http_client and method == "POST":
             gpu_op = await _begin_ollama_lazy_operation(
                 path,
                 model,
@@ -1486,6 +1572,7 @@ def create_proxy_app(
         """Nicht-Streaming Request verarbeiten und komplett weiterleiten."""
 
         backend_response = None
+        operation = _native_request_operation(http_client, record, target_url, body, gpu_op, method)
         gpu_marker_no_start = False
         try:
             try:
@@ -1495,7 +1582,9 @@ def create_proxy_app(
                     headers=headers,
                     content=body,
                 )
-                backend_response = await http_client.send(backend_request, stream=True)
+                backend_response = await operation.send(http_client, backend_request)
+            except AdmissionError as exc:
+                return await _admission_error_response(exc, record, start_time)
             except (httpx.ConnectError, httpx.PoolTimeout):
                 gpu_marker_no_start = True
                 raise
@@ -1530,7 +1619,7 @@ def create_proxy_app(
             # Body inkrementell einlesen und bei Ueberschreitung abbrechen.
             body_chunks: list[bytes] = []
             total_size = 0
-            async for chunk in backend_response.aiter_bytes():
+            async for chunk in operation.chunks(backend_response):
                 total_size += len(chunk)
                 if total_size > MAX_RESPONSE_SIZE:
                     if gpu_op is not None and gpu_op.token is not None:
@@ -1586,14 +1675,7 @@ def create_proxy_app(
                 elif 400 <= backend_response.status_code < 500:
                     gpu_op.clear_marker = True
         finally:
-            try:
-                if backend_response is not None:
-                    await backend_response.aclose()
-            finally:
-                if gpu_op is not None:
-                    if gpu_marker_no_start and gpu_op.token is not None:
-                        gpu_op.clear_marker = True
-                    await vram_lease.finish_gpu_service_operation(gpu_op)
+            await operation.close()
 
         duration_ms = (time.monotonic() - start_time) * 1000
         response_size = len(response_body)
@@ -1681,6 +1763,7 @@ def create_proxy_app(
     ) -> StreamingResponse:
         """Streaming Request (NDJSON) verarbeiten und Chunks durchleiten."""
 
+        operation = _native_request_operation(http_client, record, target_url, body, gpu_op, method)
         gpu_marker_no_start = False
         try:
             try:
@@ -1691,10 +1774,10 @@ def create_proxy_app(
                     content=body,
                 )
 
-                backend_response = await http_client.send(
-                    backend_request,
-                    stream=True,
-                )
+                backend_response = await operation.send(http_client, backend_request)
+            except AdmissionError as exc:
+                await operation.close()
+                return await _admission_error_response(exc, record, start_time)
             except (httpx.ConnectError, httpx.PoolTimeout):
                 gpu_marker_no_start = True
                 raise
@@ -1703,10 +1786,7 @@ def create_proxy_app(
                     gpu_marker_no_start = True
                 raise
         except BaseException:
-            if gpu_op is not None:
-                if gpu_marker_no_start and gpu_op.token is not None:
-                    gpu_op.clear_marker = True
-                await vram_lease.finish_gpu_service_operation(gpu_op)
+            await operation.close()
             raise
 
         try:
@@ -1729,15 +1809,21 @@ def create_proxy_app(
             )
         except BaseException:
             # Connection-Leak verhindern wenn Exception vor StreamingResponse-Rueckgabe auftritt
-            try:
-                await backend_response.aclose()
-            finally:
-                if gpu_op is not None:
-                    await vram_lease.finish_gpu_service_operation(gpu_op)
+            await operation.close()
             raise
+
+        stream_started = False
+
+        async def finalize_unstarted():
+            if not stream_started:
+                await _safe_log_update(record.id, state="error",
+                    duration_ms=round((time.monotonic() - start_time) * 1000, 1),
+                    error_message="Client disconnected before response body")
 
         async def stream_generator():
             """Generator der NDJSON-Chunks durchleitet und dabei parst."""
+            nonlocal stream_started
+            stream_started = True
             total_response_size = 0
             tokens_generated = 0
             last_line_data = None
@@ -1766,7 +1852,7 @@ def create_proxy_app(
                     response_text_len += len(text)
 
             try:
-                async for chunk in backend_response.aiter_bytes():
+                async for chunk in operation.chunks(backend_response):
                     # NDJSON parsen: Chunks koennen unvollstaendige Zeilen enthalten.
                     # Buffer-Limit VOR yield pruefen, sonst leakt der ueberschreitende
                     # Chunk noch an den Client bevor der RuntimeError feuert.
@@ -1972,28 +2058,19 @@ def create_proxy_app(
                         pass
 
             finally:
-                try:
-                    await backend_response.aclose()
-                finally:
-                    if gpu_op is not None:
-                        if gpu_op.token is not None:
-                            if (
-                                200 <= backend_response.status_code < 300
-                                and not stream_corrupted
-                                and isinstance(last_line_data, dict)
-                                and last_line_data.get("done") is True
-                                and not last_line_data.get("error")
-                            ):
-                                gpu_op.clear_marker = True
-                            elif 400 <= backend_response.status_code < 500:
-                                gpu_op.clear_marker = True
-                        await vram_lease.finish_gpu_service_operation(gpu_op)
+                await operation.close()
 
-        return StreamingResponse(
-            content=stream_generator(),
-            status_code=backend_response.status_code,
-            headers=response_headers,
-        )
+        try:
+            return NativeStreamingResponse(
+                content=stream_generator(),
+                operation=operation,
+                finalize=finalize_unstarted,
+                status_code=backend_response.status_code,
+                headers=response_headers,
+            )
+        except BaseException:
+            await operation.close()
+            raise
 
     # Catch-All Route fuer alle Pfade und Methoden
     async def catch_all(request: Request) -> Response:
@@ -2012,6 +2089,8 @@ def create_proxy_app(
     async def shutdown_clients():
         import logging
         logger = logging.getLogger("proxy")
+        if log_updates:
+            await asyncio.wait(tuple(log_updates), timeout=10)
         for client_name, client in (
             ("http_client", http_client),
             ("embed_client", embed_client),

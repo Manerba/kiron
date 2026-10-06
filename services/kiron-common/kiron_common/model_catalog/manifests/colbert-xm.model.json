@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "canonical_model_id": "colbert-xm:latest",
   "aliases": [
     "colbert-xm"
@@ -24,16 +24,20 @@
         "weights": [
           {
             "path": "model.safetensors",
-            "sha256": "9c74a0fabc96993d671aa8550eec103bd31ec62a5c50c570b41ec628a8985b3c"
+            "sha256": "9c74a0fabc96993d671aa8550eec103bd31ec62a5c50c570b41ec628a8985b3c",
+            "size_bytes": null
           }
         ],
         "auxiliary": [
           {
             "path": "artifact.metadata",
-            "sha256": "9df4cb28e86271ee5aa21eb3d3b97773315d7975fed800a50a0f4766da2cb9e3"
+            "sha256": "9df4cb28e86271ee5aa21eb3d3b97773315d7975fed800a50a0f4766da2cb9e3",
+            "size_bytes": null
           }
         ],
-        "metadata": {}
+        "metadata": {},
+        "format": "hf_weights",
+        "projector": null
       },
       "routes": [
         {
@@ -56,7 +60,8 @@
           "precision": null,
           "size": 3410847320
         }
-      }
+      },
+      "runtime_profile": null
     }
   ],
   "profiles": [

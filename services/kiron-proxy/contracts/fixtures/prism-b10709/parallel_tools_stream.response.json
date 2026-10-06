@@ -1,0 +1,16 @@
+{
+  "status": 200,
+  "headers": {
+    "Server": "llama.cpp",
+    "Access-Control-Allow-Origin": "",
+    "X-Accel-Buffering": "no",
+    "Content-Type": "text/event-stream",
+    "Transfer-Encoding": "chunked",
+    "Keep-Alive": "timeout=5, max=100"
+  },
+  "error": null,
+  "elapsed_s": 111.499343,
+  "case": "parallel_tools_stream",
+  "prefix": "01-parallel_tools_stream",
+  "response_bytes": 4132
+}

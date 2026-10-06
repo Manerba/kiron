@@ -1,0 +1,35 @@
+[Unit]
+Description=KIron Prism local inference controller
+After=network.target
+StartLimitBurst=3
+StartLimitIntervalSec=300
+
+[Service]
+Type=simple
+User=kiron-prism
+Group=kiron-prism
+SupplementaryGroups=kiron-common kiron-config kiron-runtime kiron-prism-control video render
+WorkingDirectory=/usr/lib/kiron/services/kiron-prism
+ExecStart=/usr/lib/kiron/services/kiron-prism/venv/bin/python main.py --policy /usr/lib/kiron/data/prism-runtime-policy.json
+Restart=on-failure
+RestartSec=10
+KillMode=mixed
+TimeoutStopSec=65
+SendSIGKILL=yes
+UMask=0027
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/run/kiron/prism /run/kiron/vram
+NoNewPrivileges=true
+RestrictSUIDSGID=true
+LockPersonality=true
+PrivateDevices=false
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET
+
+[Install]
+WantedBy=multi-user.target

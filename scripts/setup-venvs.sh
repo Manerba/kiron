@@ -14,7 +14,7 @@ set -e
 
 SRC="/opt/kiron"
 DST="/usr/lib/kiron"
-SERVICES=(kiron-proxy kiron-docling kiron-embeddings kiron-deberta kitt-worker)
+SERVICES=(kiron-proxy kiron-docling kiron-embeddings kiron-deberta kiron-prism kitt-worker)
 COMMON_SRC="$DST/services/kiron-common"
 HF_HOME="/var/cache/kiron/huggingface"
 HF_HUB_CACHE="$HF_HOME/hub"
@@ -22,12 +22,58 @@ ST_HOME="$HF_HOME/sentence-transformers"
 XDG_CACHE_HOME="/var/cache/kiron"
 REGISTRY_CLI_ENTRYPOINT_SOURCE="$SRC/scripts/kiron-model-registry-entrypoint.sh"
 
+# Optional, closed per-service package pins for an operator-prepared wheelhouse.
+# Validate every file before even observing/stopping services. pip inherits the
+# selected constraint only inside that service's build subshell below.
+validate_venv_constraints() {
+    if [ -z "${KIRON_VENV_CONSTRAINTS_DIR:-}" ]; then
+        return 0
+    fi
+    python3 - "$KIRON_VENV_CONSTRAINTS_DIR" "${SERVICES[@]}" <<'PY'
+from pathlib import Path
+import re
+import stat
+import sys
+
+root = Path(sys.argv[1])
+if not root.is_absolute() or root.resolve() != root or not root.is_dir():
+    raise SystemExit("FEHLER: KIRON_VENV_CONSTRAINTS_DIR muss ein absolutes Verzeichnis ohne Symlinks sein")
+expected = {name + ".txt" for name in sys.argv[2:]}
+if {path.name for path in root.iterdir()} != expected:
+    raise SystemExit("FEHLER: Constraints-Verzeichnis muss genau die sechs Dienstdateien enthalten")
+version = r"(?:[0-9]+!)?[0-9]+(?:\.[0-9]+)*(?:(?:a|b|rc)[0-9]+)?(?:\.post[0-9]+)?(?:\.dev[0-9]+)?(?:\+[A-Za-z0-9]+(?:[._-][A-Za-z0-9]+)*)?"
+pattern = re.compile(r"([A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?)==(" + version + r")")
+for name in sorted(expected):
+    path = root / name
+    info = path.lstat()
+    if not stat.S_ISREG(info.st_mode) or info.st_size > 1024 * 1024:
+        raise SystemExit("FEHLER: ungueltige Constraints-Datei: " + name)
+    pins = set()
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        match = pattern.fullmatch(line)
+        if match is None:
+            raise SystemExit("FEHLER: Constraints erlauben nur package==version: " + name)
+        package = re.sub(r"[-_.]+", "-", match[1]).lower()
+        if package in pins:
+            raise SystemExit("FEHLER: doppelter Constraints-Paketname: " + name)
+        pins.add(package)
+    if not {"pip", "setuptools", "wheel"} <= pins:
+        raise SystemExit("FEHLER: Constraints muessen pip, setuptools und wheel pinnen: " + name)
+PY
+}
+
+validate_venv_constraints
+
 service_group() {
     case "$1" in
         kiron-proxy) echo "kiron-proxy" ;;
         kiron-docling) echo "kiron-docling" ;;
         kiron-embeddings) echo "kiron-embeddings" ;;
         kiron-deberta) echo "kiron-deberta" ;;
+        kiron-prism) echo "kiron-prism" ;;
         kitt-worker) echo "kitt-worker" ;;
         *) echo "FEHLER: unbekannter Service $1" >&2; return 1 ;;
     esac
@@ -39,6 +85,7 @@ service_import_module() {
         kiron-docling) echo "proxy" ;;
         kiron-embeddings) echo "main" ;;
         kiron-deberta) echo "main" ;;
+        kiron-prism) echo "main" ;;
         *) echo "FEHLER: kein Import-Smoke fuer $1 definiert" >&2; return 1 ;;
     esac
 }
@@ -69,11 +116,12 @@ apply_all_service_tree_permissions() {
 
 required_identity_groups() {
     case "$1" in
-        kiron-proxy) echo "docker kiron-runtime kiron-common" ;;
+        kiron-proxy) echo "docker kiron-runtime kiron-common kiron-config kiron-prism-control" ;;
         kiron-docling) echo "docker kiron-runtime kiron-common" ;;
-        kiron-embeddings) echo "kiron-models kiron-config kiron-common video render" ;;
+        kiron-embeddings) echo "kiron-models kiron-config kiron-common kiron-runtime video render" ;;
         kiron-deberta) echo "kiron-models kiron-common video render" ;;
-        kitt-worker) echo "" ;;
+        kiron-prism) echo "kiron-common kiron-config kiron-runtime kiron-prism-control video render" ;;
+        kitt-worker) echo "kiron-runtime" ;;
         *) echo "FEHLER: unbekannter Service $1" >&2; return 1 ;;
     esac
 }
@@ -113,7 +161,7 @@ check_issue_859_prereqs() {
     fi
 
     for group in \
-        kiron-proxy kiron-docling kiron-embeddings kiron-deberta \
+        kiron-proxy kiron-docling kiron-embeddings kiron-deberta kiron-prism kiron-prism-control \
         kiron-models kiron-runtime kiron-config kiron-common docker video render; do
         if ! getent group "$group" >/dev/null 2>&1; then
             echo "FEHLER: Gruppe $group fehlt; install-system-configs.sh zuerst ausfuehren." >&2
@@ -132,6 +180,7 @@ check_issue_859_prereqs() {
 
     for path in \
         "/run/kiron/vram" \
+        "/run/kiron/prism" \
         "$DST/data/kiron-proxy" \
         "$DST/data/shared" \
         "$HF_HOME" \
@@ -161,6 +210,9 @@ smoke_service_venv_new() {
             ;;
         kiron-deberta)
             smoke_code='import json; from importlib import resources; import kiron_common; from kiron_common.embedding_registry import MODEL_CATALOG, MODEL_STATE_VIEW; manifest_root = resources.files("kiron_common.model_catalog.manifests"); assert any(item.name.endswith(".model.json") for item in manifest_root.iterdir()); assert MODEL_CATALOG.groups; assert MODEL_STATE_VIEW.catalog is MODEL_CATALOG; import main; health = json.loads(main.health().body); assert main.SHARED_MODEL_CATALOG is MODEL_CATALOG; assert main.DEBERTA_CATALOG_VIEW.models; assert main.DEBERTA_CATALOG_VIEW.catalog_digest == MODEL_CATALOG.catalog_digest == health["catalog_digest"]; assert health["model_states"]; assert all(type(row["installed"]) is bool for row in health["model_states"])'
+            ;;
+        kiron-prism)
+            smoke_code='import main, controller, composition; from kiron_common.prism_runtime_policy import Policy; from kiron_common.local_model_registry import RuntimeModelRegistry; from kiron_common.gpu_admission import AdmissionStore; assert callable(main.create_app)'
             ;;
         *)
             smoke_code="import ${module}"
@@ -354,6 +406,11 @@ done
 # unberuehrt. Ein pip-Fehler fuehrt jetzt zum frueh-Exit, der Trap darf die
 # Services wieder starten (VENV_TOUCHED=0), weil $venv_dir noch intakt ist.
 for svc in "${SERVICES[@]}"; do
+  (
+    if [ -n "${KIRON_VENV_CONSTRAINTS_DIR:-}" ]; then
+        export PIP_CONSTRAINT="$KIRON_VENV_CONSTRAINTS_DIR/$svc.txt"
+        export PIP_BUILD_CONSTRAINT="$PIP_CONSTRAINT"
+    fi
     req="$SRC/services/$svc/requirements.txt"
     venv_new="$DST/services/$svc/venv.new"
     if [ -f "$req" ]; then
@@ -365,20 +422,26 @@ for svc in "${SERVICES[@]}"; do
         if [ "$svc" = "kiron-proxy" ] || \
            [ "$svc" = "kiron-docling" ] || \
            [ "$svc" = "kiron-embeddings" ] || \
-           [ "$svc" = "kiron-deberta" ]; then
+           [ "$svc" = "kiron-deberta" ] || \
+           [ "$svc" = "kiron-prism" ]; then
             "$venv_new/bin/pip" install -e "$COMMON_SRC"
             "$venv_new/bin/python" -c 'import kiron_common'
             # pip erzeugt absolute Shebangs auf venv.new. Der gemeinsame
             # Root-CLI muss den atomaren Verzeichnis-Swap hingegen ueberleben.
             install -m 0750 -o root -g root "$REGISTRY_CLI_ENTRYPOINT_SOURCE" "$venv_new/bin/kiron-model-registry"
         fi
+        if [ "$svc" = "kitt-worker" ]; then
+            # Private installed copy: KITT needs no access to the common source tree.
+            "$venv_new/bin/pip" install "$COMMON_SRC"
+        fi
         echo "  $svc: build ok"
     fi
+  )
 done
 
 # #886 Phase 2: Rechte-Zielmodell und Smoke-Tests gegen die neuen venvs vor dem Swap.
 apply_all_service_tree_permissions
-for svc in kiron-proxy kiron-docling kiron-embeddings kiron-deberta; do
+for svc in kiron-proxy kiron-docling kiron-embeddings kiron-deberta kiron-prism; do
     smoke_service_venv_new "$svc" || exit 1
 done
 
@@ -416,6 +479,10 @@ runuser -u kitt-worker -- test -w "$DST/data/kitt-worker" || {
 }
 runuser -u kitt-worker -- test -w "/run/kiron/kitt-worker" || {
     echo "FEHLER: kitt-worker kann kurzlebigen Runtime-Pfad nicht beschreiben." >&2
+    exit 1
+}
+runuser -u kitt-worker -- test -w "/run/kiron/vram" || {
+    echo "FEHLER: kitt-worker kann den gemeinsamen Admission-Pfad nicht beschreiben." >&2
     exit 1
 }
 for required_dir in \

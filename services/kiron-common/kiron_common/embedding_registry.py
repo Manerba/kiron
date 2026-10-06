@@ -172,12 +172,39 @@ def _profile_projection(
     if wire.task is not ModelTask.EMBEDDING:
         raise EmbeddingContractError(path, "profile task must be embedding")
     metadata = thaw_json(wire.profile_metadata)
+    # Stable OpenAI record metadata is not part of the vector compatibility
+    # fingerprint. The existing embedding pipeline projection stays exact.
+    if isinstance(metadata, dict) and "created" in metadata:
+        created = metadata.pop("created")
+        if type(created) is not int or created < 0:
+            raise EmbeddingContractError(f"{path}/metadata/created", "must be a nonnegative integer")
     metadata = _closed_mapping(
         metadata,
         path=f"{path}/metadata",
         fields=_PROFILE_METADATA_FIELDS,
     )
     model_name, backend = _backend_projection(wire, path=path)
+    request_options = metadata["pipeline"]["parameters"].get("request_options")
+    if request_options is not None:
+        policy_path = f"{path}/metadata/pipeline/parameters/request_options"
+        if backend["type"] != "ollama" or metadata["kind"] != "dense":
+            raise EmbeddingContractError(policy_path, "request options require an Ollama dense profile")
+        if (not isinstance(request_options, dict)
+                or set(request_options) != {"num_ctx", "num_batch"}
+                or any(type(v) is not int or v <= 0 for v in request_options.values())):
+            raise EmbeddingContractError(policy_path, "must pin positive integer context and batch size")
+        limits = metadata["max_input_tokens"]
+        if (limits["truncation"] != "none" or limits["overflow"] != "reject"
+                or any(v != request_options["num_ctx"] for v in limits["by_role"].values())
+                or metadata["pipeline"]["parameters"].get("truncate") is not False):
+            raise EmbeddingContractError(policy_path, "request options must match the complete-input limit policy")
+        if (metadata["input_type"]["required"] is not True
+                or metadata["input_type"]["missing_role_behavior"] != "reject"):
+            raise EmbeddingContractError(policy_path, "formatted Ollama requests require explicit roles")
+        for role in ("search_document", "search_query"):
+            template = metadata["pipeline"]["formatting"][role]["template"]
+            if type(template) is not str or template.count("{text}") != 1:
+                raise EmbeddingContractError(policy_path, "each role must declare one {text} placeholder")
     profile = {
         "profile_id": wire.profile_id,
         "kind": copy.deepcopy(metadata["kind"]),
@@ -487,13 +514,15 @@ def resolve_profile_input_type(
     model_name: object,
     endpoint: str,
     input_type: object,
+    *,
+    registry: EmbeddingProfileRegistry = EMBEDDING_REGISTRY,
 ) -> InputTypeResolution | None:
     """Resolve and validate input_type without contacting a model backend."""
 
-    group = EMBEDDING_REGISTRY.resolve(model_name)
+    group = registry.resolve(model_name)
     if group is None:
         return None
-    profile = EMBEDDING_REGISTRY.default_profile(model_name, endpoint)
+    profile = registry.default_profile(model_name, endpoint)
     if profile is None:
         return None
 

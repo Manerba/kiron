@@ -238,7 +238,7 @@ class CentralDiscoveryContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(profile["profile_id"], "kiron-colbert-xm-multivector-v1")
         self.assertEqual(profile["endpoint"], "/api/embed_colbert")
 
-    async def test_ollama_only_show_is_explicitly_unverified_and_alias_is_rewritten(self):
+    async def test_ollama_show_exposes_verified_quantized_profile_and_rewrites_alias(self):
         e5 = EMBEDDING_REGISTRY.require("e5-mistral-7b-instruct")
         ollama = _Client(send_payloads={"/api/show": {"native_extension": True}})
         embedding = _Client()
@@ -257,8 +257,9 @@ class CentralDiscoveryContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.json()["native_extension"])
         profile = response.json()["kiron_capabilities"]["profiles"][0]
-        self.assertEqual(profile["verification"]["status"], "unverified")
-        self.assertIsNone(profile["index_compatibility_id"])
+        self.assertEqual(profile["verification"]["status"], "verified")
+        self.assertIsNotNone(profile["index_compatibility_id"])
+        self.assertIsNotNone(profile["query_compatibility_id"])
         sent_body = json.loads(ollama.sent[0]["content"])
         self.assertEqual(sent_body["model"], e5.ollama_model)
 

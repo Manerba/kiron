@@ -8,6 +8,7 @@ SERVICE_UNITS=(
     kiron-docling.service
     kiron-embeddings.service
     kiron-deberta.service
+    kiron-prism.service
     kitt-worker.service
 )
 
@@ -100,15 +101,18 @@ verify_service_identity() {
 }
 
 ensure_kiron_identities() {
-    ensure_kiron_service_identity kiron-proxy docker kiron-runtime kiron-common
+    ensure_kiron_service_identity kiron-proxy docker kiron-runtime kiron-common kiron-config kiron-prism-control
     ensure_kiron_service_identity kiron-docling docker kiron-runtime kiron-common
-    ensure_kiron_service_identity kiron-embeddings kiron-models kiron-config kiron-common video render
+    ensure_kiron_service_identity kiron-embeddings kiron-models kiron-config kiron-common kiron-runtime video render
     ensure_kiron_service_identity kiron-deberta kiron-models kiron-common video render
 
-    verify_service_identity kiron-proxy docker kiron-runtime kiron-common
+    ensure_kiron_service_identity kiron-prism kiron-common kiron-config kiron-runtime kiron-prism-control video render
+
+    verify_service_identity kiron-proxy docker kiron-runtime kiron-common kiron-config kiron-prism-control
     verify_service_identity kiron-docling docker kiron-runtime kiron-common
-    verify_service_identity kiron-embeddings kiron-models kiron-config kiron-common video render
+    verify_service_identity kiron-embeddings kiron-models kiron-config kiron-common kiron-runtime video render
     verify_service_identity kiron-deberta kiron-models kiron-common video render
+    verify_service_identity kiron-prism kiron-common kiron-config kiron-runtime kiron-prism-control video render
     echo "  KIron Service-User und Gruppen installiert"
 }
 
@@ -127,6 +131,9 @@ ensure_kitt_worker_identity() {
             kitt-worker
         echo "  User kitt-worker angelegt"
     fi
+    ensure_group kiron-runtime
+    usermod -G kiron-runtime kitt-worker
+    lock_service_password kitt-worker
 }
 
 verify_kitt_worker_identity() {
@@ -143,8 +150,8 @@ verify_kitt_worker_identity() {
         /usr/sbin/nologin|/sbin/nologin|/bin/false) ;;
         *) fail "kitt-worker muss eine Non-Login-Shell nutzen" ;;
     esac
-    groups="$(id -nG kitt-worker)"
-    [ "$groups" = "kitt-worker" ] || fail "kitt-worker darf keine Supplementary Groups haben: $groups"
+    groups="$(id -nG kitt-worker | tr ' ' '\n' | LC_ALL=C sort | xargs)"
+    [ "$groups" = "kiron-runtime kitt-worker" ] || fail "kitt-worker darf nur kiron-runtime als Zusatzgruppe haben: $groups"
     if command -v passwd >/dev/null 2>&1; then
         password_state="$(passwd -S kitt-worker 2>/dev/null | awk '{print $2}')"
         case "$password_state" in
@@ -287,13 +294,16 @@ install_sudoers_sources() {
 verify_kiron_runtime_paths() {
     verify_path_stat /run/kiron "root:root 755"
     verify_path_stat /run/kiron/vram "root:kiron-runtime 2770"
+    verify_path_stat /run/kiron/prism "kiron-prism:kiron-prism-control 2750"
+    verify_path_stat /usr/lib/kiron/data/gguf-models "root:kiron-common 2750"
+    verify_optional_path_stat /usr/lib/kiron/data/prism-runtime-policy.json "root:kiron-config 640"
     verify_path_stat /run/xtables.lock "root:root 600"
     verify_path_stat /usr/lib/kiron/data "root:root 755"
     verify_path_stat /usr/lib/kiron/data/kiron-proxy "kiron-proxy:kiron-proxy 750"
-    verify_path_stat /usr/lib/kiron/data/shared "kiron-proxy:kiron-config 2750"
+    verify_path_stat /usr/lib/kiron/data/shared "kiron-proxy:kiron-common 2750"
     verify_path_stat /usr/lib/kiron/data/local-models "root:kiron-common 2750"
-    verify_optional_path_stat /usr/lib/kiron/data/shared/local-model-registry.json "kiron-proxy:kiron-config 640"
-    verify_optional_path_stat /usr/lib/kiron/data/shared/local-model-registry.json.lock "kiron-proxy:kiron-config 640"
+    verify_optional_path_stat /usr/lib/kiron/data/shared/local-model-registry.json "kiron-proxy:kiron-common 640"
+    verify_optional_path_stat /usr/lib/kiron/data/shared/local-model-registry.json.lock "kiron-proxy:kiron-common 640"
     verify_path_stat /var/cache/kiron "root:root 755"
     verify_path_stat /var/cache/kiron/huggingface "root:kiron-models 2770"
     verify_path_stat /var/cache/kiron/huggingface/hub "root:kiron-models 2770"
@@ -302,7 +312,65 @@ verify_kiron_runtime_paths() {
     verify_path_stat /var/cache/kiron/huggingface/xet "root:kiron-models 2770"
 }
 
+initialize_local_model_registry() {
+    # Create only missing v2 storage. Preserve existing contents, including a
+    # corrupt/unsupported registry which must fail visibly in the common decoder.
+    python3 - <<'PY'
+import fcntl
+import grp
+import os
+import pwd
+import stat
+
+uid = pwd.getpwnam("kiron-proxy").pw_uid
+gid = grp.getgrnam("kiron-common").gr_gid
+directory = os.open("/usr/lib/kiron/data/shared", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+name = "local-model-registry.json"
+
+def open_file(name, *, exclusive):
+    flags = os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+    if exclusive:
+        flags |= os.O_CREAT | os.O_EXCL
+    descriptor = os.open(name, flags, 0o640, dir_fd=directory)
+    info = os.fstat(descriptor)
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        os.close(descriptor)
+        raise RuntimeError("registry files must be regular single-link files")
+    if exclusive:
+        os.fchown(descriptor, uid, gid)
+        os.fchmod(descriptor, 0o640)
+    elif (info.st_uid, info.st_gid, stat.S_IMODE(info.st_mode)) != (uid, gid, 0o640):
+        os.close(descriptor)
+        raise RuntimeError("unexpected registry file ownership or mode")
+    return descriptor
+
+try:
+    try:
+        lock = open_file(name + ".lock", exclusive=True)
+    except FileExistsError:
+        lock = open_file(name + ".lock", exclusive=False)
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            descriptor = open_file(name, exclusive=True)
+        except FileExistsError:
+            descriptor = open_file(name, exclusive=False)
+            os.close(descriptor)
+        else:
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(b'{"version":2,"entries":[]}\n')
+                stream.flush()
+                os.fsync(stream.fileno())
+        os.fsync(directory)
+    finally:
+        os.close(lock)
+finally:
+    os.close(directory)
+PY
+}
+
 validate_service_unit_sources
+verify_optional_regular_file /usr/lib/kiron/data/prism-runtime-policy.json
 verify_optional_regular_file /usr/lib/kiron/data/shared/local-model-registry.json
 verify_optional_regular_file /usr/lib/kiron/data/shared/local-model-registry.json.lock
 ensure_kiron_identities
@@ -321,6 +389,7 @@ tmpfiles_src="/opt/kiron/system/tmpfiles.d/kiron-runtime.conf"
 mkdir -p /etc/tmpfiles.d
 cp "$tmpfiles_src" /etc/tmpfiles.d/kiron-runtime.conf
 systemd-tmpfiles --create /etc/tmpfiles.d/kiron-runtime.conf
+initialize_local_model_registry
 verify_kiron_runtime_paths
 verify_kitt_worker_runtime_dir /usr/lib/kiron/data/kitt-worker
 verify_kitt_worker_runtime_dir /run/kiron/kitt-worker

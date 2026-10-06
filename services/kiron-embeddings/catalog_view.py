@@ -350,8 +350,8 @@ def _parse_loader_parameters(wire: WireProfile, *, path: str) -> LoaderParameter
         torch_dtype = _non_empty_string(
             values["torch_dtype"], path=f"{path}/torch_dtype"
         )
-        if torch_dtype != "bfloat16":
-            _fail(f"{path}/torch_dtype", "must be 'bfloat16'")
+        if torch_dtype != "float32":
+            _fail(f"{path}/torch_dtype", "must be 'float32'")
         return TransformersLastTokenLoaderParameters(
             tokenizer_use_fast=_boolean(
                 values["tokenizer_use_fast"],
@@ -432,8 +432,13 @@ def _parse_formatting_entry(value: object, *, path: str) -> str:
 
 
 def _parse_endpoint_profile(wire: WireProfile, *, path: str) -> EndpointProfile:
+    values = dict(wire.profile_metadata)
+    if "created" in values:
+        created = values.pop("created")
+        if type(created) is not int or created < 0:
+            _fail(f"{path}/metadata/created", "must be a nonnegative API creation timestamp")
     metadata = _closed_mapping(
-        wire.profile_metadata,
+        values,
         path=f"{path}/metadata",
         required=frozenset(
             (
@@ -568,6 +573,13 @@ def _parse_endpoint_profile(wire: WireProfile, *, path: str) -> EndpointProfile:
                 "must match profile dimensions",
             )
     elif wire.loader.type is LoaderType.TRANSFORMERS_LAST_TOKEN:
+        precision = _closed_mapping(
+            pipeline["parameters"],
+            path=f"{path}/metadata/pipeline/parameters",
+            required=frozenset(("torch_dtype",)),
+        )
+        if precision["torch_dtype"] != "float32":
+            _fail(f"{path}/metadata/pipeline/parameters/torch_dtype", "must be 'float32'")
         if pooling["method"] != "last_token":
             _fail(
                 f"{path}/metadata/pipeline/pooling/method",
@@ -728,10 +740,10 @@ def build_embedding_service_view(
 
         if isinstance(
             loader_parameters, TransformersLastTokenLoaderParameters
-        ) and discovery.precision != "BF16":
+        ) and discovery.precision != "F32":
             _fail(
                 f"{path}/metadata/discovery/precision",
-                "transformers_last_token bfloat16 configuration requires 'BF16'",
+                "transformers_last_token float32 configuration requires 'F32'",
             )
         if isinstance(loader_parameters, ColbertXmodLoaderParameters):
             if len(wire.artifact.weights) != 1:

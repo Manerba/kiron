@@ -1,0 +1,273 @@
+{
+  "schema_version": 1,
+  "scope": "Recorded direct-upstream Prism SDK parser probes only; not KIron API conformance or a general guarantee of strict tools, named tool choice, capabilities, or performance.",
+  "response_mutations": "none; request JSON files, response metadata files and raw JSON/SSE bodies are byte-for-byte copies",
+  "sdk_version": "2.29.0",
+  "upstream": {
+    "repository": "https://github.com/PrismML-Eng/llama.cpp",
+    "source_commit": "9a9394a895b96003ca842a6041cb28ac49a108f7",
+    "release_tag": "prism-b10709-9a9394a",
+    "archive": {
+      "url": "https://github.com/PrismML-Eng/llama.cpp/releases/download/prism-b10709-9a9394a/llama-prism-b10709-9a9394a-bin-linux-cuda-12.8-x64.tar.gz",
+      "bytes": 167241119,
+      "sha256": "8aec67eb023b251712c7e6490f367b5671bf587eced1436a9b85f4a90c3b7d3d",
+      "platform": "linux-x86_64",
+      "cuda": "12.8"
+    },
+    "binary_path": "/usr/lib/kiron/test-runtimes/prism/prism-b10709-9a9394a/runtime/llama-prism-b10709-9a9394a/llama-server",
+    "binary_sha256": "e5c4211999de5b789b980626ad4b35f17d9b75f9a45c6d8b1801ff41f9162c88",
+    "system_fingerprint": "b10709-9a9394a89",
+    "launch_evidence": [
+      {
+        "source": "/usr/lib/kiron/test-runtimes/prism/reports/cuda32-bounded/launch.json",
+        "sha256": "3087f9bef2a0432eed52146e1a8cc4763766c4b549fad52d5d078bc88b7c413d"
+      },
+      {
+        "source": "/usr/lib/kiron/test-runtimes/prism/reports/cuda40-threads4/launch.json",
+        "sha256": "aa75bdab7ec76fb873cb11e13b8117ffeca691e7a12a186a1dac630a7c912127"
+      }
+    ]
+  },
+  "original_replay_reports": [
+    {
+      "source": "/usr/lib/kiron/test-runtimes/prism/reports/sdk-live-fixtures.json",
+      "sha256": "f17819c68299528eda4f0804f34d157f4ed453b99d35be75634b8be68f86d76d"
+    },
+    {
+      "source": "/usr/lib/kiron/test-runtimes/prism/reports/sdk-parallel-live-fixture.json",
+      "sha256": "a56a37586af762924ab3387871df1e3a0728678bfc2a74b9938193d671b9cff2"
+    }
+  ],
+  "fixtures": {
+    "text": {
+      "files": {
+        "request.json": {
+          "path": "text.request.json",
+          "source": "/usr/lib/kiron/test-runtimes/prism/reports/cuda32-text/02-text.request.json",
+          "sha256": "4b97969c92cbfc886f4748841d13414644c486ff3544b8d6efe5021ffccb32c9"
+        },
+        "response.json": {
+          "path": "text.response.json",
+          "source": "/usr/lib/kiron/test-runtimes/prism/reports/cuda32-text/02-text.response.json",
+          "sha256": "d759b967772672556d692f3dc918c3ba54539b180d7f44181c73f33ae8362d94"
+        },
+        "response.raw": {
+          "path": "text.response.raw",
+          "source": "/usr/lib/kiron/test-runtimes/prism/reports/cuda32-text/02-text.response.raw",
+          "sha256": "11d1c44f452ffc695cad96c5bb3d3fd0843e7e185a5649ff59453cca70528866"
+        }
+      },
+      "expected": {
+        "completion_id": "chatcmpl-A75kWhM0DIeGPGyiwjaBFmluLdITOVrn",
+        "model": "bonsai-probe",
+        "finish_reason": "stop",
+        "content": "OK",
+        "usage": {
+          "completion_tokens": 2,
+          "prompt_tokens": 19,
+          "total_tokens": 21,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "calls": []
+      }
+    },
+    "text_stream": {
+      "files": {
+        "request.json": {
+          "path": "text_stream.request.json",
+          "source": "/usr/lib/kiron/test-runtimes/prism/reports/cuda32-text/03-text_stream.request.json",
+          "sha256": "864d2ba9699a13426b49912bd25838875175517eb3ba006c9121d46c1d95c01d"
+        },
+        "response.json": {
+          "path": "text_stream.response.json",
+          "source": "/usr/lib/kiron/test-runtimes/prism/reports/cuda32-text/03-text_stream.response.json",
+          "sha256": "0bd45f0fe9a8dcffe668271d26db82703dc542cc8e19dc7f3b6fb1bc3bdf15f9"
+        },
+        "response.raw": {
+          "path": "text_stream.response.raw",
+          "source": "/usr/lib/kiron/test-runtimes/prism/reports/cuda32-text/03-text_stream.response.raw",
+          "sha256": "f096be5851ceb021dfbcf26e7ede43586e16b7901672b6822649a72b4aee20d7"
+        }
+      },
+      "expected": {
+        "completion_id": "chatcmpl-frwFETu8LniG63OeN7aC9YVpa0YRKccG",
+        "model": "bonsai-probe",
+        "finish_reason": "stop",
+        "content": "OK",
+        "usage": {
+          "completion_tokens": 2,
+          "prompt_tokens": 19,
+          "total_tokens": 21,
+          "prompt_tokens_details": {
+            "cached_tokens": 15
+          }
+        },
+        "calls": [],
+        "chunks": 4,
+        "helper_events": 6,
+        "fragment_indices": [],
+        "heartbeat_comment_lines": 0
+      }
+    },
+    "tool": {
+      "files": {
+        "request.json": {
+          "path": "tool.request.json",
+          "source": "/usr/lib/kiron/test-runtimes/prism/reports/cuda32-features/01-tool.request.json",
+          "sha256": "ccac988f67e79987359d1ec508a8b99b89c40b7ac1ec78e9ea501bb5e826bedf"
+        },
+        "response.json": {
+          "path": "tool.response.json",
+          "source": "/usr/lib/kiron/test-runtimes/prism/reports/cuda32-features/01-tool.response.json",
+          "sha256": "ff7f2d0f95e0eed0d60c8b3be720652692f292802df7417c2ef9f8d734491ac2"
+        },
+        "response.raw": {
+          "path": "tool.response.raw",
+          "source": "/usr/lib/kiron/test-runtimes/prism/reports/cuda32-features/01-tool.response.raw",
+          "sha256": "f27bd1f738e87274dc34fc42b85099cc634e31c9a0c3c93136105aa3827f470a"
+        }
+      },
+      "expected": {
+        "completion_id": "chatcmpl-AEoWWVQooG4XzE9FdCyiG3dbkRTV8xAz",
+        "model": "bonsai-probe",
+        "finish_reason": "tool_calls",
+        "content": "",
+        "usage": {
+          "completion_tokens": 26,
+          "prompt_tokens": 290,
+          "total_tokens": 316,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "calls": [
+          {
+            "id": "Fe4wIN5UilJmeXBHrfBQA5la7gZcVefy",
+            "name": "weather",
+            "arguments": {
+              "city": "Berlin"
+            }
+          }
+        ]
+      }
+    },
+    "tool_stream": {
+      "files": {
+        "request.json": {
+          "path": "tool_stream.request.json",
+          "source": "/usr/lib/kiron/test-runtimes/prism/reports/cuda32-features/02-tool_stream.request.json",
+          "sha256": "916a46d4deb8943d9bfb3fbbf1a9d2acb4f3426330e4827b4d636dde89192e82"
+        },
+        "response.json": {
+          "path": "tool_stream.response.json",
+          "source": "/usr/lib/kiron/test-runtimes/prism/reports/cuda32-features/02-tool_stream.response.json",
+          "sha256": "395310e0630a4d5b1f2f343f4bfb2f9da8136c7f7e479e2396858ec651864db8"
+        },
+        "response.raw": {
+          "path": "tool_stream.response.raw",
+          "source": "/usr/lib/kiron/test-runtimes/prism/reports/cuda32-features/02-tool_stream.response.raw",
+          "sha256": "2580b94251e92ee9624a0ed1aa308f26c2cecbd7fa5cd0316db3941e2bdfe4d3"
+        }
+      },
+      "expected": {
+        "completion_id": "chatcmpl-0nOukmHHgLLKmjhryT39iubAEGG2sy1u",
+        "model": "bonsai-probe",
+        "finish_reason": "tool_calls",
+        "content": "",
+        "usage": {
+          "completion_tokens": 26,
+          "prompt_tokens": 290,
+          "total_tokens": 316,
+          "prompt_tokens_details": {
+            "cached_tokens": 286
+          }
+        },
+        "calls": [
+          {
+            "id": "Y9ORvnpzkqY6UXwMHJCHiWBMaKtjIeib",
+            "name": "weather",
+            "arguments": {
+              "city": "Berlin"
+            }
+          }
+        ],
+        "chunks": 8,
+        "helper_events": 14,
+        "fragment_indices": [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "heartbeat_comment_lines": 0
+      }
+    },
+    "parallel_tools_stream": {
+      "files": {
+        "request.json": {
+          "path": "parallel_tools_stream.request.json",
+          "source": "/usr/lib/kiron/test-runtimes/prism/reports/cuda40-parallel-stream/01-parallel_tools_stream.request.json",
+          "sha256": "bef5bbc7c696492c10ef564120faf3adabaf82c08119ffa80c21b9718a9b7a7a"
+        },
+        "response.json": {
+          "path": "parallel_tools_stream.response.json",
+          "source": "/usr/lib/kiron/test-runtimes/prism/reports/cuda40-parallel-stream/01-parallel_tools_stream.response.json",
+          "sha256": "285efb5403eac6417920d0778185e7a3df4177dad1fdd16780f4668c89ef1cb8"
+        },
+        "response.raw": {
+          "path": "parallel_tools_stream.response.raw",
+          "source": "/usr/lib/kiron/test-runtimes/prism/reports/cuda40-parallel-stream/01-parallel_tools_stream.response.raw",
+          "sha256": "b6213da8ff942cfd3716fb028ac994c022acf462563cc42ffe98e7fb8853426f"
+        }
+      },
+      "expected": {
+        "completion_id": "chatcmpl-lcUYffyxxkUJRLzVNh2h3ybB9U3bCBo8",
+        "model": "bonsai-probe",
+        "finish_reason": "tool_calls",
+        "content": "",
+        "usage": {
+          "completion_tokens": 52,
+          "prompt_tokens": 297,
+          "total_tokens": 349,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "calls": [
+          {
+            "id": "zIS7o9Fi0cjTVegpODOU90WXfYmoTF7o",
+            "name": "weather",
+            "arguments": {
+              "city": "Berlin"
+            }
+          },
+          {
+            "id": "1RQ3LAfpXTOyvhOF3VweaiR2bu2Q5dpt",
+            "name": "weather",
+            "arguments": {
+              "city": "Paris"
+            }
+          }
+        ],
+        "chunks": 13,
+        "helper_events": 25,
+        "fragment_indices": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          1,
+          1,
+          1,
+          1,
+          1
+        ],
+        "heartbeat_comment_lines": 1
+      }
+    }
+  }
+}

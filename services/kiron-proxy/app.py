@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import contextlib
 import json
 import os
 import re
@@ -12,7 +13,7 @@ import threading
 import time
 from pathlib import Path
 
-from fastapi import Body, FastAPI, Query, WebSocket, WebSocketDisconnect
+from fastapi import Body, FastAPI, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from starlette.websockets import WebSocketState
@@ -21,7 +22,6 @@ import httpx
 
 from kiron_common.embedding_registry import MODEL_CATALOG, MODEL_STATE_VIEW
 from kiron_common.local_model_registry import (
-    LocalModelProvider,
     ModelRegistrationError,
     ModelRegistrationService,
 )
@@ -32,12 +32,23 @@ from kiron_common.local_model_registry.composition import (
 )
 from kiron_common.model_catalog import BackendType
 from kiron_common.ollama_compat import is_real_int
+from kiron_common.gpu_admission import AdmissionError
+from kiron_common.gpu_admission.ollama_lifecycle import OllamaLifecycleOperation
 
 from request_store import RequestStore, RequestStoreReadError
 from metrics import get_cached_payload
 from history_db import MetricsDB
+from high_res_history import HighResHistoryClosed, HighResHistoryService
 from api_key_store import LastActiveApiKeyError
 import vram_lease
+from kiron_common.gpu_admission.native_contract import (
+    COMPLETION_HEADER, OPERATION_HEADER, OVERLAY_HEADER,
+)
+import dashboard_runtime
+from model_control import ModelControl
+import ollama_recovery
+from native_admission import make_store as ollama_admission_store
+from routing_catalog import PROXY_ROUTING_VIEW
 from selftest import router as selftest_router
 from model_discovery import (
     InventoryShapeError,
@@ -66,6 +77,9 @@ store: RequestStore = None
 # Globale MetricsDB (wird von main.py gesetzt)
 metrics_db: MetricsDB = None
 
+# Eigenstaendige RAM-basierte 1m-Historie; wird von main.py gesetzt.
+high_res_history_service: HighResHistoryService | None = None
+
 # DBWorkTracker fuer SQLite-Reads aus Dashboard-Handlern (#713): cross-thread
 # `db.close()` darf nicht waehrend laufender query_range/get_db_stats greifen.
 db_work_tracker = None
@@ -76,6 +90,7 @@ api_key_store = None
 OLLAMA_BASE_URL = DEFAULT_OLLAMA_BASE_URL
 EMBEDDING_HEALTH_URL = "http://127.0.0.1:11436/health"
 EMBEDDING_LOAD_URL = "http://127.0.0.1:11436/api/load"
+EMBEDDING_UNLOAD_URL = "http://127.0.0.1:11436/api/unload"
 EMBEDDING_SERVICE = "kiron-embeddings.service"
 DEBERTA_HEALTH_URL = "http://127.0.0.1:11437/health"
 DEBERTA_LOAD_URL = "http://127.0.0.1:11437/api/load"
@@ -425,6 +440,11 @@ def set_store(request_store: RequestStore):
 def set_metrics_db(db: MetricsDB):
     global metrics_db
     metrics_db = db
+
+
+def set_high_res_history_service(service: HighResHistoryService | None) -> None:
+    global high_res_history_service
+    high_res_history_service = service
 
 
 def set_db_work_tracker(tracker):
@@ -908,44 +928,101 @@ async def get_model_registration_candidates():
         return _registration_error_response(exc)
     catalog_ollama = _catalog_ollama_reference_keys()
     visible = [
-        candidate.to_dict()
-        for candidate in candidates
+        dashboard_runtime.public_candidate(candidate)
+        for candidate in candidates.candidates
         if not (
-            candidate.provider is LocalModelProvider.OLLAMA
+            candidate.runtime_provider is BackendType.OLLAMA
             and candidate.reference.lower() in catalog_ollama
         )
     ]
-    return {"status": "ok", "candidates": visible}
+    return {"status": "ok", "candidates": visible,
+            "runtime_profiles": [{"id": name, "projector_supported": policy.projector_sha256 is not None}
+                                 for name, policy in get_model_registration_service().registration_profiles().items()],
+            "errors": {provider.value: code for provider, code in candidates.errors.items()}}
 
 
 @app.post("/api/models/register")
-async def register_local_model(body: object = Body(...)):
-    if type(body) is not dict or not set(body).issubset(
-        {"provider", "reference", "loader"}
-    ):
-        return JSONResponse(
-            {
-                "status": "error",
-                "error": {
-                    "code": "invalid_request",
-                    "message": "request must contain only provider, reference and loader",
-                },
-            },
-            status_code=400,
-        )
+async def register_local_model(request: Request, body: object = Body(...)):
+    if not dashboard_runtime.mutation_allowed(request):
+        return JSONResponse({"error": {"code": "csrf_rejected", "message": "Aktion nur vom eigenen Dashboard erlaubt."}}, status_code=403)
+    if (type(body) is not dict or not set(body).issubset(
+            {"candidate_id", "loader", "projector_id", "runtime_profile"})
+            or type(body.get("candidate_id")) is not str):
+        return dashboard_runtime.error_response("invalid_request")
     try:
-        entry = await _to_thread(
-            get_model_registration_service().register_model,
-            provider=body.get("provider"),
-            reference=body.get("reference"),
-            loader=body.get("loader"),
-        )
+        service = get_model_registration_service()
+        discovery = await _to_thread(service.list_candidates)
+        candidates = {dashboard_runtime.candidate_id(item): item for item in discovery.candidates}
+        candidate = candidates.get(body["candidate_id"])
+        projector_id = body.get("projector_id")
+        if projector_id is not None and type(projector_id) is not str:
+            return dashboard_runtime.error_response("invalid_request")
+        projector = candidates.get(projector_id) if projector_id is not None else None
+        if (candidate is None or (projector_id is not None and (projector is None
+                or projector.runtime_provider is not candidate.runtime_provider))):
+            return dashboard_runtime.error_response("model_not_found")
+        entry = await _to_thread(service.register_model,
+            runtime_provider=candidate.runtime_provider, reference=candidate.reference,
+            loader=body.get("loader"), runtime_profile=body.get("runtime_profile"),
+            projector_reference=projector.reference if projector else None)
     except ModelRegistrationError as exc:
         return _registration_error_response(exc)
-    return JSONResponse(
-        {"status": "registered", "model": entry.to_dict()},
-        status_code=201,
+    return JSONResponse({"status": "registered", "model": dashboard_runtime.public_registration(entry)}, status_code=201)
+
+
+@app.get("/api/models/runtime")
+async def get_runtime_models(request: Request):
+    return await dashboard_runtime.runtime_inventory(request)
+
+
+@app.post("/api/models/runtime/action")
+async def runtime_model_action(request: Request, body: object = Body(...)):
+    return await dashboard_runtime.runtime_action(request, body)
+
+
+def _model_control():
+    return ModelControl(
+        read_native=get_local_models, read_runtime=dashboard_runtime.runtime_inventory,
+        runtime_action=dashboard_runtime.runtime_action,
+        cpu_verified=vram_lease.num_gpu_zero_effective,
+        read_ollama_state=lambda: ollama_recovery.status(ollama_admission_store()),
+        handlers={"ollama_load": load_model, "ollama_cpu": load_model,
+                  "ollama_unload": unload_model, "ollama_delete": delete_model,
+                  "embedding_load": load_embedding_model, "embedding_unload": unload_embedding_model,
+                  "embedding_warmup": warmup_colbert_model,
+                  "deberta_load": load_deberta_model, "deberta_unload": unload_deberta_model},
     )
+
+
+@app.get("/api/models/control")
+async def get_model_controls(request: Request):
+    payload, _ = await _model_control().inventory(request)
+    return payload
+
+
+@app.post("/api/models/control/action")
+async def control_model(request: Request, body: object = Body(...)):
+    return await _model_control().execute(request, body)
+
+
+@app.get("/api/ollama/recovery")
+async def ollama_recovery_status():
+    return await _to_thread(ollama_recovery.status, ollama_admission_store())
+
+
+@app.post("/api/ollama/recovery")
+async def recover_ollama(request: Request, body: object = Body(...)):
+    if not dashboard_runtime.mutation_allowed(request):
+        return JSONResponse({"error": {"code": "csrf_rejected", "message": "Aktion nur vom eigenen Dashboard erlaubt."}}, status_code=403)
+    if (type(body) is not dict or set(body) != {"revision"} or type(body["revision"]) is not str
+            or not re.fullmatch(r"[0-9a-f]{64}", body["revision"])):
+        return dashboard_runtime.error_response("invalid_request")
+    try:
+        return await ollama_recovery.recover(ollama_admission_store(), body["revision"])
+    except AdmissionError as exc:
+        return JSONResponse({"error": {"code": exc.code, "message": str(exc)}}, status_code=409)
+    except (OSError, ValueError):
+        return JSONResponse({"error": {"code": "ollama_control_failed", "message": "Ollama-Wiederherstellung konnte nicht bestätigt werden."}}, status_code=503)
 
 
 @app.get("/api/models/local")
@@ -1026,6 +1103,18 @@ async def get_local_models():
         deberta_reachable = (
             isinstance(deberta_data, dict) and deberta_data.get("running") is True
         )
+        service_reachability = {
+            BackendType.KIRON_EMBEDDINGS: embed_reachable,
+            BackendType.KIRON_DEBERTA: deberta_reachable,
+        }
+        reachable_backends = tuple(
+            backend
+            for backend in (
+                BackendType.KIRON_EMBEDDINGS,
+                BackendType.KIRON_DEBERTA,
+            )
+            if service_reachability[backend]
+        )
         try:
             hf_revisions = service_huggingface_inventory(
                 MODEL_STATE_VIEW,
@@ -1033,6 +1122,7 @@ async def get_local_models():
                     BackendType.KIRON_EMBEDDINGS: embed_data,
                     BackendType.KIRON_DEBERTA: deberta_data,
                 },
+                reachable_backends=reachable_backends,
             )
         except ServiceInventoryError as exc:
             return JSONResponse(
@@ -1049,9 +1139,14 @@ async def get_local_models():
         except ModelRegistrationError as exc:
             return _registration_error_response(exc)
         try:
-            return build_local_models_payload(
+            payload = build_local_models_payload(
                 state_view=MODEL_STATE_VIEW,
                 huggingface_revisions=hf_revisions,
+                unavailable_huggingface_backends=frozenset(
+                    backend
+                    for backend, reachable in service_reachability.items()
+                    if not reachable
+                ),
                 ollama_tag_rows=tags_data["models"],
                 ollama_ps=ps_data,
                 embedding_health=embed_data,
@@ -1060,7 +1155,11 @@ async def get_local_models():
                 deberta_reachable=deberta_reachable,
                 registrations=registrations,
                 ollama_show_by_name=show_by_name,
+                service_memory=system.get("service_memory"),
             )
+            for row in payload.get("models", []):
+                row.pop("reference", None)
+            return payload
         except InventoryShapeError as exc:
             return JSONResponse(
                 {"error": f"Ungueltiges lokales Modellinventar: {exc}"},
@@ -1093,16 +1192,52 @@ async def load_embedding_model(body: dict):
                 resp = await client.post(
                     EMBEDDING_LOAD_URL,
                     json={"model": model},
+                    headers={OPERATION_HEADER: op.admission_id, OVERLAY_HEADER: op.token},
                 )
             try:
                 data = resp.json()
             except json.JSONDecodeError:
                 return JSONResponse({"error": "Ungueltige JSON-Antwort vom Embedding-Service"}, status_code=502)
-            op.clear_marker = _clear_marker_for_service_response(resp, True)
+            op.clear_marker = resp.headers.get(COMPLETION_HEADER) == op.admission_id
             status = resp.status_code if 200 <= resp.status_code < 600 else 502
             return JSONResponse(data, status_code=status)
         except httpx.ConnectError:
             op.clear_marker = True
+            return JSONResponse({"error": "Embedding-Service nicht erreichbar"}, status_code=503)
+        except httpx.TimeoutException:
+            return JSONResponse({"error": "Embedding-Service Timeout"}, status_code=504)
+        except httpx.RequestError as exc:
+            return _json_backend_error(f"Embedding-Service Backend-Fehler: {exc}")
+
+
+@app.post("/api/embedding/unload")
+async def unload_embedding_model(body: dict):
+    """Entlade genau ein Modell ueber den seriellen Embedding-Worker."""
+    model = body.get("model")
+    if set(body) != {"model"} or not _validate_model_name(model):
+        return JSONResponse({"error": "Genau ein gueltiger Modellname ist erforderlich."}, status_code=400)
+    route = next((route for route in PROXY_ROUTING_VIEW.routes
+                  if route.backend is BackendType.KIRON_EMBEDDINGS and model in route.input_names), None)
+    if route is None:
+        return JSONResponse({"error": "Unbekanntes Embedding-Modell"}, status_code=400)
+    async with vram_lease.gpu_service_operation(
+        releases_resources=True, service_name="Embedding-Service",
+    ) as op:
+        if not op.allowed:
+            return _gpu_gate_response(op.decision)
+        try:
+            async with httpx.AsyncClient(timeout=60) as client:
+                resp = await client.post(EMBEDDING_UNLOAD_URL, json={"model": model})
+            try:
+                data = resp.json()
+            except json.JSONDecodeError:
+                return JSONResponse({"error": "Ungueltige JSON-Antwort vom Embedding-Service"}, status_code=502)
+            status = resp.status_code if 200 <= resp.status_code < 600 else 502
+            if 200 <= status < 300 and (type(data) is not dict or data.get("status") != "unloaded"
+                    or data.get("model") != route.backend_model_name or type(data.get("already")) is not bool):
+                return JSONResponse({"error": "Embedding-Service hat das Entladen nicht bestaetigt."}, status_code=502)
+            return JSONResponse(data, status_code=status)
+        except httpx.ConnectError:
             return JSONResponse({"error": "Embedding-Service nicht erreichbar"}, status_code=503)
         except httpx.TimeoutException:
             return JSONResponse({"error": "Embedding-Service Timeout"}, status_code=504)
@@ -1183,40 +1318,64 @@ async def load_model(body: dict):
         payload["options"] = {"num_gpu": 0}
 
     async def _load_under_marker(op: vram_lease.GPUServiceOperation | None = None):
+        response_received = load_ended = False
         try:
-            async with httpx.AsyncClient(base_url=OLLAMA_BASE_URL, timeout=120) as client:
-                resp = await client.post("/api/generate", json=payload)
-                if resp.status_code != 200:
-                    error_data = {}
-                    data_readable = False
-                    if resp.headers.get("content-type", "").startswith("application/json"):
-                        try:
-                            error_data = resp.json()
-                            data_readable = isinstance(error_data, dict)
-                        except json.JSONDecodeError:
-                            error_data = {}
-                    if op is not None:
-                        op.clear_marker = _clear_marker_for_service_response(resp, data_readable)
-                    status = resp.status_code if resp.status_code >= 400 else 502
-                    return JSONResponse(
-                        {"error": error_data.get("error", f"Ollama-Fehler (HTTP {resp.status_code})")},
-                        status_code=status,
+            operation_id = secrets.token_hex(16)
+            async with OllamaLifecycleOperation(store=ollama_admission_store(),
+                    owner="kiron-dashboard-load", generation="dashboard-load:" + operation_id,
+                    operation_id=operation_id, deployment_id="dashboard-load:" + operation_id,
+                    deadline_monotonic=time.monotonic() + 180) as lifecycle:
+                async with httpx.AsyncClient(base_url=OLLAMA_BASE_URL, timeout=120) as client:
+                    lifecycle.mark_started()
+                    try:
+                        resp = await client.post("/api/generate", json=payload)
+                    except (httpx.ConnectError, httpx.PoolTimeout):
+                        lifecycle.confirm_end()  # No backend request was sent.
+                        raise
+                    response_received = True
+                    if resp.status_code != 200:
+                        error_data = {}
+                        data_readable = False
+                        if resp.headers.get("content-type", "").startswith("application/json"):
+                            try:
+                                error_data = resp.json()
+                                data_readable = isinstance(error_data, dict)
+                            except json.JSONDecodeError:
+                                error_data = {}
+                        if op is not None:
+                            op.clear_marker = _clear_marker_for_service_response(resp, data_readable)
+                        status = resp.status_code if resp.status_code >= 400 else 502
+                        return JSONResponse(
+                            {"error": error_data.get("error", f"Ollama-Fehler (HTTP {resp.status_code})")},
+                            status_code=status,
+                        )
+                    try:
+                        load_result = resp.json()
+                        load_ended = isinstance(load_result, dict) and load_result.get("done") is True
+                    except (ValueError, UnicodeError):
+                        load_ended = False
+                    verify_error = await _verify_model_loaded(
+                        client,
+                        name,
+                        require_cpu=not use_gpu,
+                        require_gpu=use_gpu,
                     )
-                verify_error = await _verify_model_loaded(
-                    client,
-                    name,
-                    require_cpu=not use_gpu,
-                    require_gpu=use_gpu,
-                )
-                if verify_error is not None:
-                    return verify_error
+                    if verify_error is not None:
+                        return verify_error
+                if not load_ended:
+                    return _json_backend_error("Ollama bestaetigte keinen vollstaendigen Ladeabschluss")
+                lifecycle.confirm_end()
             if op is not None:
-                op.clear_marker = True
+                op.clear_marker = load_ended
             return {"status": "loaded", "model": name, "gpu": use_gpu}
 
+        except AdmissionError as exc:
+            if op is not None and "lifecycle" in locals() and not lifecycle.started:
+                op.clear_marker = True
+            return JSONResponse({"error": ollama_recovery.conflict_message(ollama_admission_store(), exc), "code": exc.code}, status_code=409)
         except httpx.ConnectError:
             if op is not None:
-                op.clear_marker = True
+                op.clear_marker = not response_received or load_ended
             return JSONResponse({"error": "Ollama nicht erreichbar"}, status_code=503)
         except httpx.TimeoutException:
             return JSONResponse({"error": "Timeout beim Laden"}, status_code=504)
@@ -1244,34 +1403,50 @@ async def unload_model(body: dict):
     force = body.get("force") is True
 
     async with vram_lease.gpu_service_operation(
+        releases_resources=True,
         force=force,
         service_name="Ollama",
     ) as op:
         if not op.allowed:
             return _gpu_gate_response(op.decision)
         try:
-            async with httpx.AsyncClient(base_url=OLLAMA_BASE_URL, timeout=30) as client:
-                resp = await client.post("/api/generate", json={
-                    "model": name, "keep_alive": 0, "stream": False,
-                })
-                if not (200 <= resp.status_code < 300):
-                    data_readable = False
-                    if resp.headers.get("content-type", "").startswith("application/json"):
-                        try:
-                            data_readable = isinstance(resp.json(), dict)
-                        except json.JSONDecodeError:
-                            data_readable = False
-                    op.clear_marker = _clear_marker_for_service_response(resp, data_readable)
-                    return JSONResponse(
-                        {"error": f"Ollama-Fehler beim Entladen (HTTP {resp.status_code})"},
-                        status_code=resp.status_code,
-                    )
-                verify_error = await _verify_model_unloaded(client, name)
-                if verify_error is not None:
-                    return verify_error
+            operation_id = secrets.token_hex(16)
+            async with OllamaLifecycleOperation(store=ollama_admission_store(),
+                    owner="kiron-dashboard-unload", generation="dashboard:" + operation_id,
+                    operation_id=operation_id, deployment_id="dashboard:" + operation_id,
+                    deadline_monotonic=time.monotonic() + 60) as lifecycle:
+                async with httpx.AsyncClient(base_url=OLLAMA_BASE_URL, timeout=30) as client:
+                    lifecycle.mark_started()
+                    try:
+                        resp = await client.post("/api/generate", json={
+                            "model": name, "keep_alive": 0, "stream": False,
+                        })
+                    except (httpx.ConnectError, httpx.PoolTimeout):
+                        lifecycle.confirm_end()  # No backend request was sent.
+                        raise
+                    if not (200 <= resp.status_code < 300):
+                        data_readable = False
+                        if resp.headers.get("content-type", "").startswith("application/json"):
+                            try:
+                                data_readable = isinstance(resp.json(), dict)
+                            except json.JSONDecodeError:
+                                data_readable = False
+                        op.clear_marker = _clear_marker_for_service_response(resp, data_readable)
+                        return JSONResponse(
+                            {"error": f"Ollama-Fehler beim Entladen (HTTP {resp.status_code})"},
+                            status_code=resp.status_code,
+                        )
+                    verify_error = await _verify_model_unloaded(client, name)
+                    if verify_error is not None:
+                        return verify_error
+                    lifecycle.confirm_end()
             op.clear_marker = True
             return {"status": "unloaded", "model": name}
 
+        except AdmissionError as exc:
+            if "lifecycle" in locals() and not lifecycle.started:
+                op.clear_marker = True
+            return JSONResponse({"error": ollama_recovery.conflict_message(ollama_admission_store(), exc), "code": exc.code}, status_code=409)
         except httpx.ConnectError:
             op.clear_marker = True
             return JSONResponse({"error": "Ollama nicht erreichbar"}, status_code=503)
@@ -1294,65 +1469,83 @@ async def delete_model(body: dict):
     # das Modell wieder in den Speicher bringt und die VRAM-Allokation
     # ohne Cleanup gerissen wird.
     async with vram_lease.gpu_service_operation(
+        releases_resources=True,
+        serialize_release=True,
         force=force,
         service_name="Ollama",
     ) as op:
         if not op.allowed:
             return _gpu_gate_response(op.decision)
         try:
-            async with httpx.AsyncClient(base_url=OLLAMA_BASE_URL, timeout=10) as client:
-                # Pruefen ob Modell geladen ist (#272: fail-close bei ps-Fehler)
-                ps_resp = await client.get("/api/ps")
-                loaded_map: dict[str, dict] = {}
-                ps_known = False
-                if ps_resp.status_code == 200:
-                    try:
-                        loaded_map, ps_known = _parse_ps_models(ps_resp.json())
-                    except json.JSONDecodeError:
-                        ps_known = False
-
-                # #272: Wenn /api/ps nicht verlaesslich ausgewertet werden kann, NICHT blind loeschen.
-                # Ohne force=true wird ein transienter Fehler auf 503 abgebildet, damit geladene
-                # Modelle nicht versehentlich aus dem Speicher gerissen werden.
-                if not ps_known and not force:
-                    op.clear_marker = True
-                    return JSONResponse({
-                        "error": "Loaded-Check fehlgeschlagen",
-                        "hint": "Ollama /api/ps nicht verlaesslich erreichbar. "
-                                "Retry oder force=true verwenden.",
-                    }, status_code=503)
-
-                canonical = _canonical_model_name(name)
-                if (name in loaded_map or canonical in loaded_map) and not force:
-                    op.clear_marker = True
-                    return JSONResponse({
-                        "error": "Modell ist geladen",
-                        "loaded": True,
-                        "hint": "Mit force=true trotzdem loeschen oder zuerst entladen",
-                    }, status_code=409)
-
-                # Loeschen
-                del_resp = await client.request("DELETE", "/api/delete", json={"model": name})
-
-                if del_resp.status_code == 404:
-                    op.clear_marker = True
-                    return JSONResponse({"error": "Modell nicht gefunden"}, status_code=404)
-                if not (200 <= del_resp.status_code < 300):
-                    data_readable = False
-                    if del_resp.headers.get("content-type", "").startswith("application/json"):
+            operation_id = secrets.token_hex(16)
+            async with OllamaLifecycleOperation(store=ollama_admission_store(),
+                    owner="kiron-dashboard-delete", generation="dashboard-delete:" + operation_id,
+                    operation_id=operation_id, deployment_id="dashboard-delete:" + operation_id,
+                    deadline_monotonic=time.monotonic() + 60) as lifecycle:
+                async with httpx.AsyncClient(base_url=OLLAMA_BASE_URL, timeout=10) as client:
+                    # Pruefen ob Modell geladen ist (#272: fail-close bei ps-Fehler)
+                    ps_resp = await client.get("/api/ps")
+                    loaded_map: dict[str, dict] = {}
+                    ps_known = False
+                    if ps_resp.status_code == 200:
                         try:
-                            data_readable = isinstance(del_resp.json(), dict)
+                            loaded_map, ps_known = _parse_ps_models(ps_resp.json())
                         except json.JSONDecodeError:
-                            data_readable = False
-                    op.clear_marker = _clear_marker_for_service_response(del_resp, data_readable)
-                    return JSONResponse(
-                        {"error": f"Ollama-Fehler beim Loeschen (HTTP {del_resp.status_code})"},
-                        status_code=del_resp.status_code,
-                    )
+                            ps_known = False
 
+                    # #272: Wenn /api/ps nicht verlaesslich ausgewertet werden kann, NICHT blind loeschen.
+                    # Ohne force=true wird ein transienter Fehler auf 503 abgebildet, damit geladene
+                    # Modelle nicht versehentlich aus dem Speicher gerissen werden.
+                    if not ps_known and not force:
+                        op.clear_marker = True
+                        return JSONResponse({
+                            "error": "Loaded-Check fehlgeschlagen",
+                            "hint": "Ollama /api/ps nicht verlaesslich erreichbar. "
+                                    "Retry oder force=true verwenden.",
+                        }, status_code=503)
+
+                    canonical = _canonical_model_name(name)
+                    if (name in loaded_map or canonical in loaded_map) and not force:
+                        op.clear_marker = True
+                        return JSONResponse({
+                            "error": "Modell ist geladen",
+                            "loaded": True,
+                            "hint": "Mit force=true trotzdem loeschen oder zuerst entladen",
+                        }, status_code=409)
+
+                    # Loeschen
+                    lifecycle.mark_started()
+                    try:
+                        del_resp = await client.request("DELETE", "/api/delete", json={"model": name})
+                    except (httpx.ConnectError, httpx.PoolTimeout):
+                        lifecycle.confirm_end()  # No backend request was sent.
+                        raise
+
+                    if del_resp.status_code == 404:
+                        lifecycle.confirm_end()
+                        op.clear_marker = True
+                        return JSONResponse({"error": "Modell nicht gefunden"}, status_code=404)
+                    if not (200 <= del_resp.status_code < 300):
+                        data_readable = False
+                        if del_resp.headers.get("content-type", "").startswith("application/json"):
+                            try:
+                                data_readable = isinstance(del_resp.json(), dict)
+                            except json.JSONDecodeError:
+                                data_readable = False
+                        op.clear_marker = _clear_marker_for_service_response(del_resp, data_readable)
+                        return JSONResponse(
+                            {"error": f"Ollama-Fehler beim Loeschen (HTTP {del_resp.status_code})"},
+                            status_code=del_resp.status_code,
+                        )
+
+                    lifecycle.confirm_end()
+                    op.clear_marker = True
+                    return {"status": "deleted", "model": name}
+
+        except AdmissionError as exc:
+            if "lifecycle" in locals() and not lifecycle.started:
                 op.clear_marker = True
-                return {"status": "deleted", "model": name}
-
+            return JSONResponse({"error": ollama_recovery.conflict_message(ollama_admission_store(), exc), "code": exc.code}, status_code=409)
         except httpx.ConnectError:
             op.clear_marker = True
             return JSONResponse({"error": "Ollama nicht erreichbar"}, status_code=503)
@@ -1946,6 +2139,7 @@ async def stop_embedding(body: dict | None = Body(default=None)):
     """Embedding-Service stoppen."""
     body = body if isinstance(body, dict) else {}
     async with vram_lease.gpu_service_operation(
+        releases_resources=True,
         force=body.get("force") is True,
         service_name="Embedding-Service",
     ) as op:
@@ -2020,6 +2214,7 @@ async def stop_deberta(body: dict | None = Body(default=None)):
     """DeBERTa Cross-Encoder Service stoppen."""
     body = body if isinstance(body, dict) else {}
     async with vram_lease.gpu_service_operation(
+        releases_resources=True,
         force=body.get("force") is True,
         service_name="DeBERTa-Service",
     ) as op:
@@ -2053,9 +2248,12 @@ async def load_deberta_model(body: dict):
     model = body.get("model", "")
     if not _validate_model_name(model):
         return JSONResponse({"error": "Ungueltiger Modellname"}, status_code=400)
+    route = next((route for route in PROXY_ROUTING_VIEW.routes
+                  if route.backend is BackendType.KIRON_DEBERTA and model in route.input_names), None)
     async with vram_lease.gpu_service_operation(
         force=body.get("force") is True,
         service_name="DeBERTa-Service",
+        gpu_memory=route.gpu_memory if route else None,
     ) as op:
         if not op.allowed:
             return _gpu_gate_response(op.decision)
@@ -2064,12 +2262,13 @@ async def load_deberta_model(body: dict):
                 resp = await client.post(
                     DEBERTA_LOAD_URL,
                     json={"model": model},
+                    headers={OPERATION_HEADER: op.admission_id, OVERLAY_HEADER: op.token},
                 )
             try:
                 data = resp.json()
             except json.JSONDecodeError:
                 return JSONResponse({"error": "Ungueltige JSON-Antwort vom DeBERTa-Service"}, status_code=502)
-            op.clear_marker = _clear_marker_for_service_response(resp, True)
+            op.clear_marker = resp.headers.get(COMPLETION_HEADER) == op.admission_id
             status = resp.status_code if 200 <= resp.status_code < 600 else 502
             return JSONResponse(data, status_code=status)
         except httpx.ConnectError:
@@ -2082,27 +2281,34 @@ async def load_deberta_model(body: dict):
 
 
 @app.post("/api/deberta/unload")
-async def unload_deberta_model(body: dict | None = Body(default=None)):
-    """DeBERTa-Modell entladen und VRAM freigeben."""
-    body = body if isinstance(body, dict) else {}
+async def unload_deberta_model(body: dict):
+    """Genau das angegebene DeBERTa-Modell entladen und VRAM freigeben."""
+    model = body.get("model")
+    if set(body) != {"model"} or not _validate_model_name(model):
+        return JSONResponse({"error": "Genau ein gueltiger Modellname ist erforderlich."}, status_code=400)
+    route = next((route for route in PROXY_ROUTING_VIEW.routes
+                  if route.backend is BackendType.KIRON_DEBERTA and model in route.input_names), None)
+    if route is None:
+        return JSONResponse({"error": "Unbekanntes DeBERTa-Modell"}, status_code=400)
     async with vram_lease.gpu_service_operation(
-        force=body.get("force") is True,
+        releases_resources=True,
         service_name="DeBERTa-Service",
     ) as op:
         if not op.allowed:
             return _gpu_gate_response(op.decision)
         try:
-            async with httpx.AsyncClient(timeout=10) as client:
-                resp = await client.post(DEBERTA_UNLOAD_URL)
+            async with httpx.AsyncClient(timeout=60) as client:
+                resp = await client.post(DEBERTA_UNLOAD_URL, json={"model": model})
             try:
                 data = resp.json()
             except json.JSONDecodeError:
                 return JSONResponse({"error": "Ungueltige JSON-Antwort vom DeBERTa-Service"}, status_code=502)
-            op.clear_marker = _clear_marker_for_service_response(resp, True)
             status = resp.status_code if 200 <= resp.status_code < 600 else 502
+            if 200 <= status < 300 and (type(data) is not dict or data.get("status") != "unloaded"
+                    or data.get("model") != route.backend_model_name or type(data.get("already")) is not bool):
+                return JSONResponse({"error": "DeBERTa-Service hat das Entladen nicht bestaetigt."}, status_code=502)
             return JSONResponse(data, status_code=status)
         except httpx.ConnectError:
-            op.clear_marker = True
             return JSONResponse({"error": "DeBERTa-Service nicht erreichbar"}, status_code=503)
         except httpx.TimeoutException:
             return JSONResponse({"error": "DeBERTa-Service Timeout"}, status_code=504)
@@ -2984,6 +3190,61 @@ async def delete_api_key(key_id: str, body: dict | None = Body(default=None)):
 # ============================================================
 # WebSocket - Echtzeit-Kanal
 # ============================================================
+
+async def _stream_high_res_history(
+    websocket: WebSocket,
+    service: HighResHistoryService,
+    range_key: str,
+) -> None:
+    """Sendet einen Puffersnapshot und danach coalescte Einzelpunkte."""
+    snapshot = service.snapshot_frame(range_key)
+    await websocket.send_text(json.dumps(snapshot, separators=(",", ":")))
+    samples = snapshot.get("samples")
+    if isinstance(samples, list) and samples:
+        last_sequence = int(samples[-1].get("sequence", 0))
+    else:
+        last_sequence = 0
+
+    while True:
+        sample = await service.wait_for_next(last_sequence)
+        last_sequence = int(sample["sequence"])
+        await websocket.send_text(
+            json.dumps(service.point_frame(sample, range_key), separators=(",", ":"))
+        )
+
+
+async def _websocket_high_res_history(websocket: WebSocket, range_key: str) -> None:
+    await websocket.accept()
+    service = high_res_history_service
+    if service is None or not service.running:
+        await websocket.close(code=1013)
+        return
+    try:
+        await _stream_high_res_history(websocket, service, range_key)
+    except (WebSocketDisconnect, HighResHistoryClosed):
+        pass
+    except RuntimeError:
+        # Starlette meldet Sends auf einer bereits geschlossenen Verbindung je
+        # nach Disconnect-Zeitpunkt als RuntimeError statt WebSocketDisconnect.
+        if websocket.application_state == WebSocketState.CONNECTED:
+            raise
+    finally:
+        if websocket.application_state == WebSocketState.CONNECTED:
+            with contextlib.suppress(Exception):
+                await websocket.close()
+
+
+@app.websocket("/ws/history/1m")
+async def websocket_history_1m(websocket: WebSocket):
+    """Inkrementeller 250-ms-Stream fuer die letzte Minute."""
+    await _websocket_high_res_history(websocket, "1m")
+
+
+@app.websocket("/ws/history/10m")
+async def websocket_history_10m(websocket: WebSocket):
+    """Inkrementeller 250-ms-Stream fuer die letzten zehn Minuten."""
+    await _websocket_high_res_history(websocket, "10m")
+
 
 async def _send_cached_metrics_frame(
     websocket: WebSocket,

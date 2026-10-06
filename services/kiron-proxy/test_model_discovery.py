@@ -3,8 +3,8 @@ from __future__ import annotations
 import pytest
 
 from kiron_common.embedding_registry import MODEL_STATE_VIEW
-from kiron_common.local_model_registry import LocalModelProvider, RegistryEntry
-from kiron_common.model_catalog import BackendType, LoaderType
+from kiron_common.local_model_registry import RegistryEntry
+from kiron_common.model_catalog import ArtifactFormat, ArtifactType, BackendType, LoaderType
 from kiron_common.model_state import HuggingFaceRevision
 
 from model_discovery import (
@@ -17,7 +17,7 @@ from kiron_common.model_state import LocalModelInventory, RuntimeInventory
 
 
 EXPECTED_DIGEST = (
-    "sha256:c91229d7ea472b49d87f6344dbfb640fc760f43e8cace398421d5b364452e6f6"
+    "sha256:be10f0dca76de099a561f53ba77adab9e4c9b9e7238ae10ac6d8b506206f4fc0"
 )
 
 
@@ -43,10 +43,19 @@ def _payload(
     deberta_reachable=True,
     registrations=(),
     show=None,
+    service_memory=None,
 ):
     return build_local_models_payload(
         state_view=MODEL_STATE_VIEW,
         huggingface_revisions=frozenset(hf),
+        unavailable_huggingface_backends=frozenset(
+            backend
+            for backend, reachable in (
+                (BackendType.KIRON_EMBEDDINGS, embedding_reachable),
+                (BackendType.KIRON_DEBERTA, deberta_reachable),
+            )
+            if not reachable
+        ),
         ollama_tag_rows=list(tags),
         ollama_ps={"models": []} if ps is None else ps,
         embedding_health=_health() if embedding is None else embedding,
@@ -55,6 +64,7 @@ def _payload(
         deberta_reachable=deberta_reachable,
         registrations=tuple(registrations),
         ollama_show_by_name={} if show is None else show,
+        service_memory=service_memory,
     )
 
 
@@ -111,6 +121,25 @@ def test_hf_installation_is_injected_separately_from_runtime() -> None:
     assert row["runtime_state"] == "unloaded"
 
 
+def test_embedding_profile_proofs_are_scoped_to_the_backend_and_independent_of_residency():
+    rows = _payload()["models"]
+    native = next(row for row in rows if row["name"] == "nomic-embed-text"
+                  and row["backend"] == "kiron_embeddings")
+    ollama = next(row for row in rows if row["name"] == "nomic-embed-text:latest"
+                  and row["backend"] == "ollama")
+    assert native["load_state"] == "unloaded" and native["installed"] is False
+    assert {profile["profile_id"] for profile in native["embedding_profiles"]} == {
+        "kiron-nomic-dense-v1", "kiron-nomic-late-v1",
+    }
+    for profile in native["embedding_profiles"]:
+        assert profile["verification"] == {"status": "verified", "blocking_reasons": []}
+        assert profile["index_compatibility_id"] and profile["query_compatibility_id"]
+    assert len(ollama["embedding_profiles"]) == 1
+    assert ollama["embedding_profiles"][0]["profile_id"] == "ollama-nomic-dense-v1"
+    assert ollama["embedding_profiles"][0]["verification"]["status"] == "unverified"
+    assert ollama["embedding_profiles"][0]["query_compatibility_id"] is None
+
+
 def test_loading_and_unknown_runtime_are_not_guessed() -> None:
     loading = _payload(
         embedding=_health(loading="nomic-embed-text"),
@@ -132,6 +161,7 @@ def test_loading_and_unknown_runtime_are_not_guessed() -> None:
 
     assert loading_row["runtime_state"] == "loading"
     assert unknown_row["runtime_state"] == "unknown"
+    assert unknown_row["installed"] is None
 
 
 def test_only_registered_unknown_ollama_rows_join_the_catalog_list() -> None:
@@ -143,7 +173,8 @@ def test_only_registered_unknown_ollama_rows_join_the_catalog_list() -> None:
         "native_extension": {"kept": True},
     }
     registration = RegistryEntry.create(
-        provider=LocalModelProvider.OLLAMA,
+        runtime_provider=BackendType.OLLAMA,
+        artifact_origin=ArtifactType.OLLAMA, artifact_format=ArtifactFormat.OLLAMA_MANIFEST,
         reference=unknown["name"],
         display_name=unknown["name"],
         loader=LoaderType.OLLAMA,
@@ -189,6 +220,7 @@ def test_only_registered_unknown_ollama_rows_join_the_catalog_list() -> None:
     assert generic["registry_id"] == registration.id
     assert generic["native_context_length"] == 32768
     assert generic["runtime_context_length"] == 8192
+    assert generic["runtime_device"] == "gpu"  # Exact bytes, even when rounded GB is zero.
     assert generic["catalog_context_length"] is None
     assert generic["catalog_token_limits"] == []
     assert "canonical_model_id" not in generic
@@ -214,7 +246,8 @@ def test_huggingface_registration_is_visible_without_changing_catalog_state(
     model_path = tmp_path / "dynamic-hf"
     model_path.mkdir()
     registration = RegistryEntry.create(
-        provider=LocalModelProvider.HUGGINGFACE,
+        runtime_provider=BackendType.KIRON_DEBERTA,
+        artifact_origin=ArtifactType.LOCAL, artifact_format=ArtifactFormat.HF_WEIGHTS,
         reference=str(model_path),
         display_name="Dynamic <model>",
         loader=LoaderType.CROSS_ENCODER,
@@ -228,7 +261,7 @@ def test_huggingface_registration_is_visible_without_changing_catalog_state(
 
     assert row["name"] == "Dynamic <model>"
     assert row["reference"] == str(model_path)
-    assert row["backend"] == "huggingface"
+    assert row["backend"] == "kiron_deberta"
     assert row["installed"] is True
     assert row["catalog_managed"] is False
     assert row["locally_registered"] is True
@@ -277,9 +310,38 @@ def test_service_health_provides_exact_hf_inventory_without_proxy_fs_access() ->
                 frozenset((deberta.huggingface_revision,)),
             ),
         },
+        reachable_backends=(
+            BackendType.KIRON_EMBEDDINGS,
+            BackendType.KIRON_DEBERTA,
+        ),
     )
 
     assert inventory == expected
+
+
+def test_unreachable_service_inventory_is_unknown_not_inconsistent() -> None:
+    embedding = MODEL_STATE_VIEW.resolve(
+        "mxbai-embed-large",
+        BackendType.KIRON_EMBEDDINGS,
+    )
+    assert embedding is not None and embedding.huggingface_revision is not None
+
+    inventory = service_huggingface_inventory(
+        MODEL_STATE_VIEW,
+        {
+            BackendType.KIRON_EMBEDDINGS: _service_inventory_health(
+                BackendType.KIRON_EMBEDDINGS,
+                frozenset((embedding.huggingface_revision,)),
+            ),
+            BackendType.KIRON_DEBERTA: {
+                "catalog_digest": None,
+                "model_states": None,
+            },
+        },
+        reachable_backends=(BackendType.KIRON_EMBEDDINGS,),
+    )
+
+    assert inventory == frozenset((embedding.huggingface_revision,))
 
 
 @pytest.mark.parametrize(
@@ -306,4 +368,11 @@ def test_service_inventory_fails_closed_for_digest_or_shape_errors(mutate) -> No
     mutate(health)
 
     with pytest.raises(ServiceInventoryError):
-        service_huggingface_inventory(MODEL_STATE_VIEW, health)
+        service_huggingface_inventory(
+            MODEL_STATE_VIEW,
+            health,
+            reachable_backends=(
+                BackendType.KIRON_EMBEDDINGS,
+                BackendType.KIRON_DEBERTA,
+            ),
+        )

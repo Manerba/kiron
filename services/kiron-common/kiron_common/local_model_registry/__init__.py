@@ -18,7 +18,7 @@ from .errors import (
 )
 from .models import (
     LocalLoaderMetadata,
-    LocalModelProvider,
+    LocalArtifactFile,
     RegistrationCandidate,
     RegistryEntry,
     ValidatedLocalModel,
@@ -30,6 +30,7 @@ from .registry import (
     RuntimeModelRegistry,
 )
 from .service import (
+    CandidateDiscovery,
     ModelRegistrationService,
     RegistrationValidators,
     list_candidates,
@@ -46,6 +47,10 @@ from .validators import (
 
 __all__ = [
     "DEFAULT_REGISTRY_PATH",
+    "DEFAULT_GGUF_MODEL_ROOT",
+    "GGUFLocalValidator",
+    "GGUFRegistrationPolicy",
+    "CandidateDiscovery",
     "DEFAULT_HUGGINGFACE_MODEL_ROOT",
     "DuplicateModelError",
     "HuggingFaceLocalValidator",
@@ -55,7 +60,7 @@ __all__ = [
     "LoaderMetadataError",
     "LocalLoaderMetadata",
     "LocalModelNotFoundError",
-    "LocalModelProvider",
+    "LocalArtifactFile",
     "LocalValidationError",
     "ModelRegistrationError",
     "ModelRegistrationService",
@@ -75,3 +80,5 @@ __all__ = [
     "register_model",
     "stable_registry_id",
 ]
+
+from .gguf import DEFAULT_GGUF_MODEL_ROOT, GGUFLocalValidator, GGUFRegistrationPolicy

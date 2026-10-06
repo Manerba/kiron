@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "canonical_model_id": "hellord/e5-mistral-7b-instruct:Q4_0",
   "aliases": [
     "e5-mistral-7b-instruct",
@@ -25,11 +25,14 @@
         "weights": [
           {
             "path": "model",
-            "sha256": "f75c0e30696fa7f1656320905943fb42e489e7c4156c37f37e9a17060b5e3e89"
+            "sha256": "f75c0e30696fa7f1656320905943fb42e489e7c4156c37f37e9a17060b5e3e89",
+            "size_bytes": 4108916960
           }
         ],
         "auxiliary": [],
-        "metadata": {}
+        "metadata": {},
+        "format": "ollama_manifest",
+        "projector": null
       },
       "routes": [
         {
@@ -41,7 +44,8 @@
         "type": "ollama",
         "parameters": {}
       },
-      "metadata": {}
+      "metadata": {},
+      "runtime_profile": null
     }
   ],
   "profiles": [
@@ -57,15 +61,15 @@
         "max_input_tokens": {
           "unit": "tokenizer_tokens",
           "counting": "after_server_formatting_including_special_tokens",
-          "truncation": "unknown",
-          "overflow": "unknown",
+          "truncation": "none",
+          "overflow": "reject",
           "by_role": {
-            "search_document": null,
-            "search_query": null
+            "search_document": 4096,
+            "search_query": 4096
           }
         },
-        "output_normalized": null,
-        "similarity": "unknown",
+        "output_normalized": true,
+        "similarity": "cosine",
         "input_type": {
           "supported": [
             "search_document",
@@ -73,53 +77,66 @@
           ],
           "additional_task_roles": [],
           "aliases": [],
-          "role_sensitive": null,
-          "required": false,
+          "role_sensitive": true,
+          "required": true,
           "default": null,
-          "missing_role_behavior": "unknown"
+          "missing_role_behavior": "reject"
         },
         "formatting_owner": "server",
         "pipeline": {
           "tokenizer": {
-            "repository": null,
-            "revision": null
+            "repository": "ollama/hellord/e5-mistral-7b-instruct",
+            "revision": "sha256:f75c0e30696fa7f1656320905943fb42e489e7c4156c37f37e9a17060b5e3e89"
           },
           "formatting": {
             "search_document": {
-              "template": null,
+              "template": "{text}</s>",
               "parameters": {}
             },
             "search_query": {
-              "template": null,
+              "template": "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery: {text}</s>",
               "parameters": {}
             }
           },
           "pooling": {
-            "method": "unknown",
-            "parameters": {}
+            "method": "last_token",
+            "parameters": {
+              "attention": "causal",
+              "position": "last_token_after_truncation"
+            }
           },
           "normalization": {
-            "method": "unknown",
-            "dtype": "unknown",
-            "scope": "unknown"
+            "method": "l2",
+            "dtype": "float32",
+            "scope": "vector"
           },
           "parameters": {
-            "observed_context_length": 32768,
-            "observed_quantization": "Q4_0"
+            "request_options": {
+              "num_ctx": 4096,
+              "num_batch": 512
+            },
+            "request_adapter": "kiron-ollama-embedding-v1",
+            "quantization": "Q4_0",
+            "add_bos_token": true,
+            "add_eos_token": false,
+            "parse_special": true,
+            "eos_suffix_token_id": 2,
+            "truncate": false
           }
         },
         "verification": {
-          "status": "unverified",
+          "status": "verified",
           "evidence": [
+            "independent-cpu-llama.cpp:9a9394a:exact-gguf:last-token-forward-and-negative-controls",
+            "kiron-ollama-embedding-v1:server-role-formatting-eos-and-complete-input-guard",
             "local-ollama-manifest-sha256:c53c78f9f295165b7b4311cec0063639e1675f699584fd955253944bb35b50b5",
             "local-ollama-model-blob-sha256:f75c0e30696fa7f1656320905943fb42e489e7c4156c37f37e9a17060b5e3e89",
-            "ollama-api-version:0.18.0"
+            "ollama-api-version:0.18.0",
+            "pinned-quantized-vector-space:upstream-full-precision-equivalence-not-asserted",
+            "reference-vectors:scripts/fixtures/hellord-e5-mistral-v1.reference.json@sha256:602ad65221530b19658e28a8431eab26c328d0a9669842b64717b97b1d625e2d",
+            "upstream-formatting:intfloat/e5-mistral-7b-instruct@d62cc4417be0e3289c03dd459d1ef2d137e2554e"
           ],
-          "blocking_reasons": [
-            "api_show_advertises_completion_only",
-            "missing_embedding_pipeline_layers_and_reference_witness",
-            "missing_exact_upstream_revision_and_conversion_provenance"
-          ]
+          "blocking_reasons": []
         }
       }
     }

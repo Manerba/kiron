@@ -25,6 +25,8 @@ class EncodeResult:
     embeddings: list[list[float]]
     prompt_eval_count: int
     load_duration_ns: int
+    execution_epoch: int | None = None
+    execution_artifact: str | None = None
 
 
 @dataclass(slots=True)
@@ -44,7 +46,7 @@ class ColbertEmbedResult:
 
 @dataclass(slots=True)
 class ModelJob:
-    kind: Literal["load", "encode", "drop", "late_embed", "colbert_embed"]
+    kind: Literal["load", "unload", "encode", "drop", "late_embed", "colbert_embed"]
     payload: dict[str, object]
     future: asyncio.Future
     loop: asyncio.AbstractEventLoop
@@ -58,6 +60,10 @@ class WorkerQueueFullError(RuntimeError):
 
 class WorkerStoppedError(RuntimeError):
     pass
+
+
+class StaleGenerationError(ValueError):
+    """The expected resident changed; no model access/execution was attempted."""
 
 
 class NonFiniteEmbeddingError(RuntimeError):
@@ -218,16 +224,23 @@ class SerialModelWorker:
             job.cancelled.set()
             raise
 
-    async def load(self, model_name: str) -> str:
-        future, job = self._submit("load", {"model_name": model_name})
+    async def load(self, model_name: str, *, load_parent: tuple[str, str] | None = None) -> str:
+        future, job = self._submit("load", {"model_name": model_name, "load_parent": load_parent})
+        return await self._await_with_cancel(future, job)
+
+    async def unload(self, model_name: str) -> bool:
+        future, job = self._submit("unload", {"model_name": model_name})
         return await self._await_with_cancel(future, job)
 
     async def encode(
-        self, model_name: str, texts: list[str], input_type: str | None
+        self, model_name: str, texts: list[str], input_type: str | None, *, expected_artifact: str | None = None,
+        expected_epoch: int | None = None
     ) -> EncodeResult:
         future, job = self._submit(
             "encode",
-            {"model_name": model_name, "texts": texts, "input_type": input_type},
+            {"model_name": model_name, "texts": texts, "input_type": input_type,
+             **({"expected_artifact": expected_artifact, "expected_epoch": expected_epoch}
+                if expected_artifact is not None else {})},
         )
         return await self._await_with_cancel(future, job)
 
@@ -319,6 +332,13 @@ class SerialModelWorker:
                 try:
                     job = self._queue.get(timeout=self._POLL_TIMEOUT_S)
                 except queue.Empty:
+                    idle = getattr(self._manager, "residency_idle", None)
+                    if idle is not None:
+                        try:
+                            idle()
+                        except Exception as exc:
+                            self._record_error(exc)
+                            logger.exception("Embedding resident heartbeat failed closed")
                     continue
                 # Race-Fenster: stop_event wurde gesetzt, waehrend wir in
                 # queue.get warteten. Drainen mit dem gerade gepullten Job.
@@ -344,6 +364,9 @@ class SerialModelWorker:
                 logger.exception("clear_loading_for_crash fehlgeschlagen")
 
         if fatal:
+            unknown = getattr(self._manager, "residency_unknown", None)
+            if unknown is not None:
+                unknown()
             # Fail-Fast: systemd startet den Prozess neu. Ohne os._exit
             # bliebe der Service HTTP-erreichbar mit totem Worker.
             os._exit(1)
@@ -376,6 +399,13 @@ class SerialModelWorker:
             self._manager._drop_model_sync()
         except Exception:
             logger.exception("Fehler im Drop-Pfad waehrend Stop")
+            unknown = getattr(self._manager, "residency_unknown", None)
+            if unknown is not None:
+                unknown()
+        else:
+            boundary = getattr(self._manager, "residency_boundary", None)
+            if boundary is not None:
+                boundary()
         finally:
             self._set_current_job(None)
 
@@ -391,13 +421,19 @@ class SerialModelWorker:
             try:
                 if job.kind == "load":
                     name = job.payload["model_name"]
-                    self._manager._ensure_model_sync(name)
+                    self._manager._ensure_model_sync(name, load_parent=job.payload["load_parent"])
                     completion = (_complete_future_with_result, name)
+                elif job.kind == "unload":
+                    removed = self._manager._unload_model_sync(job.payload["model_name"])
+                    completion = (_complete_future_with_result, removed)
                 elif job.kind == "encode":
                     name = job.payload["model_name"]
                     texts = job.payload["texts"]
                     input_type = job.payload["input_type"]
-                    result = self._manager._encode_sync(name, texts, input_type)
+                    options = ({"expected_artifact": job.payload["expected_artifact"],
+                                "expected_epoch": job.payload["expected_epoch"]}
+                               if "expected_artifact" in job.payload else {})
+                    result = self._manager._encode_sync(name, texts, input_type, **options)
                     completion = (_complete_future_with_result, result)
                 elif job.kind == "late_embed":
                     result = self._manager._late_embed_sync(
@@ -427,6 +463,13 @@ class SerialModelWorker:
                 self._record_error(exc)
                 completion = (_complete_future_with_exception, exc)
         finally:
+            boundary = getattr(self._manager, "residency_boundary", None)
+            if boundary is not None:
+                try:
+                    boundary()
+                except Exception as exc:
+                    self._record_error(exc)
+                    completion = (_complete_future_with_exception, exc)
             # Der atomare Runtime-Snapshot muss bereits idle sein, bevor die
             # Future-Aufloesung den Awaiter wieder laufen lassen kann. Sonst
             # kann unmittelbar nach einem erfolgreichen await noch der alte

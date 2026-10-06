@@ -20,6 +20,9 @@ PROXY_DIR = Path(__file__).resolve().parent
 import proxy  # noqa: E402
 from kiron_common.embedding_registry import MODEL_CATALOG  # noqa: E402
 from kiron_common.model_catalog import (  # noqa: E402
+    ArtifactFormat,
+    ArtifactType,
+    CatalogValidationError,
     BackendType,
     ModelCatalog,
     ModelEndpoint,
@@ -71,7 +74,7 @@ def _async_test(function):
 
 def _manifests() -> list[dict]:
     return [
-        group.to_manifest_dict(schema_version=1)
+        group.to_manifest_dict(schema_version=2)
         for group in MODEL_CATALOG.groups
     ]
 
@@ -115,17 +118,17 @@ class _BackendClient:
         self.current_model: str | None = None
 
     def build_request(self, method, url, headers=None, content=None):
-        return {
-            "method": method,
-            "url": url,
-            "headers": headers or {},
-            "content": content or b"",
-        }
+        return httpx.Request(method, "http://backend" + url, headers=headers, content=content)
 
     async def send(self, request, stream=False):
         del stream
-        self.sent.append(request)
-        return _BackendResponse()
+        self.sent.append({"method": request.method, "url": request.url.path,
+                          "headers": dict(request.headers), "content": request.content})
+        response = _BackendResponse()
+        if self.backend is BackendType.KIRON_DEBERTA:
+            response.headers = {**response.headers,
+                "X-Kiron-Operation-Terminated": request.headers["X-Kiron-Operation-Id"]}
+        return response
 
     async def get(self, url):
         self.gets.append(url)
@@ -239,9 +242,11 @@ def _build_app():
 def test_production_view_uses_shared_singleton_and_ordered_routes():
     assert PROXY_ROUTING_VIEW.catalog is MODEL_CATALOG
     assert PROXY_ROUTING_VIEW.catalog_digest == (
-        "sha256:c91229d7ea472b49d87f6344dbfb640fc760f43e8cace398421d5b364452e6f6"
+        "sha256:be10f0dca76de099a561f53ba77adab9e4c9b9e7238ae10ac6d8b506206f4fc0"
     )
-    assert PROXY_ROUTING_VIEW.endpoints == tuple(ModelEndpoint)
+    assert PROXY_ROUTING_VIEW.endpoints == tuple(
+        endpoint for endpoint in ModelEndpoint if endpoint not in {ModelEndpoint.CHAT_COMPLETIONS, ModelEndpoint.RESPONSES}
+    )
     for endpoint, expected in EXPECTED_AVAILABLE.items():
         assert PROXY_ROUTING_VIEW.available_models(endpoint) == expected
 
@@ -339,7 +344,7 @@ def test_view_is_deeply_immutable_and_uses_injected_catalog():
     ("mutation", "path_fragment"),
     (
         ("loader", "/loader/type"),
-        ("backend", "/backend/type"),
+        ("backend", "/loader/type"),
         ("missing_model_name", "/backend/parameters"),
         ("unknown_backend_parameter", "/backend/parameters"),
     ),
@@ -361,10 +366,10 @@ def test_unknown_loader_or_routing_data_fails_fast(mutation, path_fragment):
             del deployment["backend"]["parameters"]["model_name"]
         else:
             deployment["backend"]["parameters"]["routing_guess"] = True
-    catalog = ModelCatalog.from_manifests(documents)
-    with pytest.raises(ProxyRoutingCatalogError) as exc_info:
+    with pytest.raises((CatalogValidationError, ProxyRoutingCatalogError)) as exc_info:
+        catalog = ModelCatalog.from_manifests(documents)
         build_proxy_routing_view(catalog)
-    assert path_fragment in exc_info.value.path
+    assert path_fragment in str(exc_info.value)
 
 
 def test_missing_required_endpoint_fails_fast():

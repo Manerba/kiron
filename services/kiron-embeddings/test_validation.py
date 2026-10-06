@@ -40,7 +40,7 @@ from model_worker import (  # noqa: E402
 def _temporary_standard_manifest() -> dict:
     manifest = copy.deepcopy(
         main.MODEL_CATALOG.require("bge-m3:latest").to_manifest_dict(
-            schema_version=1
+            schema_version=2
         )
     )
     deployment = next(
@@ -60,7 +60,7 @@ def _temporary_standard_manifest() -> dict:
     deployment["artifact"]["repository"] = "example/test-standard-embed"
     deployment["artifact"]["revision"] = "a" * 40
     deployment["artifact"]["weights"] = [
-        {"path": "model.safetensors", "sha256": "b" * 64}
+        {"path": "model.safetensors", "sha256": "b" * 64, "size_bytes": None}
     ]
     profile["id"] = "test-standard-embed.profile"
     profile["deployment_id"] = deployment["id"]
@@ -130,6 +130,7 @@ class CatalogServiceViewTests(unittest.TestCase):
             trust_remote_code=False,
             revision="a" * 40,
             local_files_only=True,
+            model_kwargs={"use_safetensors": True},
         )
 
     def test_service_view_is_deeply_immutable(self):
@@ -158,21 +159,15 @@ class CatalogServiceViewTests(unittest.TestCase):
         manifest["deployments"][0]["loader"]["type"] = (
             LoaderType.CROSS_ENCODER.value
         )
-        catalog = ModelCatalog.from_manifests([manifest])
-        with self.assertRaisesRegex(
-            EmbeddingServiceCatalogError,
-            r"cross_encoder.*not allowed.*kiron_embeddings",
-        ):
-            build_embedding_service_view(
-                catalog,
-                {LoaderType.CROSS_ENCODER: mock.Mock()},
-            )
+        with self.assertRaisesRegex(CatalogValidationError, r"loader/type.*not supported"):
+            ModelCatalog.from_manifests([manifest])
 
     def test_wrong_backend_type_is_explicitly_filtered_out(self):
         manifest = _temporary_standard_manifest()
         manifest["deployments"][0]["backend"]["type"] = (
             BackendType.KIRON_DEBERTA.value
         )
+        manifest["deployments"][0]["loader"]["type"] = LoaderType.CROSS_ENCODER.value
         catalog = ModelCatalog.from_manifests([manifest])
         view = build_embedding_service_view(
             catalog,
@@ -301,7 +296,7 @@ class FakeWorker:
     def snapshot(self) -> dict:
         return dict(self._snapshot)
 
-    async def load(self, name: str) -> str:
+    async def load(self, name: str, *, load_parent=None) -> str:
         self.load_calls.append(name)
         if self._load_exc is not None:
             raise self._load_exc
@@ -843,7 +838,7 @@ class HealthEndpointTests(unittest.TestCase):
         self.assertEqual(body["status"], "no_model")
         self.assertEqual(
             body["catalog_digest"],
-            "sha256:c91229d7ea472b49d87f6344dbfb640fc760f43e8cace398421d5b364452e6f6",
+            "sha256:be10f0dca76de099a561f53ba77adab9e4c9b9e7238ae10ac6d8b506206f4fc0",
         )
         self.assertTrue(body["worker_thread_alive"])
         self.assertEqual(body["queue_depth"], 0)
@@ -948,9 +943,9 @@ class TagsEndpointTests(unittest.TestCase):
         self.assertEqual(fake.load_calls, [])
         self.assertEqual(fake.encode_calls, [])
         self.assertIn("models", resp)
-        # Service-Default F16; Mankei bleibt modellbedingt BF16.
+        # Service-Default F16; Mankei verwendet explizit F32.
         for m in resp["models"]:
-            expected = "BF16" if m["name"] == "mankei-326m-embedder" else "F16"
+            expected = "F32" if m["name"] == "mankei-326m-embedder" else "F16"
             self.assertEqual(m["details"]["quantization_level"], expected)
 
     def test_tags_cpu_device_uses_F32(self):
@@ -970,7 +965,7 @@ class TagsEndpointTests(unittest.TestCase):
             main.model_worker = old
 
         for m in resp["models"]:
-            expected = "BF16" if m["name"] == "mankei-326m-embedder" else "F32"
+            expected = "F32" if m["name"] == "mankei-326m-embedder" else "F32"
             self.assertEqual(m["details"]["quantization_level"], expected)
 
     def test_tags_digest_uses_pinned_revision(self):
@@ -1492,7 +1487,7 @@ class MainSourceStaticChecks(unittest.TestCase):
         """
         embed_src = inspect.getsource(main.embed)
         colbert_src = inspect.getsource(main.embed_colbert)
-        load_src = inspect.getsource(main.load_model_endpoint)
+        load_src = inspect.getsource(main.load_model_endpoint) + inspect.getsource(main._load_model_endpoint)
         late_src = inspect.getsource(main.embed_late)
 
         for name, src in (

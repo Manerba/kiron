@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://kiron.local/schemas/model-manifest-v1.schema.json",
-  "title": "KIron model manifest V1",
+  "$id": "https://kiron.local/schemas/model-manifest-v2.schema.json",
+  "title": "KIron model manifest V2",
   "description": "One immutable manifest per canonical model group. Profile.default_for_endpoint selects a profile only inside its model group. request_defaults separately declares catalog-wide request defaults for rerank and score. Cross-document uniqueness is enforced by kiron_common.model_catalog.",
   "type": "object",
   "additionalProperties": false,
@@ -16,7 +16,7 @@
   ],
   "properties": {
     "schema_version": {
-      "const": 1
+      "const": 2
     },
     "canonical_model_id": {
       "$ref": "#/$defs/literalName"
@@ -76,13 +76,24 @@
     "artifactFile": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["path", "sha256"],
+      "required": [
+        "path",
+        "sha256",
+        "size_bytes"
+      ],
       "properties": {
         "path": {
           "$ref": "#/$defs/literalName"
         },
         "sha256": {
           "$ref": "#/$defs/sha256Hex"
+        },
+        "size_bytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1
         }
       }
     },
@@ -97,17 +108,29 @@
         "trust_remote_code",
         "weights",
         "auxiliary",
-        "metadata"
+        "metadata",
+        "format",
+        "projector"
       ],
       "properties": {
         "type": {
-          "enum": ["huggingface", "ollama"]
+          "enum": [
+            "huggingface",
+            "ollama",
+            "local"
+          ]
         },
         "repository": {
-          "type": ["string", "null"]
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "revision": {
-          "type": ["string", "null"]
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "manifest_digest": {
           "oneOf": [
@@ -137,6 +160,23 @@
         },
         "metadata": {
           "$ref": "#/$defs/metadata"
+        },
+        "format": {
+          "enum": [
+            "hf_weights",
+            "ollama_manifest",
+            "gguf"
+          ]
+        },
+        "projector": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/artifactFile"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "allOf": [
@@ -194,10 +234,18 @@
     "backend": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["type", "parameters"],
+      "required": [
+        "type",
+        "parameters"
+      ],
       "properties": {
         "type": {
-          "enum": ["kiron_embeddings", "kiron_deberta", "ollama"]
+          "enum": [
+            "kiron_embeddings",
+            "kiron_deberta",
+            "ollama",
+            "prism"
+          ]
         },
         "parameters": {
           "type": "object"
@@ -207,7 +255,10 @@
     "loader": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["type", "parameters"],
+      "required": [
+        "type",
+        "parameters"
+      ],
       "properties": {
         "type": {
           "enum": [
@@ -216,7 +267,8 @@
             "colbert_xmod",
             "cross_encoder",
             "mankei_last_token",
-            "ollama"
+            "ollama",
+            "prism_gguf"
           ]
         },
         "parameters": {
@@ -240,13 +292,19 @@
         },
         {
           "$ref": "#/$defs/nliRoute"
+        },
+        {
+          "$ref": "#/$defs/chatRoute"
         }
       ]
     },
     "embedRoute": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["task", "endpoint"],
+      "required": [
+        "task",
+        "endpoint"
+      ],
       "properties": {
         "task": {
           "const": "embedding"
@@ -259,7 +317,10 @@
     "embedLateRoute": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["task", "endpoint"],
+      "required": [
+        "task",
+        "endpoint"
+      ],
       "properties": {
         "task": {
           "const": "embedding"
@@ -272,7 +333,10 @@
     "embedMultiVectorRoute": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["task", "endpoint"],
+      "required": [
+        "task",
+        "endpoint"
+      ],
       "properties": {
         "task": {
           "const": "embedding"
@@ -285,7 +349,10 @@
     "rerankRoute": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["task", "endpoint"],
+      "required": [
+        "task",
+        "endpoint"
+      ],
       "properties": {
         "task": {
           "const": "rerank"
@@ -298,7 +365,10 @@
     "nliRoute": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["task", "endpoint"],
+      "required": [
+        "task",
+        "endpoint"
+      ],
       "properties": {
         "task": {
           "const": "nli"
@@ -317,7 +387,8 @@
         "artifact",
         "routes",
         "loader",
-        "metadata"
+        "metadata",
+        "runtime_profile"
       ],
       "properties": {
         "id": {
@@ -342,13 +413,26 @@
         },
         "metadata": {
           "$ref": "#/$defs/metadata"
+        },
+        "runtime_profile": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/stableId"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       }
     },
     "requestDefault": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["endpoint", "profile_id"],
+      "required": [
+        "endpoint",
+        "profile_id"
+      ],
       "properties": {
         "endpoint": {
           "enum": [
@@ -383,7 +467,8 @@
           "enum": [
             "embedding",
             "rerank",
-            "nli"
+            "nli",
+            "chat"
           ]
         },
         "endpoint": {
@@ -392,7 +477,9 @@
             "/api/embed_late",
             "/api/embed_colbert",
             "/api/rerank",
-            "/api/score"
+            "/api/score",
+            "/v1/chat/completions",
+            "/v1/responses"
           ]
         },
         "default_for_endpoint": {
@@ -400,6 +487,25 @@
         },
         "metadata": {
           "$ref": "#/$defs/metadata"
+        }
+      }
+    },
+    "chatRoute": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "task",
+        "endpoint"
+      ],
+      "properties": {
+        "task": {
+          "const": "chat"
+        },
+        "endpoint": {
+          "enum": [
+            "/v1/chat/completions",
+            "/v1/responses"
+          ]
         }
       }
     }

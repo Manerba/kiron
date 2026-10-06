@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "canonical_model_id": "since2006/gte-Qwen2-7B-instruct:Q4_K_M",
   "aliases": [
     "gte-qwen2-7b-instruct",
@@ -25,11 +25,14 @@
         "weights": [
           {
             "path": "model",
-            "sha256": "537509a18d9593e0022fbee0d5eda902dddba19ceaf1e8b446ff2d6f4201b6b9"
+            "sha256": "537509a18d9593e0022fbee0d5eda902dddba19ceaf1e8b446ff2d6f4201b6b9",
+            "size_bytes": null
           }
         ],
         "auxiliary": [],
-        "metadata": {}
+        "metadata": {},
+        "format": "ollama_manifest",
+        "projector": null
       },
       "routes": [
         {
@@ -41,7 +44,8 @@
         "type": "ollama",
         "parameters": {}
       },
-      "metadata": {}
+      "metadata": {},
+      "runtime_profile": null
     }
   ],
   "profiles": [

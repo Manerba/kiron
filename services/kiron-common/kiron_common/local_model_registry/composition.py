@@ -8,8 +8,10 @@ from pathlib import Path
 
 from kiron_common.local_ollama_api import DEFAULT_OLLAMA_BASE_URL, LocalOllamaAPI
 from kiron_common.model_catalog import LoaderType
+from kiron_common.prism_runtime_policy import Policy, PolicyError
 
-from .models import LocalLoaderMetadata
+from .models import LocalLoaderMetadata, HF_LOADERS
+from .gguf import DEFAULT_GGUF_MODEL_ROOT, GGUFLocalValidator, GGUFRegistrationPolicy
 from .registry import RuntimeModelRegistry
 from .service import ModelRegistrationService, RegistrationValidators
 from .validators import (
@@ -20,6 +22,7 @@ from .validators import (
 
 
 _CONFIG_LIMIT = 1024 * 1024
+DEFAULT_PRISM_POLICY_PATH = Path("/usr/lib/kiron/data/prism-runtime-policy.json")
 _WEIGHT_SUFFIXES = (".safetensors", ".bin", ".pt")
 _TOKENIZER_FILES = frozenset(
     {
@@ -43,7 +46,7 @@ def inspect_huggingface_loader_metadata(
 ) -> LocalLoaderMetadata:
     """Inspect only files already present in one canonical local directory."""
 
-    if not isinstance(loader, LoaderType) or loader is LoaderType.OLLAMA:
+    if loader not in HF_LOADERS:
         raise ValueError("unsupported local Hugging Face loader")
     config_path = path / "config.json"
     if not _regular_local_file(config_path):
@@ -68,9 +71,26 @@ def build_model_registration_service(
     ollama: object | None = None,
     inspect_loader: Callable[[Path, LoaderType], LocalLoaderMetadata] | None = None,
     huggingface_model_root: Path = DEFAULT_HUGGINGFACE_MODEL_ROOT,
+    gguf_model_root: Path = DEFAULT_GGUF_MODEL_ROOT,
+    gguf_profiles: Mapping[str, GGUFRegistrationPolicy] | None = None,
+    prism_policy_path: Path | None = DEFAULT_PRISM_POLICY_PATH,
 ) -> ModelRegistrationService:
     """Build the sole local registration use-case composition."""
 
+    # Explicit injected profiles serve isolated compositions. Production CLI and
+    # dashboard use the same root-owned policy and parser as the controller.
+    if gguf_profiles is None and prism_policy_path is not None:
+        policy_path = Path(prism_policy_path)
+        try:
+            policy_path.lstat()
+        except FileNotFoundError:
+            pass  # Optional policy absent: GGUF remains unconfigured.
+        else:
+            policy = Policy.load(policy_path)
+            if len(policy.artifact_roots) != 1:
+                raise PolicyError("registration requires exactly one configured GGUF root")
+            gguf_model_root = policy.artifact_roots[0]
+            gguf_profiles = policy.registration_profiles()
     resolved_registry = registry if registry is not None else RuntimeModelRegistry()
     resolved_ollama = ollama if ollama is not None else LocalOllamaAPI()
     list_models = getattr(resolved_ollama, "list_models", None)
@@ -81,6 +101,7 @@ def build_model_registration_service(
     return ModelRegistrationService(
         resolved_registry,
         RegistrationValidators(
+            gguf=GGUFLocalValidator(model_root=gguf_model_root, profiles=gguf_profiles),
             ollama=OllamaLocalValidator(
                 list_models=list_models,
                 show_model=show_model,

@@ -23,9 +23,13 @@ def _parser() -> _ArgumentParser:
     parser = _ArgumentParser(prog="kiron-model-registry", add_help=False)
     commands = parser.add_subparsers(dest="command", required=True)
     register = commands.add_parser("register", add_help=False)
-    register.add_argument("--provider", required=True)
+    register.add_argument("--runtime-provider", required=True)
     register.add_argument("--reference", required=True)
     register.add_argument("--loader")
+    register.add_argument("--runtime-profile")
+    register.add_argument("--projector-reference")
+    register.add_argument("--expected-sha256")
+    register.add_argument("--expected-projector-sha256")
     commands.add_parser("list", add_help=False)
     return parser
 
@@ -58,9 +62,13 @@ def run_cli(
     try:
         if arguments.command == "register":
             entry = service.register_model(
-                provider=arguments.provider,
+                runtime_provider=arguments.runtime_provider,
                 reference=arguments.reference,
                 loader=arguments.loader,
+                runtime_profile=arguments.runtime_profile,
+                projector_reference=arguments.projector_reference,
+                expected_sha256=arguments.expected_sha256,
+                expected_projector_sha256=arguments.expected_projector_sha256,
             )
             return 0, {"status": "registered", "model": entry.to_dict()}
         entries = [entry.to_dict() for entry in service.list_models()]

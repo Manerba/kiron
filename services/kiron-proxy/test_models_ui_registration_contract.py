@@ -84,9 +84,9 @@ def test_registration_dialog_uses_discovered_candidates_not_free_text() -> None:
     assert '<select id="modelRegistrationReference" required>' in js
     assert '<input id="modelRegistrationReference"' not in js
     assert "loadRegistrationCandidates" in js
-    assert "candidate.provider === provider.value" in js
+    assert "candidate.runtime_provider === provider.value" in js
     assert "Keine unregistrierten lokalen Modelle gefunden" in js
-    assert "reference: referenceNode.value" in js
+    assert "candidate_id: referenceNode.value" in js
 
 
 def test_static_and_dynamic_origins_are_visible_in_the_same_table() -> None:
@@ -149,3 +149,17 @@ def test_models_rows_match_dashboard_density_and_compact_toggle() -> None:
         assert contract in expandable_css
     assert 'padding: 3px 12px;' in expandable_css
     assert 'gap: 2px;' in expandable_css
+
+
+def test_registration_uses_explicit_runtime_and_artifact_identity():
+    js = JS.read_text(encoding="utf-8")
+    assert 'candidate_id: referenceNode.value' in js
+    assert 'runtime_provider: providerNode.value' not in js
+    assert 'X-Kiron-Action' in js
+    assert 'modelRegistrationProjector' in js
+    assert 'modelRegistrationProfile' in js
+    assert 'candidate.artifact_origin' in js
+    assert 'candidate.artifact_format' in js
+    assert '_registrationErrors[provider.value]' in js
+    assert 'option.disabled = option.hidden' in js
+    assert '<option value="huggingface">' not in js

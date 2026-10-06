@@ -20,6 +20,7 @@ import loaders  # noqa: E402
 import main  # noqa: E402
 from kiron_common.model_catalog import (  # noqa: E402
     BackendType,
+    CatalogValidationError,
     LoaderType,
     ModelCatalog,
     ModelEndpoint,
@@ -37,7 +38,7 @@ EXPECTED_MODELS = (
 
 def _production_manifests() -> list[dict]:
     return [
-        group.to_manifest_dict(schema_version=1)
+        group.to_manifest_dict(schema_version=2)
         for group in main.SHARED_MODEL_CATALOG.groups
     ]
 
@@ -54,12 +55,13 @@ def _manifest(canonical_model_id: str) -> dict:
 
 def _temporary_standard_manifest() -> dict:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "canonical_model_id": "temporary-reranker",
         "aliases": ["example/temporary-reranker"],
         "deployments": [
             {
                 "id": "kiron-deberta-temporary-v1.deployment",
+                "runtime_profile": None,
                 "backend": {
                     "type": "kiron_deberta",
                     "parameters": {
@@ -70,14 +72,16 @@ def _temporary_standard_manifest() -> dict:
                 },
                 "artifact": {
                     "type": "huggingface",
+                    "format": "hf_weights",
                     "repository": "example/temporary-reranker",
                     "revision": "f" * 40,
                     "manifest_digest": None,
                     "trust_remote_code": False,
                     "weights": [
-                        {"path": "model.safetensors", "sha256": "e" * 64}
+                        {"path": "model.safetensors", "sha256": "e" * 64, "size_bytes": None}
                     ],
                     "auxiliary": [],
+                    "projector": None,
                     "metadata": {},
                 },
                 "routes": [
@@ -97,6 +101,8 @@ def _temporary_standard_manifest() -> dict:
                         "labels": None,
                         "rerank_label": None,
                         "size": 123456,
+                        "gpu_memory": {"load_bytes": 123456, "request_bytes": 1024,
+                                       "headroom_bytes": 1024},
                     }
                 },
             }
@@ -283,8 +289,8 @@ class CatalogViewTests(unittest.TestCase):
         wrong_backend = _manifest("ms-marco-MiniLM-L-6-v2")
         wrong_backend["deployments"][0]["backend"]["type"] = "kiron_embeddings"
         with self.assertRaisesRegex(
-            catalog_view.DebertaServiceCatalogError,
-            "belongs to another backend",
+            CatalogValidationError,
+            "loader/type.*not supported",
         ):
             catalog_view.build_deberta_service_view(
                 ModelCatalog.from_manifests([wrong_backend]),
@@ -297,8 +303,8 @@ class CatalogViewTests(unittest.TestCase):
             "parameters": {"additional_role_template": None},
         }
         with self.assertRaisesRegex(
-            catalog_view.DebertaServiceCatalogError,
-            "is not allowed",
+            CatalogValidationError,
+            "loader/type.*not supported",
         ):
             catalog_view.build_deberta_service_view(
                 ModelCatalog.from_manifests([wrong_loader]),
@@ -328,6 +334,17 @@ class CatalogViewTests(unittest.TestCase):
                         loaders.load_mankei_last_token_cuda,
                 },
             )
+
+    def test_gpu_memory_budget_is_required_and_strict(self):
+        for invalid in (None, {}, {"load_bytes": True, "request_bytes": 1, "headroom_bytes": 1},
+                        {"load_bytes": 1, "request_bytes": 0, "headroom_bytes": 1},
+                        {"load_bytes": 1, "request_bytes": 1, "headroom_bytes": 1, "extra": 1}):
+            with self.subTest(invalid=invalid):
+                document = _manifest("ms-marco-MiniLM-L-6-v2")
+                document["deployments"][0]["metadata"]["service"]["gpu_memory"] = invalid
+                with self.assertRaisesRegex(catalog_view.DebertaServiceCatalogError, "gpu_memory"):
+                    catalog_view.build_deberta_service_view(
+                        ModelCatalog.from_manifests([document]), loaders.LOADER_REGISTRY)
 
     def test_tags_and_existing_model_list_endpoint_are_catalog_derived(self):
         self.assertEqual(
@@ -417,7 +434,7 @@ class EndpointSemanticsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["available_models"], list(EXPECTED_MODELS))
         self.assertEqual(
             payload["catalog_digest"],
-            "sha256:c91229d7ea472b49d87f6344dbfb640fc760f43e8cace398421d5b364452e6f6",
+            "sha256:be10f0dca76de099a561f53ba77adab9e4c9b9e7238ae10ac6d8b506206f4fc0",
         )
         self.assertEqual(payload["loaded_models"], ["mankei-326m-reranker"])
 

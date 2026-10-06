@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "canonical_model_id": "Org/Alpha:Q4",
   "aliases": [
     "Org/Alpha",
@@ -23,13 +23,16 @@
         "weights": [
           {
             "path": "model.safetensors",
-            "sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+            "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+            "size_bytes": null
           }
         ],
         "auxiliary": [],
         "metadata": {
           "size_bytes": 123
-        }
+        },
+        "format": "hf_weights",
+        "projector": null
       },
       "routes": [
         {
@@ -50,7 +53,8 @@
       },
       "metadata": {
         "device_class": "cuda"
-      }
+      },
+      "runtime_profile": null
     },
     {
       "id": "alpha.ollama",
@@ -67,11 +71,14 @@
         "weights": [
           {
             "path": "model",
-            "sha256": "3333333333333333333333333333333333333333333333333333333333333333"
+            "sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+            "size_bytes": null
           }
         ],
         "auxiliary": [],
-        "metadata": {}
+        "metadata": {},
+        "format": "ollama_manifest",
+        "projector": null
       },
       "routes": [
         {
@@ -83,7 +90,8 @@
         "type": "ollama",
         "parameters": {}
       },
-      "metadata": {}
+      "metadata": {},
+      "runtime_profile": null
     }
   ],
   "profiles": [

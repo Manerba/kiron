@@ -75,13 +75,14 @@ def _raise_open_failure(error: OSError) -> None:
 class RuntimeModelRegistry:
     """A separate runtime overlay; it never writes Catalog source manifests."""
 
-    __slots__ = ("_file_policy", "_lock_path", "_path")
+    __slots__ = ("_file_policy", "_lock_path", "_path", "_readonly")
 
     def __init__(
         self,
         path: Path = DEFAULT_REGISTRY_PATH,
         *,
         file_policy: RegistryFilePolicy | None = None,
+        readonly: bool = False,
     ) -> None:
         resolved = Path(path)
         if not resolved.is_absolute():
@@ -90,9 +91,12 @@ class RuntimeModelRegistry:
             raise ValueError("registry path must name a file")
         if file_policy is not None and type(file_policy) is not RegistryFilePolicy:
             raise TypeError("file_policy must be a RegistryFilePolicy")
+        if type(readonly) is not bool:
+            raise TypeError("readonly must be boolean")
         self._path = resolved
         self._lock_path = resolved.with_name(resolved.name + ".lock")
         self._file_policy = file_policy or RegistryFilePolicy()
+        self._readonly = readonly
 
     @property
     def path(self) -> Path:
@@ -197,6 +201,19 @@ class RuntimeModelRegistry:
             pass
 
     def _open_lock(self, policy: _ResolvedFilePolicy) -> int:
+        if self._readonly:
+            try:
+                descriptor = os.open(self._lock_path, os.O_RDONLY | _NOFOLLOW | _CLOEXEC | _NONBLOCK)
+            except FileNotFoundError:
+                raise RegistryAccessError() from None
+            except OSError as error:
+                _raise_open_failure(error)
+            try:
+                self._verify_regular_descriptor(descriptor, policy, mode=_LOCK_MODE)
+                return descriptor
+            except BaseException:
+                os.close(descriptor)
+                raise
         flags = os.O_RDWR | _NOFOLLOW | _CLOEXEC | _NONBLOCK
         for _attempt in range(8):
             created = False
@@ -245,7 +262,14 @@ class RuntimeModelRegistry:
         *,
         exclusive: bool,
     ) -> Iterator[_ResolvedFilePolicy]:
-        policy = self._resolved_file_policy()
+        if self._readonly and exclusive:
+            raise RegistryAccessError()
+        try:
+            policy = self._resolved_file_policy()
+        except FileNotFoundError:
+            if self._readonly:
+                raise RegistryAccessError() from None
+            raise
         descriptor = self._open_lock(policy)
         try:
             try:
@@ -272,6 +296,8 @@ class RuntimeModelRegistry:
                 os.O_RDONLY | _NOFOLLOW | _CLOEXEC | _NONBLOCK,
             )
         except FileNotFoundError:
+            if self._readonly:
+                raise RegistryAccessError() from None
             return ()
         except OSError as error:
             _raise_open_failure(error)
@@ -387,7 +413,7 @@ class RuntimeModelRegistry:
             if any(
                 existing.id == entry.id
                 or (
-                    existing.provider is entry.provider
+                    existing.runtime_provider is entry.runtime_provider
                     and existing.reference == entry.reference
                 )
                 for existing in current

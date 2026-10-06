@@ -3,21 +3,21 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from dataclasses import fields
+from datetime import datetime
 import json
+import re
 
-from kiron_common.model_catalog import LoaderType
+from kiron_common.model_catalog import ArtifactFormat, ArtifactType, BackendType, LoaderType
 
 from .errors import RegistryCorruptionError
-from .models import LocalModelProvider, RegistryEntry
+from .models import LocalArtifactFile, RegistryEntry
 
 
-REGISTRY_VERSION = 1
+REGISTRY_VERSION = 2
 MAX_REGISTRY_BYTES = 1024 * 1024
 MAX_REGISTRY_ENTRIES = 4096
-_ENTRY_KEYS = frozenset(
-    ("id", "provider", "reference", "display_name", "loader")
-)
-
+_ENTRY_KEYS = frozenset(field.name for field in fields(RegistryEntry))
 
 class _DecodeFailure(ValueError):
     pass
@@ -61,20 +61,28 @@ def decode_registry(payload: bytes) -> tuple[RegistryEntry, ...]:
         if type(rows) is not list or len(rows) > MAX_REGISTRY_ENTRIES:
             raise _DecodeFailure("invalid entries")
         entries: list[RegistryEntry] = []
-        identities: set[tuple[LocalModelProvider, str]] = set()
+        identities: set[tuple[BackendType, str]] = set()
         for row in rows:
             if type(row) is not dict or set(row) != _ENTRY_KEYS:
                 raise _DecodeFailure("invalid entry")
-            if any(type(row[key]) is not str for key in _ENTRY_KEYS):
-                raise _DecodeFailure("entry values must be strings")
-            entry = RegistryEntry(
-                id=row["id"],
-                provider=LocalModelProvider(row["provider"]),
-                reference=row["reference"],
-                display_name=row["display_name"],
-                loader=LoaderType(row["loader"]),
-            )
-            identity = (entry.provider, entry.reference)
+            values = dict(row)
+            values["runtime_provider"] = BackendType(row["runtime_provider"])
+            values["artifact_origin"] = ArtifactType(row["artifact_origin"])
+            values["artifact_format"] = ArtifactFormat(row["artifact_format"])
+            values["loader"] = LoaderType(row["loader"])
+            registered_at = row["registered_at"]
+            if (type(registered_at) is not str or re.fullmatch(
+                    r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6}Z",
+                    registered_at) is None):
+                raise _DecodeFailure("invalid UTC registration timestamp")
+            values["registered_at"] = datetime.fromisoformat(registered_at)
+            if row["projector"] is not None:
+                projector = row["projector"]
+                if type(projector) is not dict or set(projector) != {"reference", "sha256", "size_bytes"}:
+                    raise _DecodeFailure("invalid projector")
+                values["projector"] = LocalArtifactFile(**projector)
+            entry = RegistryEntry(**values)
+            identity = (entry.runtime_provider, entry.reference)
             if identity in identities:
                 raise _DecodeFailure("duplicate identity")
             identities.add(identity)
@@ -101,7 +109,7 @@ def encode_registry(entries: Iterable[RegistryEntry]) -> bytes:
         type(entry) is not RegistryEntry for entry in ordered
     ):
         raise ValueError("invalid registry entries")
-    identities = {(entry.provider, entry.reference) for entry in ordered}
+    identities = {(entry.runtime_provider, entry.reference) for entry in ordered}
     if len(identities) != len(ordered):
         raise ValueError("duplicate registry identity")
     document = {

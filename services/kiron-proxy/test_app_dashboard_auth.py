@@ -79,6 +79,13 @@ class DashboardAuthIntegrationTests(unittest.TestCase):
             with self.client.websocket_connect("/ws/live"):
                 pass
 
+    def test_high_res_history_websockets_without_auth_are_rejected(self):
+        for range_key in ("1m", "10m"):
+            with self.subTest(range_key=range_key):
+                with self.assertRaises(WebSocketDisconnect):
+                    with self.client.websocket_connect(f"/ws/history/{range_key}"):
+                        pass
+
 
 if __name__ == "__main__":
     unittest.main()

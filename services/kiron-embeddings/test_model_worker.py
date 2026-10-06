@@ -110,7 +110,7 @@ class FakeManager:
         with self.state_lock:
             self.loading_model = None
 
-    def _ensure_model_sync(self, name: str):
+    def _ensure_model_sync(self, name: str, *, load_parent=None):
         self.assert_worker_thread()
         with self.state_lock:
             if self.current_model_name == name and self.model is not None:
@@ -471,17 +471,22 @@ class SerialModelWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.manager.load_blocker = threading.Event()
         worker.start()
 
-        # 1 laeuft, 2 in Queue (size 2 erreicht)
-        f1 = asyncio.create_task(worker.load("a"))
-        f2 = asyncio.create_task(worker.load("b"))
-        f3 = asyncio.create_task(worker.load("c"))
-        await asyncio.sleep(0.1)
-
-        with self.assertRaises(WorkerQueueFullError):
-            await worker.load("d")
-
-        self.manager.load_blocker.set()
-        await asyncio.wait_for(asyncio.gather(f1, f2, f3), timeout=3.0)
+        pending = [asyncio.create_task(worker.load("a"))]
+        try:
+            # Erst nach der tatsaechlichen Entnahme ist Platz fuer zwei wartende
+            # Jobs. Ein sleep nach drei Submits garantiert diese Reihenfolge nicht.
+            self.assertTrue(await asyncio.to_thread(self.manager.load_started.wait, 2.0))
+            pending.extend(asyncio.create_task(worker.load(name)) for name in ("b", "c"))
+            await asyncio.sleep(0)  # Beide Submit-Coroutinen bis zu ihrem Future ausfuehren.
+            self.assertEqual(worker._queue.qsize(), 2)
+            self.assertFalse(any(task.done() for task in pending))
+            with self.assertRaises(WorkerQueueFullError):
+                await asyncio.wait_for(worker.load("d"), timeout=1.0)
+            self.manager.load_blocker.set()
+            await asyncio.wait_for(asyncio.gather(*pending), timeout=3.0)
+        finally:
+            self.manager.load_blocker.set()
+            await asyncio.wait_for(asyncio.gather(*pending, return_exceptions=True), timeout=3.0)
 
     # ---- Stop
 
@@ -819,7 +824,7 @@ class SerialModelWorkerTests(unittest.IsolatedAsyncioTestCase):
         # bubblet -> outer try -> fatal -> finally -> clear_loading_for_crash.
 
         class CrashingLoad(FakeManager):
-            def _ensure_model_sync(_self, name):
+            def _ensure_model_sync(_self, name, *, load_parent=None):
                 _self.assert_worker_thread()
                 with _self.state_lock:
                     _self.loading_model = name
@@ -856,7 +861,7 @@ class SerialModelWorkerTests(unittest.IsolatedAsyncioTestCase):
         captured: dict = {}
 
         class CrashingManager(FakeManager):
-            def _ensure_model_sync(_self, name):
+            def _ensure_model_sync(_self, name, *, load_parent=None):
                 _self.assert_worker_thread()
                 with _self.state_lock:
                     _self.loading_model = name
@@ -1006,16 +1011,20 @@ class SerialModelWorkerLateEmbedTests(unittest.IsolatedAsyncioTestCase):
         worker.start()
 
         chunk = [{"text": "x", "char_start": 0, "char_end": 1}]
-        f1 = asyncio.create_task(worker.late_embed("a", "d", chunk, None))
-        f2 = asyncio.create_task(worker.late_embed("b", "d", chunk, None))
-        f3 = asyncio.create_task(worker.late_embed("c", "d", chunk, None))
-        await asyncio.sleep(0.1)
-
-        with self.assertRaises(WorkerQueueFullError):
-            await worker.late_embed("d", "d", chunk, None)
-
-        self.manager.late_embed_blocker.set()
-        await asyncio.wait_for(asyncio.gather(f1, f2, f3), timeout=3.0)
+        pending = [asyncio.create_task(worker.late_embed("a", "d", chunk, None))]
+        try:
+            self.assertTrue(await asyncio.to_thread(self.manager.late_embed_started.wait, 2.0))
+            pending.extend(asyncio.create_task(worker.late_embed(name, "d", chunk, None)) for name in ("b", "c"))
+            await asyncio.sleep(0)
+            self.assertEqual(worker._queue.qsize(), 2)
+            self.assertFalse(any(task.done() for task in pending))
+            with self.assertRaises(WorkerQueueFullError):
+                await asyncio.wait_for(worker.late_embed("d", "d", chunk, None), timeout=1.0)
+            self.manager.late_embed_blocker.set()
+            await asyncio.wait_for(asyncio.gather(*pending), timeout=3.0)
+        finally:
+            self.manager.late_embed_blocker.set()
+            await asyncio.wait_for(asyncio.gather(*pending, return_exceptions=True), timeout=3.0)
 
     async def test_late_embed_stop_drain(self):
         # worker.stop() waehrend Late-Embed-Job pending -> WorkerStoppedError an Future.
@@ -1158,6 +1167,9 @@ class ModelManagerOomCleanupTests(unittest.TestCase):
         class OomModel:
             max_seq_length = 512
 
+            def forward(self, features):
+                return features
+
             def tokenizer(self, texts, **kwargs):
                 return {"input_ids": [[1, 2, 3] for _ in texts]}
 
@@ -1206,6 +1218,11 @@ class ModelManagerSlotCacheTests(unittest.TestCase):
 
     def _make_manager(self, *, slots=2):
         import main as main_mod
+
+        verifier = mock.patch.object(main_mod, "verify_local_artifact")
+        proof = verifier.start().return_value
+        proof.fingerprint = "fixture-only-artifact"
+        self.addCleanup(verifier.stop)
 
         manager = main_mod.ModelManager(model_slots=slots)
         manager.set_worker_thread()
@@ -1426,7 +1443,7 @@ class IssueEightEightyRegressionTests(unittest.TestCase):
             model, _ = manager._ensure_model_sync("mxbai-embed-large")
 
         self.assertIs(model, new_obj)
-        loader.assert_called_once_with("mxbai-embed-large")
+        loader.assert_called_once_with("mxbai-embed-large", load_parent=None)
 
     def test_forces_reload_when_cuda_recovered(self):
         manager = self._make_manager()
@@ -1444,7 +1461,7 @@ class IssueEightEightyRegressionTests(unittest.TestCase):
             model, _ = manager._ensure_model_sync("mxbai-embed-large")
 
         self.assertIs(model, new_obj)
-        loader.assert_called_once_with("mxbai-embed-large")
+        loader.assert_called_once_with("mxbai-embed-large", load_parent=None)
 
 
 if __name__ == "__main__":

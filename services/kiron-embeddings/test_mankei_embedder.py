@@ -124,6 +124,8 @@ class MankeiEmbedderTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsInstance(loaded, loaders.LastTokenEmbeddingModel)
         self.assertEqual(tokenizer.padding_side, "right")
+        self.assertIs(model_load.call_args.kwargs["use_safetensors"], True)
+        self.assertIs(model_load.call_args.kwargs["torch_dtype"], torch.float32)
         for call in (tokenizer_load.call_args, model_load.call_args):
             self.assertTrue(call.kwargs["local_files_only"])
             self.assertEqual(
@@ -155,7 +157,7 @@ class MankeiEmbedderTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(response["model"], "mankei-326m-embedder")
         self.assertEqual(response["model_info"]["llama.embedding_length"], 960)
-        self.assertEqual(response["details"]["quantization_level"], "BF16")
+        self.assertEqual(response["details"]["quantization_level"], "F32")
 
 
 if __name__ == "__main__":

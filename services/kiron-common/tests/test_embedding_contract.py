@@ -49,28 +49,28 @@ def _load(path: Path) -> dict:
 
 def _production_manifest_documents() -> list[dict]:
     return [
-        group.to_manifest_dict(schema_version=1)
+        group.to_manifest_dict(schema_version=2)
         for group in MODEL_CATALOG.groups
     ]
 
 
 def _non_embedding_manifest() -> dict:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "canonical_model_id": "catalog-only-reranker:latest",
         "aliases": ["catalog-only-reranker"],
         "deployments": [
             {
                 "id": "catalog-only-reranker.service",
-                "backend": {"type": "kiron_deberta", "parameters": {}},
+                "backend": {"type": "kiron_deberta", "parameters": {}}, "runtime_profile": None,
                 "artifact": {
-                    "type": "huggingface",
+                    "type": "huggingface", "format": "hf_weights", "projector": None,
                     "repository": "example/catalog-only-reranker",
                     "revision": "a" * 40,
                     "manifest_digest": None,
                     "trust_remote_code": False,
                     "weights": [
-                        {"path": "model.safetensors", "sha256": "b" * 64}
+                        {"path": "model.safetensors", "sha256": "b" * 64, "size_bytes": None}
                     ],
                     "auxiliary": [],
                     "metadata": {},
@@ -321,7 +321,77 @@ def test_registry_contains_exactly_13_schema_valid_profiles():
     assert len(profiles) == EMBEDDING_REGISTRY.profile_count == 13
     assert sum(
         profile["verification"]["status"] == "verified" for profile in profiles
-    ) == 3
+    ) == 5
+
+
+def test_nomic_late_verification_is_bound_to_full_reference_vectors():
+    path = ROOT / "scripts/fixtures/nomic-late-v1.reference.json"
+    witness = _load(path)
+    caps = EMBEDDING_REGISTRY.require("nomic-embed-text").capabilities
+    late = next(p for p in caps["profiles"] if p["profile_id"] == "kiron-nomic-late-v1")
+    dense = next(p for p in caps["profiles"] if p["profile_id"] == "kiron-nomic-dense-v1")
+    assert late["verification"]["status"] == "verified"
+    assert late["verification"]["blocking_reasons"] == []
+    assert ("reference-vectors:scripts/fixtures/nomic-late-v1.reference.json@sha256:"
+            + hashlib.sha256(path.read_bytes()).hexdigest()) in late["verification"]["evidence"]
+    assert witness["provenance"]["revision"] == late["artifact"]["revision"]
+    assert witness["provenance"]["weight_sha256"] == late["artifact"]["weights"][0]["sha256"]
+    assert {c["name"] for c in witness["cases"]} == {
+        "document_overlap_unicode", "literal_special_tokens", "query_special_tokens",
+        "empty_document", "window_and_fallback_truncation", "query_berlin", "query_paris",
+    }
+    assert sum(len(c["embeddings"]) for c in witness["cases"]) == 22
+    for case in witness["cases"]:
+        assert len(case["embeddings"]) == len(case["request"]["chunks"])
+        for vector in case["embeddings"]:
+            assert len(vector) == 768 and all(math.isfinite(x) for x in vector)
+            assert abs(math.sqrt(sum(x*x for x in vector)) - 1) < 1e-6
+    for key in ("index_compatibility_id", "query_compatibility_id"):
+        assert late[key] is not None and late[key] != dense[key]
+
+
+def test_hellord_profile_is_bound_to_exact_gguf_vectors_and_role_pipeline():
+    path = ROOT / "scripts/fixtures/hellord-e5-mistral-v1.reference.json"
+    witness = _load(path)
+    profile = EMBEDDING_REGISTRY.profile("ollama-e5-mistral-dense-v1")
+    assert profile["verification"]["status"] == "verified"
+    assert profile["verification"]["blocking_reasons"] == []
+    assert ("reference-vectors:scripts/fixtures/hellord-e5-mistral-v1.reference.json@sha256:"
+            + hashlib.sha256(path.read_bytes()).hexdigest()) in profile["verification"]["evidence"]
+    assert profile["artifact"]["weights"][0]["sha256"] == witness["artifact"]["weight_sha256"]
+    assert profile["artifact"]["manifest_digest"] == "sha256:" + witness["artifact"]["manifest_sha256"]
+    assert profile["pipeline"]["tokenizer"]["revision"] == "sha256:" + witness["artifact"]["weight_sha256"]
+    assert profile["input_type"]["required"] is True
+    assert profile["pipeline"]["pooling"]["method"] == "last_token"
+    assert profile["pipeline"]["formatting"]["search_document"]["template"] == "{text}</s>"
+    assert profile["pipeline"]["formatting"]["search_query"]["template"].startswith("Instruct: ")
+    cases = {c["name"]: c for c in witness["cases"]}
+    assert len(cases) == 12
+    assert len(cases["boundary_document"]["executed_tokens"]) == 4096
+    assert cases["boundary_document"]["executed_tokens"][-1] == 2
+    assert profile["max_input_tokens"]["truncation"] == "none"
+    assert profile["max_input_tokens"]["overflow"] == "reject"
+    for case in cases.values():
+        vector = case["embedding"]
+        assert len(vector) == 4096 and all(math.isfinite(x) for x in vector)
+        assert abs(math.sqrt(sum(x*x for x in vector)) - 1) < 1e-6
+    controls = witness["negative_controls"]
+    assert controls["last_token"]["matches"] is True
+    for name in ("wrong_first_token", "wrong_mean_pooling", "missing_eos", "missing_query_prefix"):
+        assert controls[name]["matches"] is False
+
+
+@pytest.mark.parametrize("section,key,value", [
+    ("max_input_tokens", "overflow", "truncate"),
+    ("max_input_tokens", "truncation", "right"),
+    ("input_type", "required", False),
+])
+def test_ollama_request_policy_rejects_catalog_contract_disagreement(section, key, value):
+    manifests = _production_manifest_documents()
+    manifest = next(m for m in manifests if m["canonical_model_id"] == "hellord/e5-mistral-7b-instruct:Q4_0")
+    manifest["profiles"][0]["metadata"][section][key] = value
+    with pytest.raises(EmbeddingContractError):
+        build_embedding_registry(ModelCatalog.from_manifests(manifests))
 
 
 def test_only_verified_profiles_have_recomputed_non_null_ids():

@@ -106,6 +106,55 @@ def test_fake_runner_succeeds_without_side_effects(tmp_path):
     assert list(tmp_path.iterdir()) == []
 
 
+def test_sft_backend_end_requires_reaped_process_and_absent_group(monkeypatch):
+    monkeypatch.setattr(runners, "_owned_process_scan_confirms_absence", lambda *args, **kwargs: True)
+    async def run():
+        runner = runners.SftSubprocessRunner(SimpleNamespace())
+        assert runner.backend_terminated
+        runner._spawn_attempted = True
+        runner._job_uid = "admission-proof-test"
+        assert not runner.backend_terminated  # Ambiguous subprocess creation.
+        proc = await asyncio.create_subprocess_exec(sys.executable, "-c", "import time; time.sleep(0.05)",
+                                                    start_new_session=True)
+        runner._process = proc
+        assert not runner.backend_terminated
+        await proc.wait()
+        assert runner.backend_terminated
+        monkeypatch.setattr(runners, "_owned_process_scan_confirms_absence", lambda *args, **kwargs: False)
+        assert not runner.backend_terminated  # Leader exit cannot hide survivors.
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("kind", ["absent", "marker", "child", "group", "stat_denied",
+                                   "env_denied", "uid_denied", "foreign", "vanished", "malformed"])
+def test_backend_absence_requires_complete_own_uid_process_scan(tmp_path, monkeypatch, kind):
+    process = tmp_path / "900001"
+    process.mkdir()
+    parent, group = (12345 if kind == "child" else 1), (12345 if kind == "group" else 900001)
+    (process / "stat").write_text(f"900001 (worker) S {parent} {group} 900001\n")
+    (process / "environ").write_bytes(b"KITT_JOB_UID=job\0" if kind == "marker" else b"OTHER=1\0")
+    original_stat, original_open = Path.stat, Path.open
+    def stat_file(path, *args, **kwargs):
+        if path == process and kind == "uid_denied":
+            raise PermissionError("uid unavailable")
+        if path == process and kind == "foreign":
+            return SimpleNamespace(st_uid=os.geteuid() + 1)
+        return original_stat(path, *args, **kwargs)
+    def open_file(path, *args, **kwargs):
+        if path.parent == process:
+            if kind == "vanished":
+                raise FileNotFoundError("process ended")
+            if kind == "foreign" or (kind == "stat_denied" and path.name == "stat") or (kind == "env_denied" and path.name == "environ"):
+                raise PermissionError("process evidence unavailable")
+        return original_open(path, *args, **kwargs)
+    if kind == "malformed":
+        (process / "stat").write_text("truncated")
+    monkeypatch.setattr(Path, "stat", stat_file)
+    monkeypatch.setattr(Path, "open", open_file)
+    assert runners._owned_process_scan_confirms_absence(12345, job_uid="job", proc_root=tmp_path) is (
+        kind in {"absent", "foreign", "vanished"})
+
+
 def test_fake_runner_reports_failure_as_codes():
     async def run():
         cancel = asyncio.Event()

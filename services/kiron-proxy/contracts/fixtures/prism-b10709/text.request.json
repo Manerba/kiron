@@ -1,0 +1,17 @@
+{
+  "url": "http://127.0.0.1:18089/v1/chat/completions",
+  "method": "POST",
+  "json": {
+    "model": "bonsai-probe",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Reply with the single word OK."
+      }
+    ],
+    "temperature": 0,
+    "max_tokens": 32,
+    "reasoning_format": "deepseek",
+    "reasoning_effort": "none"
+  }
+}

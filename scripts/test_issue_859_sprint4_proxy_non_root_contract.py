@@ -48,6 +48,8 @@ def test_proxy_unit_matches_sprint4_non_root_contract():
         "docker",
         "kiron-runtime",
         "kiron-common",
+        "kiron-config",
+        "kiron-prism-control",
     }
     assert env["KIRON_RUNTIME_DIR"] == RUNTIME_DIR
 
@@ -157,6 +159,9 @@ def _run_wrapper(relpath: str, *args: str) -> subprocess.CompletedProcess:
 def test_service_control_wrapper_is_fail_closed_before_systemctl_exec():
     allowed = {
         ("restart", "kiron-proxy.service"),
+        ("start", "kiron-prism.service"),
+        ("stop", "kiron-prism.service"),
+        ("restart", "kiron-prism.service"),
         ("start", "kiron-embeddings.service"),
         ("stop", "kiron-embeddings.service"),
         ("restart", "kiron-embeddings.service"),

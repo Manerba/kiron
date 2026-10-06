@@ -38,6 +38,7 @@ if str(COMMON_SOURCE) not in sys.path:
 from kiron_common.embedding_registry import build_embedding_registry  # noqa: E402
 from kiron_common.model_catalog import (  # noqa: E402
     BackendType,
+    SCHEMA_VERSION,
     DEFAULT_MANIFEST_PACKAGE,
     LoaderType,
     ModelCatalog,
@@ -139,7 +140,7 @@ def _production_golden_check(summary: dict[str, Any], golden_path: Path) -> None
 
 
 def _matrix_row(group: object, manifest_name: str) -> dict[str, Any]:
-    document = group.to_manifest_dict(schema_version=1)
+    document = group.to_manifest_dict(schema_version=SCHEMA_VERSION)
     return {
         "manifest": manifest_name,
         "canonical_model_id": document["canonical_model_id"],
@@ -286,7 +287,7 @@ def validate_catalog_architecture(
     }
     summary: dict[str, Any] = {
         "status": "ok",
-        "catalog_schema_version": 1,
+        "catalog_schema_version": SCHEMA_VERSION,
         "catalog_digest": catalog.catalog_digest,
         "manifest_package": manifest_package,
         "manifest_files": list(manifest_files),

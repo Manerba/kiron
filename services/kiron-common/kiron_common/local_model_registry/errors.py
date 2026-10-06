@@ -16,7 +16,7 @@ class InvalidProviderError(ModelRegistrationError):
     code = "invalid_provider"
 
     def __init__(self) -> None:
-        super().__init__("provider must be ollama or huggingface")
+        super().__init__("runtime_provider must be ollama, prism, kiron_embeddings or kiron_deberta")
 
 
 class InvalidReferenceError(ModelRegistrationError):

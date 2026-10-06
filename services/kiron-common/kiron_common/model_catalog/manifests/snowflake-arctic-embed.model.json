@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "canonical_model_id": "snowflake-arctic-embed:l",
   "aliases": [
     "snowflake-arctic-embed"
@@ -24,11 +24,14 @@
         "weights": [
           {
             "path": "model.safetensors",
-            "sha256": "46e36bf399c152c51818e1d0423bfe628d79fc9536dbf9d4fcc93078827d6c99"
+            "sha256": "46e36bf399c152c51818e1d0423bfe628d79fc9536dbf9d4fcc93078827d6c99",
+            "size_bytes": null
           }
         ],
         "auxiliary": [],
-        "metadata": {}
+        "metadata": {},
+        "format": "hf_weights",
+        "projector": null
       },
       "routes": [
         {
@@ -50,7 +53,8 @@
           "precision": null,
           "size": 670000000
         }
-      }
+      },
+      "runtime_profile": null
     },
     {
       "id": "ollama-snowflake-dense-v1.deployment",
@@ -71,11 +75,14 @@
         "weights": [
           {
             "path": "model",
-            "sha256": "fb3b66c7bdf6dabbb2edbc22627f4cb2df021c9e9545b54feafd8a7c09fe8ec5"
+            "sha256": "fb3b66c7bdf6dabbb2edbc22627f4cb2df021c9e9545b54feafd8a7c09fe8ec5",
+            "size_bytes": null
           }
         ],
         "auxiliary": [],
-        "metadata": {}
+        "metadata": {},
+        "format": "ollama_manifest",
+        "projector": null
       },
       "routes": [
         {
@@ -87,7 +94,8 @@
         "type": "ollama",
         "parameters": {}
       },
-      "metadata": {}
+      "metadata": {},
+      "runtime_profile": null
     }
   ],
   "profiles": [
